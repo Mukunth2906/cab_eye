@@ -1,0 +1,1079 @@
+<title>Eyes-Free Booking Rig</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+
+<style>
+:root{
+  --ground:#0A0C0D;
+  --panel:#121618;
+  --raised:#1A2125;
+  --raised-2:#222B30;
+  --line:#2A3438;
+  --line-soft:#1E262A;
+
+  --ink:#E8EEEC;
+  --ink-dim:#93A29E;
+  --ink-faint:#5E6C69;
+
+  --amber:#EFAA46;      /* the rider speaking */
+  --teal:#3FBCAD;       /* the system speaking */
+  --violet:#9B8FE0;     /* earcon, non-speech */
+  --red:#E45B4F;        /* alert */
+  --green:#5CC98D;      /* driver events */
+
+  --sans:"IBM Plex Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  --cond:"IBM Plex Sans Condensed","IBM Plex Sans",-apple-system,"Segoe UI",sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,"Cascadia Code",Consolas,monospace;
+
+  --r:10px;
+}
+
+*{box-sizing:border-box;margin:0;padding:0}
+html{font-size:17px}
+
+body{
+  height:100vh;
+  overflow:hidden;
+  background:var(--ground);
+  color:var(--ink);
+  font-family:var(--sans);
+  display:grid;
+  grid-template-rows:auto 1fr;
+  -webkit-font-smoothing:antialiased;
+}
+
+button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
+button:focus-visible{outline:2px solid var(--teal);outline-offset:2px}
+
+.lbl{
+  font-family:var(--cond);
+  font-size:.76rem;
+  font-weight:600;
+  letter-spacing:.13em;
+  text-transform:uppercase;
+  color:var(--ink-faint);
+}
+
+/* ─── header ─────────────────────────────────────────── */
+.head{
+  display:flex;align-items:center;gap:1.6rem;
+  padding:.85rem 1.4rem;
+  border-bottom:1px solid var(--line);
+  background:var(--panel);
+}
+.brand{display:flex;flex-direction:column;gap:.15rem;flex-shrink:0}
+.brand h1{
+  font-family:var(--cond);font-size:1.28rem;font-weight:700;
+  letter-spacing:.01em;line-height:1;
+}
+.brand .sub{font-size:.78rem;color:var(--ink-faint)}
+
+.gauges{display:flex;gap:.5rem;margin-left:auto;flex-shrink:0}
+.gauge{
+  background:var(--raised);border:1px solid var(--line-soft);
+  border-radius:var(--r);padding:.45rem .8rem;min-width:96px;
+}
+.gauge .lbl{font-size:.66rem;display:block;margin-bottom:.15rem}
+.gauge .val{
+  font-family:var(--mono);font-size:1.15rem;font-weight:600;
+  font-variant-numeric:tabular-nums;line-height:1.1;
+}
+.gauge.hero .val{color:var(--teal);font-size:1.45rem}
+
+.ctrls{display:flex;gap:.45rem;align-items:center;flex-shrink:0}
+.btn{
+  background:var(--raised);border:1px solid var(--line);
+  border-radius:var(--r);padding:.5rem .85rem;
+  font-family:var(--cond);font-size:.82rem;font-weight:600;
+  letter-spacing:.06em;text-transform:uppercase;color:var(--ink-dim);
+  transition:background .14s,color .14s,border-color .14s;
+}
+.btn:hover{background:var(--raised-2);color:var(--ink)}
+.btn.on{background:var(--teal);border-color:var(--teal);color:#06110F}
+
+/* ─── main grid ──────────────────────────────────────── */
+.rig{
+  display:grid;
+  grid-template-columns:minmax(310px,1fr) minmax(400px,1.35fr) minmax(310px,1fr);
+  gap:1.1rem;padding:1.1rem 1.4rem;
+  min-height:0;
+}
+.col{display:flex;flex-direction:column;gap:.7rem;min-height:0}
+.col-head{display:flex;align-items:baseline;gap:.6rem}
+.col-head .who{font-family:var(--cond);font-size:1rem;font-weight:700;letter-spacing:.02em}
+.col-head .tag{font-size:.76rem;color:var(--ink-faint)}
+
+/* ─── phone ──────────────────────────────────────────── */
+.phone{
+  flex:1;min-height:0;
+  background:#06090A;
+  border:1px solid var(--line);
+  border-radius:22px;
+  padding:.6rem;
+  display:flex;
+}
+.screen{
+  flex:1;min-height:0;
+  background:var(--ground);
+  border-radius:16px;
+  padding:1.3rem 1.15rem;
+  display:flex;flex-direction:column;
+  position:relative;overflow:hidden;
+}
+
+/* rider surface — one screen, many states */
+.surface{
+  flex:1;min-height:0;
+  display:flex;flex-direction:column;
+  align-items:center;justify-content:center;
+  gap:1rem;text-align:center;
+}
+.orb{
+  width:150px;height:150px;border-radius:50%;
+  border:3px solid var(--line);
+  display:flex;align-items:center;justify-content:center;
+  flex-direction:column;gap:.3rem;flex-shrink:0;
+  background:var(--panel);
+  transition:border-color .2s,background .2s;
+}
+.orb .glyph{font-size:2.6rem;line-height:1}
+.orb.live{border-color:var(--amber);background:rgba(239,170,70,.09);animation:breathe 1.5s ease-in-out infinite}
+.orb.think{border-color:var(--violet);background:rgba(155,143,224,.08);animation:breathe 1s ease-in-out infinite}
+.orb.ok{border-color:var(--teal);background:rgba(63,188,173,.09)}
+@keyframes breathe{0%,100%{transform:scale(1)}50%{transform:scale(1.055)}}
+@media (prefers-reduced-motion:reduce){.orb{animation:none!important}}
+
+.talk{cursor:pointer;user-select:none;-webkit-user-select:none}
+
+.big{font-family:var(--cond);font-size:2rem;font-weight:700;line-height:1.1;text-wrap:balance}
+.mid{font-size:1.25rem;font-weight:600;line-height:1.25;text-wrap:balance}
+.say{font-size:.98rem;color:var(--ink-dim);line-height:1.45;max-width:30ch}
+.tiny{font-size:.84rem;color:var(--ink-faint)}
+.amber{color:var(--amber)} .teal{color:var(--teal)} .red{color:var(--red)}
+.plate{font-family:var(--mono);font-size:1.1rem;font-weight:600;letter-spacing:.05em}
+
+.act{
+  width:100%;max-width:290px;
+  background:var(--raised);border:1px solid var(--line);
+  border-radius:var(--r);padding:.95rem 1rem;
+  font-family:var(--cond);font-size:1.05rem;font-weight:600;
+  letter-spacing:.05em;text-transform:uppercase;
+  transition:background .14s;
+}
+.act:hover{background:var(--raised-2)}
+.act.pri{background:var(--teal);border-color:var(--teal);color:#06110F}
+.act.pri:hover{background:#4FD0C0}
+.act.danger{background:var(--red);border-color:var(--red);color:#150403}
+.act.ghost{background:transparent;color:var(--ink-dim)}
+.stack{display:flex;flex-direction:column;gap:.55rem;width:100%;align-items:center}
+
+.undo{
+  width:100%;max-width:290px;height:6px;border-radius:3px;
+  background:var(--raised);overflow:hidden;
+}
+.undo i{display:block;height:100%;background:var(--amber);width:100%}
+
+.compass{
+  width:112px;height:112px;border-radius:50%;
+  border:2px solid var(--line);position:relative;flex-shrink:0;
+  display:flex;align-items:center;justify-content:center;
+}
+.compass .arrow{
+  font-size:2.6rem;line-height:1;color:var(--teal);
+  transform-origin:center;
+}
+
+.chips{display:flex;flex-wrap:wrap;gap:.4rem;justify-content:center}
+.chip{
+  background:var(--raised);border:1px solid var(--line);
+  border-radius:99px;padding:.4rem .75rem;font-size:.84rem;color:var(--ink-dim);
+}
+.chip:hover{background:var(--raised-2);color:var(--ink)}
+
+.sos-edge{
+  position:absolute;right:0;top:0;bottom:0;width:26px;
+  background:linear-gradient(90deg,transparent,rgba(228,91,79,.16));
+  display:flex;align-items:center;justify-content:center;
+  writing-mode:vertical-rl;
+  font-family:var(--cond);font-size:.72rem;font-weight:700;
+  letter-spacing:.22em;color:var(--red);
+}
+.sos-full{
+  position:absolute;inset:0;background:rgba(20,4,3,.97);
+  display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:1rem;padding:1.5rem;text-align:center;z-index:5;
+}
+
+/* driver screens */
+.dscreen{flex:1;min-height:0;display:flex;flex-direction:column;gap:.8rem}
+.badge{
+  background:rgba(228,91,79,.14);border:1px solid var(--red);
+  border-radius:var(--r);padding:.6rem .75rem;
+  font-family:var(--cond);font-size:.88rem;font-weight:700;
+  letter-spacing:.05em;color:var(--red);text-align:center;line-height:1.3;
+}
+.row{
+  display:flex;justify-content:space-between;align-items:baseline;gap:.7rem;
+  padding:.55rem 0;border-bottom:1px solid var(--line-soft);
+}
+.row .k{font-size:.82rem;color:var(--ink-faint)}
+.row .v{font-size:1rem;font-weight:600;text-align:right}
+.dfill{flex:1;min-height:0}
+.presets{display:flex;flex-direction:column;gap:.4rem}
+.preset{
+  background:var(--raised);border:1px solid var(--line);border-radius:var(--r);
+  padding:.65rem .8rem;font-size:.92rem;text-align:left;line-height:1.3;
+}
+.preset:hover{background:var(--raised-2)}
+
+/* ─── centre column ──────────────────────────────────── */
+.card{
+  background:var(--panel);border:1px solid var(--line-soft);
+  border-radius:var(--r);padding:.85rem .95rem;
+}
+.ladder{display:flex;flex-wrap:wrap;gap:.3rem}
+.step{
+  font-family:var(--mono);font-size:.74rem;font-weight:500;
+  padding:.3rem .5rem;border-radius:5px;
+  background:var(--raised);color:var(--ink-faint);
+  border:1px solid transparent;
+}
+.step.done{color:var(--ink-dim)}
+.step.now{background:var(--teal);color:#06110F;font-weight:600;border-color:var(--teal)}
+
+.marks{display:grid;grid-template-columns:repeat(5,1fr);gap:.45rem}
+.mark{background:var(--raised);border-radius:7px;padding:.5rem .55rem;text-align:center}
+.mark .lbl{font-size:.6rem;letter-spacing:.08em;display:block;margin-bottom:.2rem}
+.mark .val{font-family:var(--mono);font-size:1rem;font-weight:600;font-variant-numeric:tabular-nums}
+.mark.hit .val{color:var(--amber)}
+
+.log{
+  flex:1;min-height:0;overflow-y:auto;
+  background:var(--panel);border:1px solid var(--line-soft);
+  border-radius:var(--r);padding:.6rem .7rem;
+  display:flex;flex-direction:column;gap:.35rem;
+  scrollbar-width:thin;scrollbar-color:var(--line) transparent;
+}
+.log::-webkit-scrollbar{width:8px}
+.log::-webkit-scrollbar-thumb{background:var(--line);border-radius:4px}
+
+.ev{display:grid;grid-template-columns:58px 88px 1fr;gap:.55rem;align-items:baseline;font-size:.88rem;line-height:1.35}
+.ev:first-child{margin-top:.15rem}
+.ev .t{font-family:var(--mono);font-size:.76rem;color:var(--ink-faint);font-variant-numeric:tabular-nums}
+.ev .k{
+  font-family:var(--cond);font-size:.7rem;font-weight:700;
+  letter-spacing:.09em;text-transform:uppercase;
+}
+.ev.user .k{color:var(--amber)}
+.ev.sys  .k{color:var(--teal)}
+.ev.ear  .k{color:var(--violet)}
+.ev.drv  .k{color:var(--green)}
+.ev.warn .k{color:var(--red)}
+.ev.note .k{color:var(--ink-faint)}
+.ev.note .m{color:var(--ink-dim)}
+.ev .m{color:var(--ink)}
+.ev .m em{font-style:normal;color:var(--ink-faint)}
+
+.hint{font-size:.8rem;color:var(--ink-faint);line-height:1.4}
+</style>
+
+<header class="head">
+  <div class="brand">
+    <h1>EYES-FREE BOOKING RIG</h1>
+    <div class="sub">Voice-first cab booking &mdash; audio state machine, rider + driver</div>
+  </div>
+
+  <div class="gauges">
+    <div class="gauge hero"><span class="lbl">Time to booking</span><span class="val" id="g-ttcb">—</span></div>
+    <div class="gauge"><span class="lbl">Taps</span><span class="val" id="g-taps">0</span></div>
+    <div class="gauge"><span class="lbl">Clarify turns</span><span class="val" id="g-turns">0</span></div>
+    <div class="gauge"><span class="lbl">Audio dwell</span><span class="val" id="g-dwell">0.0s</span></div>
+  </div>
+
+  <div class="ctrls">
+    <button class="btn on" id="b-audio">Audio on</button>
+    <button class="btn" id="b-auto">Auto driver</button>
+    <button class="btn" id="b-reset">Reset</button>
+    <button class="btn" id="b-github" type="button" onclick="window.open('https://github.com/Mukunth2906/cab_eye', '_blank', 'noopener,noreferrer')">GitHub</button>
+  </div>
+</header>
+
+<main class="rig">
+
+  <!-- ── RIDER ────────────────────────────────────── -->
+  <section class="col">
+    <div class="col-head">
+      <span class="who">Rider</span>
+      <span class="tag">blind user &middot; one surface, no navigation</span>
+    </div>
+    <div class="phone">
+      <div class="screen" id="rider-screen">
+        <div class="surface" id="rider"></div>
+        <div class="sos-edge" id="sos-edge">SOS</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── CENTRE ───────────────────────────────────── -->
+  <section class="col">
+    <div class="col-head">
+      <span class="who">Instrumentation</span>
+      <span class="tag">what the paper measures</span>
+    </div>
+
+    <div class="card">
+      <span class="lbl" style="display:block;margin-bottom:.5rem">Rider state</span>
+      <div class="ladder" id="ladder"></div>
+    </div>
+
+    <div class="card">
+      <span class="lbl" style="display:block;margin-bottom:.5rem">Latency marks &mdash; mic release to first sound</span>
+      <div class="marks">
+        <div class="mark" id="m-0"><span class="lbl">T0 mic</span><span class="val">—</span></div>
+        <div class="mark" id="m-1"><span class="lbl">T1 speech</span><span class="val">—</span></div>
+        <div class="mark" id="m-2"><span class="lbl">T2 intent</span><span class="val">—</span></div>
+        <div class="mark" id="m-3"><span class="lbl">T3 place</span><span class="val">—</span></div>
+        <div class="mark" id="m-4"><span class="lbl">T4 sound</span><span class="val">—</span></div>
+      </div>
+    </div>
+
+    <div class="log" id="log"></div>
+  </section>
+
+  <!-- ── DRIVER ───────────────────────────────────── -->
+  <section class="col">
+    <div class="col-head">
+      <span class="who">Driver</span>
+      <span class="tag">sighted &middot; conventional UI</span>
+    </div>
+    <div class="phone">
+      <div class="screen">
+        <div class="dscreen" id="driver"></div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<script>
+"use strict";
+
+/* ══════════════════════════════════════════════════════
+   PLACES — small Chennai gazetteer for the rule-based path
+   ══════════════════════════════════════════════════════ */
+const PLACES = [
+  {n:"Anna Nagar East",   lat:13.0878, lng:80.2183},
+  {n:"Anna Nagar West",   lat:13.0850, lng:80.1998},
+  {n:"T Nagar",           lat:13.0418, lng:80.2341},
+  {n:"Besant Nagar",      lat:13.0002, lng:80.2668},
+  {n:"Adyar",             lat:13.0067, lng:80.2570},
+  {n:"Velachery",         lat:12.9750, lng:80.2210},
+  {n:"Guindy",            lat:13.0067, lng:80.2206},
+  {n:"Nungambakkam",      lat:13.0569, lng:80.2425},
+  {n:"Mylapore",          lat:13.0339, lng:80.2698},
+  {n:"Egmore",            lat:13.0732, lng:80.2609},
+  {n:"Chennai Central",   lat:13.0827, lng:80.2755},
+  {n:"Chennai Airport",   lat:12.9941, lng:80.1709},
+  {n:"Tambaram",          lat:12.9229, lng:80.1275},
+  {n:"Porur",             lat:13.0374, lng:80.1575},
+  {n:"Sholinganallur",    lat:12.9010, lng:80.2279}
+];
+
+const SAMPLES = [
+  "take me to Anna Nagar",
+  "take me to Anna Nagar East",
+  "I want to go to the airport",
+  "book an auto to T Nagar",
+  "drop me at Besant Nagar",
+  "Velachery-ku poganum"
+];
+
+const DRIVERS = [
+  {name:"Ravi",   car:"white Swift",   plate:"TN 07 CA 1234", phon:"Tango-November Zero-Seven, Charlie-Alpha, One-Two-Three-Four"},
+  {name:"Suresh", car:"grey Wagon R",  plate:"TN 09 BK 4471", phon:"Tango-November Zero-Nine, Bravo-Kilo, Four-Four-Seven-One"}
+];
+
+const POSITIONS = [
+  "I'm right in front of you, near the gate",
+  "I'm about twenty metres to your left",
+  "I'm behind the blue bus, please wait there",
+  "I'm across the road, I'll come to you"
+];
+
+/* ══════════════════════════════════════════════════════
+   STATE
+   ══════════════════════════════════════════════════════ */
+const RIDER_STATES = ["idle","listening","resolving","clarify","confirming",
+                      "finding","assigned","approaching","arrived","intrip","done"];
+
+let S = {};
+function freshState(){
+  S = {
+    rider:"idle", driver:"offline",
+    transcript:"", dest:null, rideType:"auto",
+    candidates:[], drv:null, bearing:0, fare:0, eta:0,
+    sos:false, undoTimer:null, undoLeft:0,
+    marks:[null,null,null,null,null], t0:0,
+    taps:0, turns:0, dwell:0, ttcb:null,
+    autoDriver:false, audioOn:true, approachTimer:null
+  };
+}
+freshState();
+
+/* ══════════════════════════════════════════════════════
+   AUDIO — earcons, heartbeat, stereo bearing
+   ══════════════════════════════════════════════════════ */
+let AC = null;
+function ac(){
+  if(!AC){ AC = new (window.AudioContext||window.webkitAudioContext)(); }
+  if(AC.state === "suspended") AC.resume();
+  return AC;
+}
+
+function tone(freq, dur, {type="sine", gain=0.13, pan=0, delay=0, glide=0}={}){
+  if(!S.audioOn) return;
+  const c = ac(), t = c.currentTime + delay;
+  const o = c.createOscillator(), g = c.createGain(), p = c.createStereoPanner();
+  o.type = type;
+  o.frequency.setValueAtTime(freq, t);
+  if(glide) o.frequency.exponentialRampToValueAtTime(glide, t + dur);
+  p.pan.setValueAtTime(Math.max(-1, Math.min(1, pan)), t);
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(gain, t + 0.012);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g); g.connect(p); p.connect(c.destination);
+  o.start(t); o.stop(t + dur + 0.05);
+}
+
+const EARCON = {
+  listen:   ()=>{ tone(520,.10,{type:"triangle"}); tone(780,.13,{type:"triangle",delay:.09}); },
+  captured: ()=>  tone(400,.07,{type:"square",gain:.07}),
+  thinking: ()=>{ tone(300,.09,{type:"sine",gain:.05}); tone(300,.09,{type:"sine",gain:.05,delay:.28}); },
+  booked:   ()=>{ tone(620,.11,{type:"triangle"}); tone(930,.20,{type:"triangle",delay:.10}); },
+  assigned: ()=>{ tone(500,.09); tone(660,.09,{delay:.09}); tone(820,.16,{delay:.18}); },
+  arrived:  ()=>{ tone(980,.16,{type:"triangle",gain:.17}); tone(1310,.26,{type:"triangle",gain:.17,delay:.14}); },
+  error:    ()=>  tone(220,.26,{type:"sawtooth",gain:.09,glide:140}),
+  alarm:    ()=>{ for(let i=0;i<4;i++){ tone(880,.16,{type:"square",gain:.12,delay:i*.34});
+                                        tone(660,.16,{type:"square",gain:.12,delay:i*.34+.17}); } },
+  beacon:   (pan)=>{ for(let i=0;i<3;i++) tone(1180,.13,{type:"triangle",gain:.16,pan,delay:i*.22}); },
+  approach: (pan,near)=> tone(700+near*260,.09,{type:"triangle",gain:.10,pan})
+};
+
+let heartTimer = null;
+function heartbeat(on){
+  clearInterval(heartTimer); heartTimer = null;
+  if(!on) return;
+  heartTimer = setInterval(()=>{ tone(58,.16,{type:"sine",gain:.030}); }, 2600);
+}
+
+/* ══════════════════════════════════════════════════════
+   SPEECH OUT — tiered interrupt manager
+   ══════════════════════════════════════════════════════ */
+let dwellStart = 0;
+function speak(text, tier=1){
+  log("sys","Narrator", text);
+  if(!S.audioOn || !("speechSynthesis" in window)){
+    if(S.marks[4]===null) mark(4);
+    return;
+  }
+  if(tier === 0) speechSynthesis.cancel();          // interrupt
+  const u = new SpeechSynthesisUtterance(text);
+  u.rate = 1.06; u.pitch = 1; u.lang = "en-IN";
+  u.onstart = ()=>{ dwellStart = performance.now(); if(S.marks[4]===null) mark(4); };
+  u.onend   = ()=>{ if(dwellStart){ S.dwell += (performance.now()-dwellStart)/1000; dwellStart=0; gauges(); } };
+  speechSynthesis.speak(u);
+}
+
+/* ══════════════════════════════════════════════════════
+   SPEECH IN
+   ══════════════════════════════════════════════════════ */
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let rec = null, recActive = false;
+
+function startListening(){
+  tap();
+  S.t0 = 0; S.marks = [null,null,null,null,null]; renderMarks();
+  S.rider = "listening"; S.transcript = ""; render();
+  EARCON.listen();
+  heartbeat(false);
+  log("user","Mic", "listening…");
+
+  if(!SR){
+    log("note","No ASR", "This browser has no speech recognition — pick a sample phrase.");
+    return;
+  }
+  try{
+    rec = new SR();
+    rec.lang = "en-IN"; rec.interimResults = true; rec.continuous = false;
+    recActive = true;
+    rec.onresult = e=>{
+      let txt = "";
+      for(let i=0;i<e.results.length;i++) txt += e.results[i][0].transcript;
+      S.transcript = txt.trim();
+      render();
+      if(e.results[e.results.length-1].isFinal){ recActive=false; heard(S.transcript); }
+    };
+    rec.onerror = ev=>{
+      recActive = false;
+      log("warn","ASR error", ev.error + " — use a sample phrase instead.");
+      EARCON.error();
+      S.rider = "idle"; render();
+    };
+    rec.onend = ()=>{ if(recActive){ recActive=false; if(S.transcript) heard(S.transcript); else { S.rider="idle"; render(); } } };
+    rec.start();
+  }catch(err){
+    log("warn","ASR", "could not start — use a sample phrase.");
+    S.rider = "idle"; render();
+  }
+}
+
+function stopListening(){
+  if(rec && recActive){ try{ rec.stop(); }catch(e){} }
+}
+
+function useSample(text){
+  tap();
+  S.t0 = 0; S.marks = [null,null,null,null,null]; renderMarks();
+  S.rider = "listening"; S.transcript = text; render();
+  EARCON.listen();
+  setTimeout(()=>heard(text), 620);
+}
+
+/* ══════════════════════════════════════════════════════
+   NLU — rules first, then the ambiguity budget
+   ══════════════════════════════════════════════════════ */
+function mark(i){
+  if(!S.t0) return;
+  S.marks[i] = performance.now() - S.t0;
+  renderMarks();
+}
+
+const PATTERNS = [
+  /(?:take|drop|bring)\s+me\s+(?:to|at)\s+(.+)/i,
+  /(?:i\s+(?:want|need)\s+to\s+)?go\s+to\s+(.+)/i,
+  /book\s+(?:an?\s+)?(?:auto|car|cab|bike|taxi)?\s*(?:to|for)\s+(.+)/i,
+  /(?:^|\s)to\s+(.+)/i,
+  /(.+?)\s*-?ku\s+poganum/i
+];
+
+function parseIntent(text){
+  const rideType = /\bbike\b/i.test(text) ? "bike"
+                 : /\b(car|cab|taxi)\b/i.test(text) ? "car" : "auto";
+  let q = null, fast = false;
+  for(const p of PATTERNS){
+    const m = text.match(p);
+    if(m && m[1] && m[1].trim().length > 1){ q = m[1]; fast = true; break; }
+  }
+  if(!q) q = text;
+  q = q.replace(/\b(please|now|the|a|an|auto|car|cab|taxi|bike|ride)\b/gi," ")
+       .replace(/[^\w\s]/g," ").replace(/\s+/g," ").trim();
+  return {q, rideType, fast};
+}
+
+function score(q, name){
+  const a = q.toLowerCase().split(" ").filter(Boolean);
+  const b = name.toLowerCase().split(" ").filter(Boolean);
+  if(!a.length) return 0;
+  let hit = 0;
+  for(const w of a) if(b.some(x=>x.startsWith(w)||w.startsWith(x))) hit++;
+  return hit / Math.max(a.length, b.length);
+}
+
+function km(a,b){
+  const R=6371, dLat=(b.lat-a.lat)*Math.PI/180, dLng=(b.lng-a.lng)*Math.PI/180;
+  const s=Math.sin(dLat/2)**2 + Math.cos(a.lat*Math.PI/180)*Math.cos(b.lat*Math.PI/180)*Math.sin(dLng/2)**2;
+  return 2*R*Math.asin(Math.sqrt(s));
+}
+
+const DELTA = 0.16;     // confidence gap below which two candidates are "tied"
+const DIVERGE = 1.5;    // km — below this, being wrong is cheap, so don't ask
+
+function heard(text){
+  S.t0 = performance.now() - 40;
+  mark(0); mark(1);
+  log("user","Heard", text);
+  EARCON.captured();
+  S.rider = "resolving"; render();
+  EARCON.thinking();
+
+  setTimeout(()=>{
+    const {q, rideType, fast} = parseIntent(text);
+    S.rideType = rideType;
+    mark(2);
+    log("note", fast?"Fast path":"Fallback",
+        fast ? `rule matched → "<em>${q}</em>" · ${rideType}`
+             : `no rule matched, whole utterance used → "<em>${q}</em>"`);
+
+    const ranked = PLACES.map(p=>({p, s:score(q, p.n)}))
+                         .sort((a,b)=>b.s-a.s);
+    mark(3);
+
+    if(!ranked.length || ranked[0].s < 0.28){
+      EARCON.error();
+      log("warn","No match","could not resolve a destination");
+      speak("Sorry, I didn't catch a place I know. Please say it again.", 0);
+      S.rider = "idle"; render();
+      return;
+    }
+
+    const gap = ranked[0].s - (ranked[1] ? ranked[1].s : 0);
+    const div = ranked[1] ? km(ranked[0].p, ranked[1].p) : 99;
+
+    if(gap < DELTA && div > DIVERGE){
+      S.candidates = [ranked[0].p, ranked[1].p];
+      S.turns++;
+      log("note","Ambiguity",
+        `gap ${gap.toFixed(2)} &lt; ${DELTA} <em>and</em> ${div.toFixed(1)} km apart &rarr; <b>ask</b>`);
+      S.rider = "clarify"; render(); gauges();
+      speak(`Did you mean ${ranked[0].p.n}, or ${ranked[1].p.n}?`, 1);
+      return;
+    }
+
+    if(gap < DELTA){
+      log("note","Ambiguity",
+        `gap ${gap.toFixed(2)} but only ${div.toFixed(1)} km apart &rarr; <b>don't ask</b>, book it`);
+    }
+    commit(ranked[0].p);
+  }, 320);
+}
+
+function chooseCandidate(p){ tap(); commit(p); }
+
+/* ══════════════════════════════════════════════════════
+   BOOKING
+   ══════════════════════════════════════════════════════ */
+function commit(place){
+  S.dest = place;
+  S.rider = "confirming";
+  S.undoLeft = 5;
+  render();
+  EARCON.booked();
+  speak(`Booking ${S.rideType} to ${place.n}. Say cancel to stop.`, 1);
+
+  clearInterval(S.undoTimer);
+  S.undoTimer = setInterval(()=>{
+    S.undoLeft -= 0.1;
+    if(S.undoLeft <= 0){ clearInterval(S.undoTimer); finding(); }
+    else render();
+  }, 100);
+}
+
+function cancelUndo(){
+  tap();
+  clearInterval(S.undoTimer);
+  EARCON.error();
+  log("warn","Cancelled","user cancelled inside the undo window");
+  speak("Cancelled.", 0);
+  S.rider = "idle"; S.dest = null; render();
+}
+
+function finding(){
+  S.ttcb = (performance.now() - S.t0)/1000;
+  gauges();
+  S.rider = "finding"; render();
+  heartbeat(true);
+  log("note","Booked",`request sent — time to confirmed booking <b>${S.ttcb.toFixed(2)}s</b>`);
+  S.driver = "request";
+  S.fare = 120 + Math.round(Math.random()*140);
+  S.eta  = 4 + Math.round(Math.random()*7);
+  renderDriver();
+  if(S.autoDriver) setTimeout(()=>{ if(S.driver==="request") driverAccept(); }, 2200);
+}
+
+/* ══════════════════════════════════════════════════════
+   DRIVER ACTIONS  →  rider announcements
+   ══════════════════════════════════════════════════════ */
+function driverAccept(){
+  S.drv = DRIVERS[Math.floor(Math.random()*DRIVERS.length)];
+  S.bearing = Math.round(Math.random()*360);
+  S.driver = "topickup"; S.rider = "assigned";
+  render();
+  heartbeat(false);
+  log("drv","Accepted",`${S.drv.name} · ${S.drv.car} · ${S.drv.plate}`);
+  EARCON.assigned();
+  speak(`Driver assigned. ${S.drv.name}, ${S.drv.car}. ${S.drv.phon}. About ${S.eta} minutes.`, 1);
+  startApproach();
+  if(S.autoDriver) setTimeout(()=>{ if(S.driver==="topickup") driverArrived(); }, 9000);
+}
+
+function startApproach(){
+  clearInterval(S.approachTimer);
+  let near = 0;
+  S.approachTimer = setInterval(()=>{
+    if(!["assigned","approaching"].includes(S.rider)){ clearInterval(S.approachTimer); return; }
+    near = Math.min(1, near + 0.14);
+    S.rider = "approaching"; render();
+    EARCON.approach(Math.sin(S.bearing*Math.PI/180), near);
+  }, 1500);
+  log("ear","Earcon","approach tone — tempo rises, no speech spent");
+}
+
+function driverArrived(){
+  clearInterval(S.approachTimer);
+  S.driver = "arrived"; S.rider = "arrived";
+  render();
+  log("drv","Arrived","driver tapped I've arrived");
+  EARCON.arrived();
+  speak("Your car has arrived.", 0);
+}
+
+function driverSays(text){
+  log("drv","Says",text);
+  speak(`${S.drv.name} says: ${text}`, 1);
+}
+
+function driverBeacon(){
+  const pan = Math.sin(S.bearing*Math.PI/180);
+  log("ear","Beacon",`panned ${pan>0?"right":"left"} · bearing ${S.bearing}°`);
+  EARCON.beacon(pan);
+}
+
+function driverOnboard(){
+  S.driver = "intrip"; S.rider = "intrip";
+  render();
+  heartbeat(true);
+  log("drv","Started","passenger confirmed seated");
+  speak(`Trip started. About ${S.eta + 8} minutes to ${S.dest.n}.`, 1);
+}
+
+function driverDeviation(){
+  S.sos = true; render();
+  log("warn","Deviation","route deviation detected → guardian notified");
+  EARCON.alarm();
+  speak("The route has changed. I have alerted your guardian. Say cancel if this is fine.", 0);
+}
+
+function driverComplete(){
+  clearInterval(S.approachTimer);
+  heartbeat(false);
+  S.driver = "complete"; S.rider = "done";
+  render();
+  log("drv","Complete",`fare ₹${S.fare}`);
+  speak(`You have arrived at ${S.dest.n}. Fare is ${S.fare} rupees. Please pay ${S.drv.name} in cash.`, 1);
+}
+
+/* ══════════════════════════════════════════════════════
+   RENDER — rider surface
+   ══════════════════════════════════════════════════════ */
+const $ = id => document.getElementById(id);
+
+function render(){ renderRider(); renderDriver(); renderLadder(); gauges(); }
+
+function renderRider(){
+  const r = $("rider");
+  const st = S.rider;
+  let h = "";
+
+  if(st === "idle"){
+    h = `
+      <button class="orb talk" id="mic"><span class="glyph">🎙</span></button>
+      <div class="big">Hold to speak</div>
+      <div class="say">Say where you want to go. One sentence is enough.</div>
+      <div class="chips">${SAMPLES.map((s,i)=>`<button class="chip" data-s="${i}">${s}</button>`).join("")}</div>
+      <div class="tiny">Samples exist so you can demo without a microphone.</div>`;
+  }
+
+  if(st === "listening"){
+    h = `
+      <button class="orb live talk" id="mic"><span class="glyph">🎙</span></button>
+      <div class="mid amber">${S.transcript || "Listening…"}</div>
+      <button class="act ghost" id="stop">Stop</button>`;
+  }
+
+  if(st === "resolving"){
+    h = `
+      <div class="orb think"><span class="glyph">◌</span></div>
+      <div class="mid">Working on it</div>
+      <div class="say">${S.transcript}</div>`;
+  }
+
+  if(st === "clarify"){
+    h = `
+      <div class="orb ok"><span class="glyph">?</span></div>
+      <div class="mid">Which one?</div>
+      <div class="stack">
+        ${S.candidates.map((c,i)=>`<button class="act" data-c="${i}">${c.n}</button>`).join("")}
+      </div>`;
+  }
+
+  if(st === "confirming"){
+    h = `
+      <div class="orb ok"><span class="glyph">✓</span></div>
+      <div class="big">${S.dest.n}</div>
+      <div class="say">${S.rideType} &middot; booking in ${Math.max(0,S.undoLeft).toFixed(1)}s</div>
+      <div class="undo"><i style="width:${Math.max(0,S.undoLeft)/5*100}%"></i></div>
+      <button class="act danger" id="undo">Cancel</button>`;
+  }
+
+  if(st === "finding"){
+    h = `
+      <div class="orb"><span class="glyph">◍</span></div>
+      <div class="mid">Finding a driver</div>
+      <div class="say">You'll hear a heartbeat while I work. Silence would mean something is wrong.</div>`;
+  }
+
+  if(st === "assigned" || st === "approaching"){
+    h = `
+      <div class="orb ok"><span class="glyph">🚗</span></div>
+      <div class="big">${S.drv.name}</div>
+      <div class="mid">${S.drv.car}</div>
+      <div class="plate teal">${S.drv.plate}</div>
+      <div class="say">${st==="approaching" ? "Getting closer — listen to the tone" : "About "+S.eta+" minutes away"}</div>
+      <button class="act" id="call">Call driver</button>`;
+  }
+
+  if(st === "arrived"){
+    const rot = S.bearing;
+    h = `
+      <div class="compass"><span class="arrow" style="transform:rotate(${rot}deg)">↑</span></div>
+      <div class="big teal">Car is here</div>
+      <div class="plate">${S.drv.plate}</div>
+      <div class="say">Bearing ${rot}° — the tone comes from that side</div>
+      <button class="act" id="call">Call driver</button>`;
+  }
+
+  if(st === "intrip"){
+    h = `
+      <div class="orb ok"><span class="glyph">➔</span></div>
+      <div class="big">On the way</div>
+      <div class="mid">${S.dest.n}</div>
+      <div class="stack">
+        <button class="act" id="status">Status now</button>
+        <button class="act ghost" id="call">Call driver</button>
+      </div>`;
+  }
+
+  if(st === "done"){
+    h = `
+      <div class="orb ok"><span class="glyph">✓</span></div>
+      <div class="big">₹${S.fare}</div>
+      <div class="mid">Pay ${S.drv.name} in cash</div>
+      <button class="act pri" id="again">Book again</button>`;
+  }
+
+  r.innerHTML = h;
+
+  if(S.sos){
+    const o = document.createElement("div");
+    o.className = "sos-full";
+    o.innerHTML = `
+      <div class="big red">Route changed</div>
+      <div class="say">Your guardian has been notified.</div>
+      <button class="act danger" id="sos-call">Call emergency</button>
+      <button class="act ghost" id="sos-ok">This is fine</button>`;
+    $("rider-screen").appendChild(o);
+  } else {
+    const old = $("rider-screen").querySelector(".sos-full");
+    if(old) old.remove();
+  }
+}
+
+/* ── driver ─────────────────────────────────────────── */
+function renderDriver(){
+  const d = $("driver");
+  const st = S.driver;
+  let h = "";
+
+  if(st === "offline"){
+    h = `<div class="dfill" style="display:flex;align-items:center;justify-content:center;flex-direction:column;gap:1rem;text-align:center">
+           <div class="big">Offline</div>
+           <div class="say">Go online to receive requests.</div>
+         </div>
+         <button class="act pri" id="d-online">Go online</button>`;
+  }
+
+  if(st === "waiting"){
+    h = `<div class="dfill" style="display:flex;align-items:center;justify-content:center;flex-direction:column;gap:.8rem;text-align:center">
+           <div class="big teal">Online</div>
+           <div class="say">Waiting for a ride request. Book one on the rider phone.</div>
+         </div>
+         <button class="act ghost" id="d-offline">Go offline</button>`;
+  }
+
+  if(st === "request"){
+    h = `<div class="badge">⚠ PASSENGER IS VISUALLY IMPAIRED<br>You must help them find the car</div>
+         <div class="dfill">
+           <div class="row"><span class="k">Pickup</span><span class="v">Kilpauk</span></div>
+           <div class="row"><span class="k">Drop</span><span class="v">${S.dest.n}</span></div>
+           <div class="row"><span class="k">Ride</span><span class="v">${S.rideType}</span></div>
+           <div class="row"><span class="k">Fare</span><span class="v">₹${S.fare}</span></div>
+         </div>
+         <button class="act pri" id="d-accept">Accept</button>
+         <button class="act ghost" id="d-decline">Decline</button>`;
+  }
+
+  if(st === "topickup"){
+    h = `<div class="badge">⚠ VISUALLY IMPAIRED PASSENGER</div>
+         <div class="dfill">
+           <div class="row"><span class="k">Passenger</span><span class="v">Waiting at Kilpauk</span></div>
+           <div class="row"><span class="k">Your ETA</span><span class="v">${S.eta} min</span></div>
+         </div>
+         <button class="act pri" id="d-arrived">I've arrived</button>
+         <button class="act ghost" id="d-call">Call passenger</button>`;
+  }
+
+  if(st === "arrived"){
+    h = `<div class="badge">TELL THEM WHERE YOU ARE<br>They cannot see your car</div>
+         <div class="dfill presets">
+           ${POSITIONS.map((p,i)=>`<button class="preset" data-p="${i}">“${p}”</button>`).join("")}
+         </div>
+         <button class="act" id="d-beacon">Play audio beacon</button>
+         <button class="act pri" id="d-onboard">Passenger is seated</button>`;
+  }
+
+  if(st === "intrip"){
+    h = `<div class="dfill">
+           <div class="row"><span class="k">Drop</span><span class="v">${S.dest.n}</span></div>
+           <div class="row"><span class="k">Fare</span><span class="v">₹${S.fare}</span></div>
+           <div class="row"><span class="k">Code</span><span class="v plate">${(1000+Math.floor(S.fare)).toString().slice(0,4)}</span></div>
+         </div>
+         <button class="act pri" id="d-complete">Complete trip</button>
+         <button class="act ghost" id="d-deviate">Simulate route deviation</button>`;
+  }
+
+  if(st === "complete"){
+    h = `<div class="dfill" style="display:flex;align-items:center;justify-content:center;flex-direction:column;gap:.6rem;text-align:center">
+           <div class="big">₹${S.fare}</div>
+           <div class="say">Collect in cash</div>
+         </div>
+         <button class="act pri" id="d-next">Next ride</button>`;
+  }
+
+  d.innerHTML = h;
+}
+
+/* ── ladder / marks / gauges / log ──────────────────── */
+function renderLadder(){
+  const i = RIDER_STATES.indexOf(S.rider);
+  $("ladder").innerHTML = RIDER_STATES.map((s,j)=>{
+    const cls = j===i ? "now" : (j<i ? "done" : "");
+    return `<span class="step ${cls}">${s}</span>`;
+  }).join("");
+}
+
+function renderMarks(){
+  const names = ["mic","speech","intent","place","sound"];
+  S.marks.forEach((v,i)=>{
+    const el = $("m-"+i);
+    el.querySelector(".val").textContent = v===null ? "—" : Math.round(v)+"ms";
+    el.classList.toggle("hit", v!==null);
+  });
+}
+
+function gauges(){
+  $("g-ttcb").textContent  = S.ttcb===null ? "—" : S.ttcb.toFixed(2)+"s";
+  $("g-taps").textContent  = S.taps;
+  $("g-turns").textContent = S.turns;
+  $("g-dwell").textContent = S.dwell.toFixed(1)+"s";
+}
+
+function tap(){ S.taps++; gauges(); }
+
+function log(kind, key, msg){
+  const el = document.createElement("div");
+  el.className = "ev " + kind;
+  const t = new Date();
+  const ts = t.toTimeString().slice(3,8) + "." + String(t.getMilliseconds()).padStart(3,"0").slice(0,1);
+  el.innerHTML = `<span class="t">${ts}</span><span class="k">${key}</span><span class="m">${msg}</span>`;
+  $("log").appendChild(el);
+  $("log").scrollTop = $("log").scrollHeight;
+}
+
+/* ══════════════════════════════════════════════════════
+   EVENTS
+   ══════════════════════════════════════════════════════ */
+document.addEventListener("click", e=>{
+  const t = e.target.closest("button");
+  if(!t) return;
+  const id = t.id;
+
+  // rider
+  if(id === "mic"){ ac(); S.rider==="listening" ? stopListening() : startListening(); return; }
+  if(id === "stop"){ tap(); stopListening(); return; }
+  if(t.dataset.s !== undefined){ ac(); useSample(SAMPLES[+t.dataset.s]); return; }
+  if(t.dataset.c !== undefined){ chooseCandidate(S.candidates[+t.dataset.c]); return; }
+  if(id === "undo"){ cancelUndo(); return; }
+  if(id === "call"){ tap(); log("note","Call","masked call placed"); speak("Calling your driver.",1); return; }
+  if(id === "status"){ tap(); speak(`On the way to ${S.dest.n}. About ${S.eta} minutes left.`,1); return; }
+  if(id === "again"){ tap(); softReset(); return; }
+  if(id === "sos-call"){ tap(); log("warn","Emergency","emergency call placed"); EARCON.alarm(); return; }
+  if(id === "sos-ok"){ tap(); S.sos=false; render(); log("note","Dismissed","user marked it a false alarm"); return; }
+
+  // driver
+  if(id === "d-online"){ ac(); S.driver="waiting"; renderDriver(); log("drv","Online","driver went online"); return; }
+  if(id === "d-offline"){ S.driver="offline"; renderDriver(); return; }
+  if(id === "d-accept"){ driverAccept(); return; }
+  if(id === "d-decline"){ log("drv","Declined","looking for another driver"); return; }
+  if(id === "d-arrived"){ driverArrived(); return; }
+  if(id === "d-call"){ log("drv","Call","driver called passenger"); return; }
+  if(t.dataset.p !== undefined){ driverSays(POSITIONS[+t.dataset.p]); return; }
+  if(id === "d-beacon"){ driverBeacon(); return; }
+  if(id === "d-onboard"){ driverOnboard(); return; }
+  if(id === "d-deviate"){ driverDeviation(); return; }
+  if(id === "d-complete"){ driverComplete(); return; }
+  if(id === "d-next"){ softReset(); return; }
+
+  // header
+  if(id === "b-audio"){
+    S.audioOn = !S.audioOn;
+    t.classList.toggle("on", S.audioOn);
+    t.textContent = S.audioOn ? "Audio on" : "Audio off";
+    if(!S.audioOn){ speechSynthesis.cancel(); heartbeat(false); }
+    return;
+  }
+  if(id === "b-auto"){
+    S.autoDriver = !S.autoDriver;
+    t.classList.toggle("on", S.autoDriver);
+    log("note","Auto driver", S.autoDriver ? "on — the driver side will play itself" : "off");
+    return;
+  }
+  if(id === "b-reset"){ hardReset(); return; }
+});
+
+// press-and-hold on the orb, and spacebar as a hardware key stand-in
+document.addEventListener("keydown", e=>{
+  if(e.code === "Space" && !e.repeat && S.rider === "idle"){
+    e.preventDefault(); ac(); startListening();
+  }
+});
+document.addEventListener("keyup", e=>{
+  if(e.code === "Space" && S.rider === "listening"){ e.preventDefault(); stopListening(); }
+});
+
+$("sos-edge").addEventListener("click", ()=>{
+  tap(); S.sos = true; render(); EARCON.alarm();
+  log("warn","SOS","user triggered SOS from the edge");
+  speak("Emergency. Calling your guardian.", 0);
+});
+
+function softReset(){
+  const audio = S.audioOn, auto = S.autoDriver, taps = S.taps;
+  clearInterval(S.undoTimer); clearInterval(S.approachTimer);
+  heartbeat(false); speechSynthesis.cancel();
+  freshState();
+  S.audioOn = audio; S.autoDriver = auto; S.taps = taps;
+  S.driver = "waiting";
+  renderMarks(); render();
+  log("note","Ready","new booking — say where you want to go");
+}
+
+function hardReset(){
+  clearInterval(S.undoTimer); clearInterval(S.approachTimer);
+  heartbeat(false); speechSynthesis.cancel();
+  freshState();
+  $("log").innerHTML = "";
+  document.getElementById("b-auto").classList.remove("on");
+  renderMarks(); render();
+  boot();
+}
+
+function boot(){
+  log("note","Rig ready", SR
+      ? "Hold the mic (or press Space) and say where you want to go."
+      : "No speech recognition in this browser — use the sample phrases.");
+  log("note","Read this", "The rider taps <b>once</b>. Everything after that is the system talking on its own.");
+}
+
+renderMarks(); render(); boot();
+</script>
