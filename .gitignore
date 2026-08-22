@@ -1,0 +1,41 @@
+# OS
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.iml
+*.swp
+
+# Node (if we add tooling later)
+node_modules/
+npm-debug.log*
+package-lock.json
+
+# Android / Kotlin (for when the app lands here)
+*.apk
+*.aab
+*.aar
+*.jks
+*.keystore
+local.properties
+.gradle/
+build/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Ktor / JVM backend
+target/
+out/
+*.class
+*.log
+
+# Secrets — never commit these
+.env
+.env.*
+secrets.properties
+google-services.json
