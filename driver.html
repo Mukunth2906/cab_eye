@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cab Eye — Driver</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="css/theme.css">
+<style>
+  body{overflow:hidden}
+  .shell{height:100vh}
+  #screen{flex:1;min-height:0;display:flex;flex-direction:column;gap:.9rem}
+  .fill{flex:1;min-height:0;display:flex;flex-direction:column;justify-content:center;gap:.2rem}
+  .fill.mid-center{align-items:center;text-align:center;gap:.7rem}
+  .presets{display:flex;flex-direction:column;gap:.55rem}
+  .preset{
+    background:var(--raised);border:2px solid var(--line);border-radius:var(--r);
+    padding:.9rem 1rem;font-size:1.05rem;text-align:left;line-height:1.35;color:var(--ink);
+  }
+  .preset:hover{background:var(--raised-2);border-color:var(--ink-faint)}
+  .code{
+    font-family:var(--mono);font-size:2.2rem;font-weight:600;letter-spacing:.18em;
+    color:var(--teal);text-align:center;
+  }
+</style>
+</head>
+<body>
+
+<main class="shell">
+  <div class="topbar">
+    <div>
+      <div class="who" id="hello">Driver</div>
+      <div class="role" id="vehicle"></div>
+    </div>
+    <div style="display:flex;gap:.9rem;align-items:center">
+      <button class="linkbtn" id="b-auto">Auto: off</button>
+      <button class="linkbtn" id="b-out">Sign out</button>
+    </div>
+  </div>
+
+  <div id="screen"></div>
+</main>
+
+<script src="js/auth.js"></script>
+<script src="js/bus.js"></script>
+<script src="js/driver.js"></script>
+</body>
+</html>

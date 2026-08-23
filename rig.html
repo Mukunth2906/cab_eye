@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cab Eye Test Rig</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="css/theme.css">
+<style>
+  html{font-size:17px}
+  body{height:100vh;overflow:hidden;display:grid;grid-template-rows:auto 1fr}
+
+  .head{display:flex;align-items:center;gap:1.5rem;padding:.8rem 1.3rem;
+        border-bottom:1px solid var(--line);background:var(--panel)}
+  .brand h1{font-family:var(--cond);font-size:1.25rem;font-weight:700;line-height:1}
+  .brand .sub{font-size:.82rem;color:var(--ink-faint);margin-top:.15rem}
+
+  .gauges{display:flex;gap:.5rem;margin-left:auto}
+  .gauge{background:var(--raised);border:1px solid var(--line-soft);
+         border-radius:var(--r);padding:.45rem .8rem;min-width:100px}
+  .gauge .lbl{font-size:.66rem;letter-spacing:.1em;display:block;margin-bottom:.15rem}
+  .gauge .val{font-family:var(--mono);font-size:1.15rem;font-weight:600;
+              font-variant-numeric:tabular-nums;line-height:1.1;color:var(--ink)}
+  .gauge.hero .val{color:var(--teal);font-size:1.4rem}
+
+  .btn{background:var(--raised);border:1px solid var(--line);border-radius:var(--r);
+       padding:.5rem .85rem;font-family:var(--cond);font-size:.82rem;font-weight:600;
+       letter-spacing:.06em;text-transform:uppercase;color:var(--ink-dim)}
+  .btn:hover{background:var(--raised-2);color:var(--ink)}
+
+  .rig{display:grid;grid-template-columns:minmax(320px,1fr) minmax(420px,1.3fr) minmax(320px,1fr);
+       gap:1rem;padding:1rem 1.3rem;min-height:0}
+  .col{display:flex;flex-direction:column;gap:.6rem;min-height:0}
+  .col-head{display:flex;align-items:baseline;gap:.55rem}
+  .col-head .who{font-family:var(--cond);font-size:1rem;font-weight:700}
+  .col-head .tag{font-size:.78rem;color:var(--ink-faint)}
+
+  .phone{flex:1;min-height:0;background:#05080A;border:1px solid var(--line);
+         border-radius:22px;padding:.5rem;display:flex}
+  .phone iframe{flex:1;border:0;border-radius:16px;background:var(--ground)}
+
+  .card{background:var(--panel);border:1px solid var(--line-soft);border-radius:var(--r);padding:.8rem .9rem}
+  .ladder{display:flex;flex-wrap:wrap;gap:.3rem}
+  .step{font-family:var(--mono);font-size:.74rem;padding:.3rem .5rem;border-radius:5px;
+        background:var(--raised);color:var(--ink-faint)}
+  .step.done{color:var(--ink-dim)}
+  .step.now{background:var(--teal);color:var(--on-accent);font-weight:600}
+
+  .marks{display:grid;grid-template-columns:repeat(5,1fr);gap:.45rem}
+  .mk{background:var(--raised);border-radius:7px;padding:.5rem .5rem;text-align:center}
+  .mk .lbl{font-size:.6rem;letter-spacing:.07em;display:block;margin-bottom:.2rem}
+  .mk .val{font-family:var(--mono);font-size:1rem;font-weight:600;font-variant-numeric:tabular-nums}
+  .mk.hit .val{color:var(--amber)}
+
+  .log{flex:1;min-height:0;overflow-y:auto;background:var(--panel);
+       border:1px solid var(--line-soft);border-radius:var(--r);
+       padding:.6rem .7rem;display:flex;flex-direction:column;gap:.35rem;
+       scrollbar-width:thin;scrollbar-color:var(--line) transparent}
+  .log::-webkit-scrollbar{width:8px}
+  .log::-webkit-scrollbar-thumb{background:var(--line);border-radius:4px}
+
+  .ev{display:grid;grid-template-columns:56px 88px 1fr;gap:.5rem;align-items:baseline;
+      font-size:.87rem;line-height:1.35}
+  .ev .t{font-family:var(--mono);font-size:.75rem;color:var(--ink-faint);font-variant-numeric:tabular-nums}
+  .ev .k{font-family:var(--cond);font-size:.7rem;font-weight:700;letter-spacing:.09em;text-transform:uppercase}
+  .ev.user .k{color:var(--amber)}
+  .ev.sys  .k{color:var(--teal)}
+  .ev.ear  .k{color:var(--violet)}
+  .ev.drv  .k{color:var(--green)}
+  .ev.warn .k{color:var(--red)}
+  .ev.note .k{color:var(--ink-faint)}
+  .ev.note .m{color:var(--ink-dim)}
+  .ev .m em{font-style:normal;color:var(--ink-faint)}
+</style>
+</head>
+<body>
+
+<header class="head">
+  <div class="brand">
+    <h1>CAB EYE — TEST RIG</h1>
+    <div class="sub">Both apps side by side, on one event bus. The instrumentation the paper reports.</div>
+  </div>
+
+  <div class="gauges">
+    <div class="gauge hero"><span class="lbl">Time to booking</span><span class="val" id="g-ttcb">—</span></div>
+    <div class="gauge"><span class="lbl">Rider taps</span><span class="val" id="g-taps">0</span></div>
+    <div class="gauge"><span class="lbl">Clarify turns</span><span class="val" id="g-turns">0</span></div>
+    <div class="gauge"><span class="lbl">Audio dwell</span><span class="val" id="g-dwell">0.0s</span></div>
+  </div>
+
+  <button class="btn" id="b-clear">Clear log</button>
+  <button class="btn" id="b-reload">Reload both</button>
+</header>
+
+<main class="rig">
+  <section class="col">
+    <div class="col-head"><span class="who">Rider</span><span class="tag">blind user · one surface</span></div>
+    <div class="phone"><iframe id="f-rider" src="rider.html?demo=1" title="Rider app"></iframe></div>
+  </section>
+
+  <section class="col">
+    <div class="col-head"><span class="who">Instrumentation</span><span class="tag">what the paper measures</span></div>
+
+    <div class="card">
+      <span class="lbl" style="display:block;margin-bottom:.45rem">Rider state</span>
+      <div class="ladder" id="ladder"></div>
+    </div>
+
+    <div class="card">
+      <span class="lbl" style="display:block;margin-bottom:.45rem">Latency marks — mic release to first sound</span>
+      <div class="marks">
+        <div class="mk" id="m-0"><span class="lbl">T0 mic</span><span class="val">—</span></div>
+        <div class="mk" id="m-1"><span class="lbl">T1 speech</span><span class="val">—</span></div>
+        <div class="mk" id="m-2"><span class="lbl">T2 intent</span><span class="val">—</span></div>
+        <div class="mk" id="m-3"><span class="lbl">T3 place</span><span class="val">—</span></div>
+        <div class="mk" id="m-4"><span class="lbl">T4 sound</span><span class="val">—</span></div>
+      </div>
+    </div>
+
+    <div class="log" id="log"></div>
+  </section>
+
+  <section class="col">
+    <div class="col-head"><span class="who">Driver</span><span class="tag">sighted · conventional UI</span></div>
+    <div class="phone"><iframe id="f-driver" src="driver.html?demo=1" title="Driver app"></iframe></div>
+  </section>
+</main>
+
+<script src="js/auth.js"></script>
+<script src="js/bus.js"></script>
+<script>
+// The rig signs both roles in so the two frames boot straight into the apps.
+CE.auth.ensureDemo();
+
+const $ = id => document.getElementById(id);
+const T = CE.bus.T;
+const STATES = ["idle","listening","resolving","clarify","confirming",
+                "finding","assigned","approaching","arrived","intrip","done"];
+
+function ladder(now){
+  const i = STATES.indexOf(now);
+  $("ladder").innerHTML = STATES.map((s,j)=>
+    `<span class="step ${j===i?"now":(j<i?"done":"")}">${s}</span>`).join("");
+}
+ladder("idle");
+
+CE.bus.on(T.STATE, p=>{ if(p.rider) ladder(p.rider); });
+
+CE.bus.on(T.MARKS, p=>{
+  (p.marks || []).forEach((v,i)=>{
+    const el = $("m-"+i); if(!el) return;
+    el.querySelector(".val").textContent = v === null || v === undefined ? "—" : Math.round(v)+"ms";
+    el.classList.toggle("hit", v !== null && v !== undefined);
+  });
+});
+
+CE.bus.on(T.METRICS, p=>{
+  $("g-ttcb").textContent  = p.ttcb === null || p.ttcb === undefined ? "—" : p.ttcb.toFixed(2)+"s";
+  $("g-taps").textContent  = p.taps ?? 0;
+  $("g-turns").textContent = p.turns ?? 0;
+  $("g-dwell").textContent = (p.dwell ?? 0).toFixed(1)+"s";
+});
+
+CE.bus.on(T.LOG, p=>{
+  const el = document.createElement("div");
+  el.className = "ev " + (p.kind || "note");
+  const t = new Date();
+  const ts = t.toTimeString().slice(3,8) + "." + String(t.getMilliseconds()).padStart(3,"0")[0];
+  el.innerHTML = `<span class="t">${ts}</span><span class="k">${p.key}</span><span class="m">${p.msg}</span>`;
+  $("log").appendChild(el);
+  $("log").scrollTop = $("log").scrollHeight;
+});
+
+$("b-clear").addEventListener("click", ()=>{ $("log").innerHTML = ""; });
+$("b-reload").addEventListener("click", ()=>{
+  $("f-rider").contentWindow.location.reload();
+  $("f-driver").contentWindow.location.reload();
+  $("log").innerHTML = "";
+  ladder("idle");
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cab Eye — Rider</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="css/theme.css">
+<style>
+  body{overflow:hidden}
+  .shell{height:100vh;position:relative;padding-right:2.6rem}
+
+  /* the single surface — every state renders here, nothing navigates */
+  #surface{
+    flex:1;min-height:0;overflow-y:auto;
+    display:flex;flex-direction:column;align-items:center;
+    justify-content:center;justify-content:safe center;
+    gap:1.05rem;text-align:center;padding:.6rem 0;
+    scrollbar-width:none;
+  }
+  #surface::-webkit-scrollbar{width:0}
+
+  .orb{
+    width:min(160px,26vh);height:min(160px,26vh);border-radius:50%;
+    border:4px solid var(--line);background:var(--panel);
+    display:flex;align-items:center;justify-content:center;
+    flex-shrink:0;font-size:2.9rem;line-height:1;
+    transition:border-color .2s,background .2s;
+  }
+  .orb.live {border-color:var(--amber);background:rgba(245,182,92,.12);animation:breathe 1.5s ease-in-out infinite}
+  .orb.think{border-color:var(--violet);background:rgba(176,166,240,.10);animation:breathe 1s ease-in-out infinite}
+  .orb.ok   {border-color:var(--teal);background:rgba(78,211,193,.12)}
+  @keyframes breathe{0%,100%{transform:scale(1)}50%{transform:scale(1.055)}}
+
+  .talk{cursor:pointer;user-select:none;-webkit-user-select:none}
+
+  .undo{width:100%;max-width:340px;height:8px;border-radius:4px;background:var(--raised);overflow:hidden}
+  .undo i{display:block;height:100%;background:var(--amber)}
+
+  .compass{
+    width:132px;height:132px;border-radius:50%;border:3px solid var(--line);
+    display:flex;align-items:center;justify-content:center;flex-shrink:0;
+  }
+  .compass span{font-size:3rem;line-height:1;color:var(--teal)}
+
+  .chips{display:flex;flex-wrap:wrap;gap:.5rem;justify-content:center;max-width:420px}
+  .chip{
+    background:var(--raised);border:1px solid var(--line);border-radius:99px;
+    padding:.55rem .95rem;font-size:.95rem;color:var(--ink-dim);
+  }
+  .chip:hover{background:var(--raised-2);color:var(--ink)}
+
+  .sos-edge{
+    position:absolute;right:0;top:0;bottom:0;width:2.4rem;
+    background:linear-gradient(90deg,transparent,rgba(242,119,106,.20));
+    display:flex;align-items:center;justify-content:center;writing-mode:vertical-rl;
+    font-family:var(--cond);font-size:.85rem;font-weight:700;letter-spacing:.26em;
+    color:var(--red);cursor:pointer;
+  }
+  .sos-edge:hover{background:linear-gradient(90deg,transparent,rgba(242,119,106,.34))}
+
+  .sos-full{
+    position:fixed;inset:0;background:rgba(18,4,3,.97);z-index:20;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;
+    gap:1.2rem;padding:2rem;text-align:center;
+  }
+  .sos-full .stack{max-width:340px}
+
+  .maxw{width:100%;max-width:340px}
+
+  /* the ear indicator — shows when the app is actually listening */
+  .ear{
+    display:flex;align-items:center;gap:.55rem;
+    background:var(--raised);border:2px solid var(--line);border-radius:99px;
+    padding:.5rem 1rem;font-size:1rem;color:var(--ink-dim);
+  }
+  .ear .dot{width:11px;height:11px;border-radius:50%;background:var(--ink-faint);flex-shrink:0}
+  .ear.on{border-color:var(--amber);color:var(--ink)}
+  .ear.on .dot{background:var(--amber);animation:pulse 1.1s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.75)}}
+</style>
+</head>
+<body>
+
+<main class="shell">
+  <div class="topbar">
+    <div>
+      <div class="who" id="hello">Rider</div>
+      <div class="role" id="mic-state">Mic closed</div>
+    </div>
+    <div style="display:flex;gap:.8rem;align-items:center">
+      <button class="linkbtn" id="b-hands">Hands-free: on</button>
+      <button class="linkbtn" id="b-audio">Audio on</button>
+      <button class="linkbtn" id="b-out">Sign out</button>
+    </div>
+  </div>
+
+  <div id="surface"></div>
+  <div class="sos-edge" id="sos-edge" title="Emergency">SOS</div>
+</main>
+
+<script src="js/auth.js"></script>
+<script src="js/bus.js"></script>
+<script src="js/audio.js"></script>
+<script src="js/nlu.js"></script>
+<script src="js/voice.js"></script>
+<script src="js/rider.js"></script>
+</body>
+</html>

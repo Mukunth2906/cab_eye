@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sign in — Cab Eye</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="css/theme.css">
+<style>
+  .shell{justify-content:center;gap:1.6rem}
+  form{display:flex;flex-direction:column;gap:1.1rem}
+  .hint-box{background:var(--panel);border:1px solid var(--line-soft);
+            border-radius:var(--r);padding:.9rem 1rem}
+</style>
+</head>
+<body>
+
+<main class="shell">
+  <a class="linkbtn" href="index.html">← Back</a>
+
+  <div>
+    <span class="lbl" id="eyebrow">Sign in</span>
+    <h1 class="big" id="heading">Sign in</h1>
+    <p class="say" id="blurb" style="margin-top:.5rem"></p>
+  </div>
+
+  <div id="error" class="err" hidden></div>
+
+  <form id="form" novalidate>
+    <div id="fields" class="stack"></div>
+    <button class="act pri" type="submit" id="submit">Continue</button>
+  </form>
+
+  <div class="hint-box" id="hint"></div>
+</main>
+
+<script src="js/auth.js"></script>
+<script>
+const role = new URLSearchParams(location.search).get("role") === "driver" ? "driver" : "rider";
+const $ = id => document.getElementById(id);
+
+if(role === "rider"){
+  $("eyebrow").textContent = "Rider — one-time setup";
+  $("heading").textContent = "Set up once";
+  $("blurb").textContent =
+    "This is the only form you will ever see. After this the app opens straight into the microphone — no password, no code, no login screen.";
+  $("fields").innerHTML = `
+    <div class="field">
+      <label for="name">Your name</label>
+      <input id="name" name="name" type="text" autocomplete="name" placeholder="Harshini" required>
+    </div>
+    <div class="field">
+      <label for="guardian">Guardian's phone <span style="color:var(--ink-faint);font-weight:400">(optional)</span></label>
+      <input id="guardian" name="guardian" type="tel" autocomplete="tel" placeholder="98xxxxxxxx">
+    </div>`;
+  $("submit").textContent = "Finish setup";
+  $("hint").innerHTML = `<p class="tiny">
+    A sighted helper normally does this once, at handover. In the real app this
+    step also enrols a fingerprint, and the device keeps a token from then on.</p>`;
+} else {
+  $("eyebrow").textContent = "Driver";
+  $("heading").textContent = "Driver sign in";
+  $("blurb").textContent = "Conventional login — you are sighted, so a normal form is the right tool here.";
+  $("fields").innerHTML = `
+    <div class="field">
+      <label for="email">Email</label>
+      <input id="email" name="email" type="email" autocomplete="username" placeholder="ravi@cabeye.test" required>
+    </div>
+    <div class="field">
+      <label for="pass">Password</label>
+      <input id="pass" name="pass" type="password" autocomplete="current-password" placeholder="••••••••" required>
+    </div>`;
+  $("submit").textContent = "Sign in";
+  $("hint").innerHTML = `<p class="tiny"><b>Demo accounts</b><br>
+    ravi@cabeye.test &nbsp;·&nbsp; suresh@cabeye.test<br>
+    password for both: <span class="mono">driver123</span></p>`;
+}
+
+$("form").addEventListener("submit", e=>{
+  e.preventDefault();
+  $("error").hidden = true;
+
+  if(role === "rider"){
+    const name = $("name").value.trim();
+    if(!name){ fail("Please enter a name so the app can greet you."); return; }
+    CE.auth.setupRider({name, guardian: $("guardian").value});
+    location.href = "rider.html";
+  } else {
+    const s = CE.auth.loginDriver($("email").value, $("pass").value);
+    if(!s){ fail("That email and password don't match. Try ravi@cabeye.test / driver123."); return; }
+    location.href = "driver.html";
+  }
+});
+
+function fail(msg){
+  const e = $("error");
+  e.textContent = msg;
+  e.hidden = false;
+  e.scrollIntoView({block:"nearest"});
+}
+</script>
+</body>
+</html>

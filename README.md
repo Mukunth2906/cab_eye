@@ -1,80 +1,155 @@
-# Eyes-Free Booking Rig
+# Cab Eye
 
-Interactive prototype of the voice-first cab booking system. Rider phone on the left,
-driver phone on the right, instrumentation in the middle. It actually speaks.
-
-## Repository
-
-GitHub: https://github.com/Mukunth2906/cab_eye
+Voice-first cab booking for blind users. Two separate apps — rider and driver — that
+talk to each other for real, plus a side-by-side test rig for demos and measurements.
 
 ## Run it
 
-Open `index.html` in **Google Chrome**. Nothing to install, no server, no build step.
+**Double-click `rig.html`.** That's it — no server, no install. Everything runs.
 
-Chrome matters — speech recognition only works there. Firefox will run everything else
-but you'll have to use the sample phrases instead of your voice.
+Use **Google Chrome**; speech recognition only works there.
+
+If you want the rider and driver as two genuinely separate windows (or on two phones over
+wifi), you need a server. Double-click `serve.bat`, or run `python -m http.server 8000`,
+then open `http://localhost:8000`. Opened straight from a file, only `rig.html` works,
+because that's the page that hosts both apps.
+
+| Page | What it is |
+|---|---|
+| `index.html` | Role picker — Rider or Driver |
+| `rider.html` | The blind user's app. One surface, no navigation |
+| `driver.html` | The driver's app. Conventional, sighted |
+| `rig.html` | Both apps side by side + instrumentation. **This is the paper view** |
+
+## The rule this app follows
+
+**If the app asks a question out loud, it listens for the answer out loud.**
+
+That sounds obvious, and almost no voice app does it. The earlier version said
+*"East or West?"* and then expected a finger, and said *"say cancel to stop"* while
+nothing was listening. A blind user cannot answer a spoken question by finding a button.
+
+Now every spoken prompt is answerable by speaking:
+
+| The app says | You say |
+|---|---|
+| *"Ready. Just say where you want to go."* | "take me to Anna Nagar" |
+| *"Did you mean Anna Nagar East, or West?"* | "east" · "the first one" |
+| *"Say cancel to stop."* | "cancel" — and it really cancels |
+| anything, any time | "status" · "call driver" · "repeat" · "book again" · "help" |
+
+**A complete ride takes zero taps.** The `Rider taps` gauge in the rig shows `0`.
+
+Speaking also interrupts the narrator mid-sentence — you never have to wait it out.
+`Hands-free: on/off` in the rider's top bar turns the standing mic off if it misbehaves;
+every button still works.
 
 ## Try this first
 
-1. Click **Auto driver** in the top right so the driver side plays itself.
-2. Hold the mic (or press **Spacebar**) and say *"take me to Anna Nagar."*
-3. Listen. Don't touch anything else. The whole ride runs on its own.
+Double-click **rig.html** and put headphones on. On the driver phone (right) press
+**Go online**, then set **Auto: on**.
 
-Then run it again with *"take me to Anna Nagar East"* and watch the difference in the
-log — the first one asks you which Anna Nagar, the second one doesn't.
+Click once anywhere on the rider phone — browsers need one gesture before they'll make a
+sound. It says *"Ready. Just say where you want to go"* and the mic opens on its own.
+
+Now **say** *"take me to Anna Nagar"* and don't touch the screen again. It will ask which
+Anna Nagar; **say "east"**. Then just listen.
+
+Run it again with *"take me to Anna Nagar East"* and watch the `AMBIGUITY` line change
+from `→ ask` to `→ book it`.
+
+To see them as genuinely separate apps, open `rider.html` in one window and
+`driver.html` in another — or on two phones on the same wifi.
+
+## Sign in
+
+**Rider — once, ever.** Name and guardian's number, then the app opens straight into the
+mic on every later launch. That is deliberate: a typed login form is the worst possible
+screen for a blind user, and it would contradict the zero-navigation claim. In the real
+app a helper does this at handover and the device keeps a token.
+
+**Driver — a normal form**, because they can see.
+
+```
+ravi@cabeye.test      driver123
+suresh@cabeye.test    driver123
+```
 
 ## What to look at
 
-**The rider taps once.** After the mic, everything you hear is the system talking on its
-own. That's the claim. The Taps counter at the top proves it.
+**The rider taps once.** The `Rider taps` gauge proves it. Everything after the mic is
+the system talking on its own.
 
-**The ambiguity rule fires in the log.** Look for the `AMBIGUITY` line:
+**The ambiguity rule fires in the log:**
 
 ```
 gap 0.00 < 0.16 and 2.0 km apart  →  ask
 gap 0.00 < 0.16 but 0.4 km apart  →  don't ask, book it
 ```
 
-That's the confidence-gated clarification policy. It only spends a turn when being
-wrong would actually cost the user something. Tune `DELTA` and `DIVERGE` in the script.
+Ask only when being wrong would cost the user something. Tune `DELTA` and `DIVERGE` in
+`js/nlu.js`.
 
-**The fast path vs fallback line.** `FAST PATH` means a rule matched the sentence in
-microseconds. `FALLBACK` means it didn't. Count these across 30 utterances and you have
-a real result for the paper — the fraction of speech the cheap path handles.
+**Fast path vs fallback.** `FAST PATH` means a regex matched in microseconds. Count these
+across 30 utterances and that fraction is a result for the paper.
 
-**Earcons instead of speech.** While the driver approaches, the rider hears a tone that
-speeds up, not a sentence. Watch the `Audio dwell` gauge stay flat during that stretch.
-Speech time is task time, so every second not spent talking is a second saved.
+**Earcons instead of speech.** While the driver approaches, the rider hears a rising tone,
+not a sentence. `Audio dwell` stays flat through that stretch. Speech time is task time.
 
-**Stereo bearing.** On the driver phone, tap **Play audio beacon**. It pans left or right
-to match the driver's real bearing. Use headphones. This is the last-50-metres idea.
+**Stereo bearing.** On the driver phone tap **Play audio beacon** — it pans to the
+driver's real bearing. Use headphones. This is the last-50-metres idea.
 
-**Latency marks.** T0–T4 across the middle. Mic release → speech recognised → intent
-parsed → place resolved → first sound. This is exactly the instrumentation the Android
-spike needs. Whatever numbers you see here are your browser's, not Android's, but the
-five measurement points are the same.
+**The driver's taps become the rider's speech.** Tap a position phrase on the driver
+phone and the rider hears it spoken. Each side uses the channel that suits their
+situation; the system translates.
 
-## One thing to know about the numbers
+**Latency marks.** T0–T4: mic release → speech recognised → intent parsed → place
+resolved → first sound. Same five measurement points the Android spike needs.
 
-`Time to booking` includes the 5-second undo window, because the booking genuinely
-isn't confirmed until that window closes. If you'd rather report the moment intent was
-resolved, that's the T3 mark. Change the window length in `commit()` — `S.undoLeft = 5`.
+## One thing about the numbers
+
+`Time to booking` includes the 5-second undo window, because the booking isn't confirmed
+until it closes. If you'd rather report the moment intent was resolved, that's **T3**.
+Change the window in `js/rider.js` — `UNDO_SECONDS`.
+
+## Structure
+
+```
+index.html        role picker
+login.html        driver login + one-time rider setup
+rider.html        rider app
+driver.html       driver app
+rig.html          side-by-side + instrumentation
+serve.bat         starts a local server on Windows
+
+css/theme.css     colours, type, components — shared by every page
+js/bus.js         BroadcastChannel event bus between the two apps
+js/audio.js       tone(), earcons, heartbeat, the narrator
+js/voice.js       the ear — dictation, spoken answers, standing commands
+js/nlu.js         places, patterns, the ambiguity rule
+js/auth.js        demo accounts, per-role sessions
+js/rider.js       the rider state machine
+js/driver.js      the driver screens
+```
+
+`CODE_WALKTHROUGH.md` explains every file in detail.
 
 ## Tech stack
 
-**This prototype** — deliberately dependency-free so it runs anywhere:
+**This prototype** — no dependencies, no build step:
 
 | Piece | What it uses |
 |---|---|
-| Everything | Plain HTML + CSS + JavaScript, single file, no build |
+| Everything | Plain HTML + CSS + JavaScript |
 | Voice out | Web Speech API (`speechSynthesis`) |
 | Voice in | Web Speech API (`webkitSpeechRecognition`), Chrome only |
 | Earcons, heartbeat, beacon | Web Audio API oscillators |
 | Bearing audio | Web Audio `StereoPannerNode` |
+| App-to-app | `BroadcastChannel` — same shape as the production WebSocket |
 | Intent | Regex patterns + a 15-place Chennai gazetteer |
-| Type | IBM Plex, loaded from Google Fonts |
+| Type | IBM Plex, from Google Fonts |
 
-**The real product** — unchanged from what we agreed:
+**The real product:**
 
 | Piece | What it uses |
 |---|---|
@@ -88,16 +163,16 @@ resolved, that's the T3 mark. Change the window length in `commit()` — `S.undo
 
 Cut for now: payment, Kafka, Redis, Keycloak, microservices, Docker, cloud deploy.
 
-## What's fake in here
+## What's fake
 
-The gazetteer is 15 hardcoded places, there's no real geocoding, no routing, no map, no
-backend, no persistence, and the driver is a person clicking buttons rather than a moving
-car. None of that matters for what this is for — it exists so we can *hear* the design
-and time it before writing Android code.
+15 hardcoded places, no real geocoding, no routing, no map, no backend, no persistence
+beyond `localStorage`, and the driver is a person clicking buttons rather than a moving
+car. None of that matters — this exists so we can *hear* the design and time it before
+writing Android code.
 
-## Files
+## Accessibility notes
 
-```
-index.html    the whole prototype
-README.md     this file
-```
+Every text-on-background pair is 7:1 or better (WCAG AAA). Touch targets are at least
+64px tall. `prefers-reduced-motion` is respected. Focus rings are visible everywhere.
+The rider app is fully operable from the spacebar, which stands in for a hardware key —
+so it works with the screen off.

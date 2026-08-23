@@ -1,0 +1,148 @@
+/* ═══════════════════════════════════════════════════════════
+   CAB EYE — shared theme
+   Dark, high contrast. Every text/ground pair is ≥ 7:1 (WCAG AAA).
+   ═══════════════════════════════════════════════════════════ */
+
+:root{
+  /* grounds */
+  --ground:#0A0C0D;
+  --panel:#141A1D;
+  --raised:#1E272C;
+  --raised-2:#2A363C;
+  --line:#3A484E;
+  --line-soft:#252F34;
+
+  /* text — bright, not grey */
+  --ink:#F5F9F8;        /* 17:1 on ground */
+  --ink-dim:#C6D1CE;    /* 11:1 */
+  --ink-faint:#A2AFAC;  /*  7.4:1 — nothing dimmer than this exists */
+
+  /* voices */
+  --amber:#F5B65C;      /* the rider speaking   */
+  --teal:#4ED3C1;       /* the system speaking  */
+  --violet:#B0A6F0;     /* earcon, non-speech   */
+  --red:#F2776A;        /* alert                */
+  --green:#72DFA4;      /* driver events        */
+  --on-accent:#05110F;
+
+  --sans:"IBM Plex Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  --cond:"IBM Plex Sans Condensed","IBM Plex Sans",-apple-system,"Segoe UI",sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,"Cascadia Code",Consolas,monospace;
+
+  --r:12px;
+  --gap:1rem;
+}
+
+*{box-sizing:border-box;margin:0;padding:0}
+html{font-size:19px}
+
+body{
+  background:var(--ground);
+  color:var(--ink);
+  font-family:var(--sans);
+  -webkit-font-smoothing:antialiased;
+  min-height:100vh;
+}
+
+button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
+button:focus-visible,a:focus-visible,input:focus-visible{
+  outline:3px solid var(--teal);outline-offset:3px;
+}
+a{color:var(--teal)}
+
+/* ── type ─────────────────────────────────────────────── */
+.lbl{
+  font-family:var(--cond);font-size:.8rem;font-weight:600;
+  letter-spacing:.14em;text-transform:uppercase;color:var(--ink-faint);
+}
+.display{font-family:var(--cond);font-size:2.6rem;font-weight:700;line-height:1.05;text-wrap:balance}
+.big{font-family:var(--cond);font-size:2.1rem;font-weight:700;line-height:1.1;text-wrap:balance}
+.mid{font-size:1.35rem;font-weight:600;line-height:1.3;text-wrap:balance}
+.say{font-size:1.05rem;color:var(--ink-dim);line-height:1.5;max-width:32ch}
+.tiny{font-size:.9rem;color:var(--ink-faint);line-height:1.45}
+.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.plate{font-family:var(--mono);font-size:1.25rem;font-weight:600;letter-spacing:.06em}
+.amber{color:var(--amber)} .teal{color:var(--teal)} .red{color:var(--red)}
+.center{text-align:center}
+
+/* ── buttons ──────────────────────────────────────────── */
+.act{
+  width:100%;
+  background:var(--raised);border:2px solid var(--line);
+  border-radius:var(--r);padding:1.05rem 1.2rem;
+  font-family:var(--cond);font-size:1.15rem;font-weight:600;
+  letter-spacing:.05em;text-transform:uppercase;color:var(--ink);
+  transition:background .14s,border-color .14s;
+  min-height:64px;
+}
+.act:hover{background:var(--raised-2);border-color:var(--ink-faint)}
+.act.pri{background:var(--teal);border-color:var(--teal);color:var(--on-accent)}
+.act.pri:hover{background:#63E0CF;border-color:#63E0CF}
+.act.danger{background:var(--red);border-color:var(--red);color:#160403}
+.act.danger:hover{background:#F58879;border-color:#F58879}
+.act.ghost{background:transparent;border-color:var(--line);color:var(--ink-dim)}
+.act.ghost:hover{color:var(--ink)}
+.act.huge{min-height:120px;font-size:1.45rem;flex-direction:column;gap:.35rem;display:flex;
+          align-items:center;justify-content:center}
+.act .sub{font-family:var(--sans);font-size:.9rem;font-weight:400;
+          letter-spacing:0;text-transform:none;color:inherit;opacity:.8}
+
+.stack{display:flex;flex-direction:column;gap:.7rem;width:100%}
+
+/* ── fields ───────────────────────────────────────────── */
+.field{display:flex;flex-direction:column;gap:.4rem;width:100%}
+.field label{font-size:1rem;font-weight:600;color:var(--ink-dim)}
+.field input{
+  width:100%;background:var(--panel);border:2px solid var(--line);
+  border-radius:var(--r);padding:.9rem 1rem;
+  font-family:var(--sans);font-size:1.1rem;color:var(--ink);min-height:60px;
+}
+.field input::placeholder{color:var(--ink-faint)}
+.field input:focus{border-color:var(--teal);outline:none}
+
+.err{
+  background:rgba(242,119,106,.15);border:2px solid var(--red);
+  border-radius:var(--r);padding:.8rem 1rem;color:var(--ink);font-size:1rem;
+}
+
+/* ── surfaces ─────────────────────────────────────────── */
+.card{background:var(--panel);border:1px solid var(--line-soft);border-radius:var(--r);padding:1rem 1.1rem}
+
+.shell{
+  min-height:100vh;display:flex;flex-direction:column;
+  max-width:560px;margin:0 auto;padding:1.6rem 1.4rem;gap:1.2rem;
+}
+
+.topbar{
+  display:flex;align-items:center;justify-content:space-between;
+  gap:.9rem;flex-wrap:wrap;row-gap:.45rem;flex-shrink:0;
+  padding-bottom:.9rem;border-bottom:1px solid var(--line-soft);
+}
+.topbar .who{font-family:var(--cond);font-size:1.1rem;font-weight:700;letter-spacing:.02em}
+.topbar .role{font-size:.9rem;color:var(--ink-faint)}
+.linkbtn{
+  font-family:var(--cond);font-size:.82rem;font-weight:600;letter-spacing:.06em;
+  text-transform:uppercase;color:var(--ink-faint);padding:.4rem .2rem;
+  white-space:nowrap;
+}
+.linkbtn:hover{color:var(--ink)}
+
+/* ── rows ─────────────────────────────────────────────── */
+.row{
+  display:flex;justify-content:space-between;align-items:baseline;gap:1rem;
+  padding:.75rem 0;border-bottom:1px solid var(--line-soft);
+}
+.row .k{font-size:.95rem;color:var(--ink-faint)}
+.row .v{font-size:1.15rem;font-weight:600;text-align:right}
+
+.badge{
+  background:rgba(242,119,106,.16);border:2px solid var(--red);
+  border-radius:var(--r);padding:.85rem 1rem;
+  font-family:var(--cond);font-size:1rem;font-weight:700;
+  letter-spacing:.04em;color:var(--ink);text-align:center;line-height:1.35;
+}
+.badge b{color:var(--red)}
+
+@media (prefers-reduced-motion:reduce){
+  *{animation:none!important;transition:none!important}
+}
