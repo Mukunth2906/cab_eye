@@ -85,6 +85,10 @@ CE.audio = (function(){
       clearTimeout(watchdog);
       if(dwellStart){ dwell += (performance.now()-dwellStart)/1000; dwellStart = 0; }
       speaking = false;
+      // Stamp the moment narration stopped. voice.js refuses to trust
+      // any transcript for a short guard window after this, so the
+      // recogniser cannot transcribe the phone's own speaker.
+      if(CE.voice && CE.voice.noteSpeechEnded) CE.voice.noteSpeechEnded();
       if(onDone) onDone();
     };
     u.onstart = ()=>{ speaking = true; dwellStart = performance.now(); if(onFirstAudio) onFirstAudio(); };
@@ -99,6 +103,7 @@ CE.audio = (function(){
   function shutUp(){
     try{ speechSynthesis.cancel(); }catch(e){}
     speaking = false;
+    if(CE.voice && CE.voice.noteSpeechEnded) CE.voice.noteSpeechEnded();
   }
 
   return {

@@ -73,9 +73,26 @@
   .ev.note .k{color:var(--ink-faint)}
   .ev.note .m{color:var(--ink-dim)}
   .ev .m em{font-style:normal;color:var(--ink-faint)}
+
+  .filewarn{
+    background:rgba(242,119,106,.14);border-bottom:2px solid var(--red);
+    color:var(--ink);padding:.75rem 1.3rem;font-size:.95rem;line-height:1.5;
+  }
+  .filewarn b{color:var(--red)}
+  .filewarn code{font-family:var(--mono);font-size:.88em;background:var(--raised);
+                 padding:.1rem .35rem;border-radius:4px}
 </style>
 </head>
 <body>
+
+<!-- The one banner that had to exist. Opened from disk, this page
+     looks completely healthy while the microphone is unreachable. -->
+<div class="filewarn" id="filewarn" hidden>
+  <b>The microphone is switched off because this page was opened from a file.</b>
+  Chrome only grants microphone access over <code>http://localhost</code> or HTTPS.
+  Close this, run <code>serve.bat</code> (or <code>python -m http.server 8000</code>)
+  in the project folder, and open <code>http://localhost:8000/rig.html</code>.
+</div>
 
 <header class="head">
   <div class="brand">
@@ -97,7 +114,8 @@
 <main class="rig">
   <section class="col">
     <div class="col-head"><span class="who">Rider</span><span class="tag">blind user · one surface</span></div>
-    <div class="phone"><iframe id="f-rider" src="rider.html?demo=1" title="Rider app"></iframe></div>
+    <div class="phone"><iframe id="f-rider" src="rider.html?demo=1" title="Rider app"
+        allow="microphone; autoplay"></iframe></div>
   </section>
 
   <section class="col">
@@ -124,7 +142,8 @@
 
   <section class="col">
     <div class="col-head"><span class="who">Driver</span><span class="tag">sighted · conventional UI</span></div>
-    <div class="phone"><iframe id="f-driver" src="driver.html?demo=1" title="Driver app"></iframe></div>
+    <div class="phone"><iframe id="f-driver" src="driver.html?demo=1" title="Driver app"
+        allow="microphone; autoplay"></iframe></div>
   </section>
 </main>
 
@@ -133,6 +152,16 @@
 <script>
 // The rig signs both roles in so the two frames boot straight into the apps.
 CE.auth.ensureDemo();
+
+// Secure context or not? Everything voice depends on this one answer.
+const SECURE = window.isSecureContext ||
+               location.protocol === "https:" ||
+               location.hostname === "localhost" ||
+               location.hostname === "127.0.0.1";
+if(!SECURE){
+  document.getElementById("filewarn").hidden = false;
+  document.body.style.gridTemplateRows = "auto auto 1fr";
+}
 
 const $ = id => document.getElementById(id);
 const T = CE.bus.T;

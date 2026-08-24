@@ -1,0 +1,630 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cab Eye — self test</title>
+
+<!-- ═══════════════════════════════════════════════════════════
+     This counter is installed BEFORE any app module loads, so it
+     sees every microphone acquisition the app makes from its very
+     first instruction. That number is the whole point of this page:
+     each getUserMedia call is one chance for Chrome to show a
+     permission dialog, so the count IS the number of prompts a user
+     could be hit with. The bug this page exists to prove dead showed
+     up here as one call every three seconds.
+     ═══════════════════════════════════════════════════════════ -->
+<script>
+window.__gum = 0; window.__srStarts = 0; window.__gumTimes = [];
+(function(){
+  if(navigator.mediaDevices && navigator.mediaDevices.getUserMedia){
+    var md = navigator.mediaDevices, real = md.getUserMedia.bind(md);
+    md.getUserMedia = function(c){
+      window.__gum++; window.__gumTimes.push(Math.round(performance.now()));
+      return real(c);
+    };
+  }
+  var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if(SR && SR.prototype && SR.prototype.start){
+    var s = SR.prototype.start;
+    SR.prototype.start = function(){ window.__srStarts++; return s.apply(this, arguments); };
+  }
+})();
+</script>
+
+<link rel="stylesheet" href="css/theme.css">
+<style>
+  /* Borrow the app's own palette rather than inventing a second one —
+     a diagnostic that looks like a different product invites the
+     suspicion that it is testing a different product. */
+  :root{
+    --pass:var(--green); --fail:var(--red); --warn:var(--amber);
+    --idle:var(--ink-faint); --accent:var(--teal);
+  }
+  body{max-width:60rem;margin:0 auto;padding:1.5rem 1.25rem 5rem;
+       background:var(--ground);color:var(--ink);font-family:var(--sans)}
+  h1{font-size:1.5rem;margin:0 0 .2rem}
+  .sub{color:var(--ink-dim);margin:0 0 1.5rem;font-size:.95rem;line-height:1.5}
+
+  /* The verdict banner. Big, because it is the one thing you read. */
+  .verdict{border-radius:12px;padding:1rem 1.15rem;margin:0 0 1.5rem;
+           border:1px solid var(--line);background:var(--raised)}
+  .verdict h2{margin:0 0 .3rem;font-size:1.15rem}
+  .verdict p{margin:0;color:var(--ink-dim);font-size:.94rem;line-height:1.55}
+  .verdict.good{border-color:var(--pass);box-shadow:inset 0 0 0 1px rgba(61,220,151,.18)}
+  .verdict.bad {border-color:var(--fail);box-shadow:inset 0 0 0 1px rgba(255,107,107,.18)}
+  .verdict.busy{border-color:var(--warn)}
+
+  section{margin:0 0 1.6rem}
+  section > h3{font-size:.82rem;letter-spacing:.09em;text-transform:uppercase;
+               color:var(--ink-dim);margin:0 0 .55rem;font-weight:600}
+
+  .row{display:flex;gap:.75rem;align-items:flex-start;padding:.6rem .8rem;
+       border:1px solid var(--line);border-radius:9px;margin-bottom:.4rem;
+       background:var(--raised)}
+  .dot{flex:0 0 auto;width:.7rem;height:.7rem;border-radius:50%;
+       background:var(--idle);margin-top:.35rem;transition:background .2s}
+  .dot.pass{background:var(--pass)} .dot.fail{background:var(--fail)}
+  .dot.warn{background:var(--warn)}
+  .dot.run{background:var(--warn);animation:pulse 1s ease-in-out infinite}
+  @keyframes pulse{50%{opacity:.3}}
+  @media (prefers-reduced-motion:reduce){ .dot.run{animation:none} }
+
+  .row .txt{flex:1;min-width:0}
+  .row .name{font-size:.95rem;font-weight:500}
+  .row .detail{font-size:.87rem;color:var(--ink-dim);margin-top:.15rem;
+               line-height:1.5;word-wrap:break-word}
+  .row .detail code{font-family:var(--mono);font-size:.9em;background:var(--ground);
+                    padding:.08rem .3rem;border-radius:4px}
+  .row .detail b{color:var(--ink)}
+
+  .act{display:flex;gap:.6rem;flex-wrap:wrap;margin:.7rem 0 0}
+  button{font:inherit;font-size:.94rem;padding:.7rem 1.1rem;border-radius:9px;
+         border:1px solid var(--line);background:var(--raised);color:var(--ink);
+         cursor:pointer;min-height:48px}
+  button:hover:not(:disabled){border-color:var(--accent)}
+  button:disabled{opacity:.45;cursor:default}
+  button.primary{background:var(--accent);border-color:var(--accent);color:var(--on-accent);font-weight:600}
+
+  /* The prompt counter — the headline number of this whole page. */
+  .counter{display:flex;gap:1.5rem;flex-wrap:wrap;padding:1rem 1.15rem;
+           border:1px solid var(--line);border-radius:10px;background:var(--raised);
+           margin:.7rem 0}
+  .counter .k{font-family:var(--mono);font-size:2rem;line-height:1;display:block}
+  .counter .l{font-size:.78rem;color:var(--ink-dim);text-transform:uppercase;
+              letter-spacing:.07em;margin-top:.35rem;display:block}
+  .counter .k.pass{color:var(--pass)} .counter .k.fail{color:var(--fail)}
+
+  .heard{font-family:var(--mono);font-size:.88rem;background:var(--ground);
+         border:1px solid var(--line);border-radius:8px;padding:.7rem .85rem;
+         margin:.6rem 0 0;min-height:3.2rem;max-height:11rem;overflow:auto;
+         white-space:pre-wrap;line-height:1.6}
+  .heard .w{color:var(--pass)}
+  .heard .d{color:var(--ink-dim)}
+
+  .note{font-size:.88rem;color:var(--ink-dim);line-height:1.55;margin:.6rem 0 0}
+  .note b{color:var(--ink)}
+  a{color:var(--accent)}
+</style>
+</head>
+<body>
+
+<h1>Cab Eye — self test</h1>
+<p class="sub">
+  Every check runs against the real modules in <code>js/</code>, not a copy.
+  Sections 1&ndash;3 run on their own. Sections 4 and 5 need one click each,
+  because a browser will not make a sound or open a microphone until you
+  have interacted with the page.
+</p>
+
+<div class="verdict busy" id="verdict">
+  <h2 id="v-title">Running&hellip;</h2>
+  <p id="v-body">Checking the environment and the intent engine.</p>
+</div>
+
+<section>
+  <h3>1 &middot; Environment</h3>
+  <div id="s-env"></div>
+</section>
+
+<section>
+  <h3>2 &middot; Intent engine</h3>
+  <div id="s-nlu"></div>
+</section>
+
+<section>
+  <h3>3 &middot; Backend (optional)</h3>
+  <div id="s-api"></div>
+</section>
+
+<section>
+  <h3>4 &middot; Speakers</h3>
+  <div id="s-out"></div>
+  <div class="act">
+    <button id="btn-out" class="primary">Test sound and speech</button>
+  </div>
+  <p class="note">
+    You should hear two rising beeps, then a spoken sentence. Headphones make
+    the stereo beacon test meaningful.
+  </p>
+</section>
+
+<section>
+  <h3>5 &middot; Microphone and wake word</h3>
+
+  <div class="counter">
+    <div><span class="k" id="c-gum">&mdash;</span>
+         <span class="l">permission prompts</span></div>
+    <div><span class="k" id="c-sr">&mdash;</span>
+         <span class="l">recogniser starts</span></div>
+    <div><span class="k" id="c-heard">&mdash;</span>
+         <span class="l">phrases heard</span></div>
+    <div><span class="k" id="c-wake">&mdash;</span>
+         <span class="l">wake&nbsp;word hits</span></div>
+  </div>
+
+  <div id="s-mic"></div>
+
+  <div class="act">
+    <button id="btn-mic" class="primary">Start 25-second microphone test</button>
+    <button id="btn-stop" disabled>Stop</button>
+  </div>
+
+  <p class="note">
+    Chrome should ask for the microphone <b>exactly once</b>, on the first
+    click. While the test runs, say <b>&ldquo;Hey Cab, take me to Anna
+    Nagar&rdquo;</b> a few times, and leave gaps of silence in between &mdash;
+    the silences are what the old build could not survive.
+  </p>
+
+  <div class="heard" id="heard">Nothing heard yet.</div>
+</section>
+
+<section>
+  <h3>6 &middot; Rider &harr; driver channel</h3>
+  <div id="s-bus"></div>
+</section>
+
+<script src="js/audio.js"></script>
+<script src="js/voice.js"></script>
+<script src="js/nlu.js"></script>
+<script src="js/wake.js"></script>
+<script src="js/bus.js"></script>
+<script src="js/auth.js"></script>
+<script src="js/api.js"></script>
+
+<script>
+/* ═══════════════════════════════════════════════════════════
+   The harness. Deliberately dumb: every check is a function that
+   returns {state, detail}, and nothing here shares state with the
+   app beyond calling into it. A diagnostic that can itself fail in
+   interesting ways is not a diagnostic.
+   ═══════════════════════════════════════════════════════════ */
+
+const $ = id => document.getElementById(id);
+const rows = {};
+
+function row(host, key, name, state, detail){
+  let r = rows[key];
+  if(!r){
+    r = document.createElement("div");
+    r.className = "row";
+    r.innerHTML = `<span class="dot"></span>
+      <span class="txt"><span class="name"></span>
+      <span class="detail"></span></span>`;
+    $(host).appendChild(r);
+    rows[key] = r;
+  }
+  r.querySelector(".dot").className = "dot " + (state || "");
+  r.querySelector(".name").textContent = name;
+  r.querySelector(".detail").innerHTML = detail || "";
+  r.dataset.state = state || "";
+  return r;
+}
+
+function tally(){
+  const all = Object.values(rows);
+  return {
+    fail: all.filter(r => r.dataset.state === "fail").length,
+    warn: all.filter(r => r.dataset.state === "warn").length,
+    pass: all.filter(r => r.dataset.state === "pass").length,
+    run:  all.filter(r => r.dataset.state === "run").length
+  };
+}
+
+function verdict(){
+  const t = tally();
+  const v = $("verdict");
+  if(t.run){ return; }                     // leave the running banner alone
+  if(t.fail){
+    v.className = "verdict bad";
+    $("v-title").textContent = t.fail + (t.fail === 1 ? " check failed" : " checks failed");
+    $("v-body").innerHTML = "Look for the red dots below. Each one says what to do.";
+  }else if(t.warn){
+    v.className = "verdict good";
+    $("v-title").textContent = "Working — " + t.warn +
+      (t.warn === 1 ? " optional thing not running" : " optional things not running");
+    $("v-body").innerHTML = "Amber dots are things the app deliberately survives " +
+      "without, or checks that need you to speak. Nothing red means the build is sound.";
+  }else{
+    v.className = "verdict good";
+    $("v-title").textContent = "All " + t.pass + " checks passed";
+    $("v-body").innerHTML = "The microphone opens once, the wake word fires, and the " +
+                            "intent engine resolves. This is a working build.";
+  }
+}
+
+/* ── 1 · environment ─────────────────────────────────────── */
+
+function checkEnv(){
+  const secure = window.isSecureContext ||
+                 location.protocol === "https:" ||
+                 location.hostname === "localhost" ||
+                 location.hostname === "127.0.0.1";
+
+  row("s-env","origin","Page origin", secure ? "pass" : "fail",
+    secure
+      ? `<code>${location.origin}</code> is a secure context. Chrome will
+         remember the microphone permission for it.`
+      : `<b>This is the problem.</b> <code>${location.protocol}//</code> is not a
+         secure context, so Chrome refuses to remember a microphone grant and
+         re-asks every few seconds. Close this tab, run <code>serve.bat</code>,
+         and open <code>http://localhost:8000/selftest.html</code>.`);
+
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  row("s-env","sr","Speech recognition", SR ? "pass" : "fail",
+    SR ? "<code>webkitSpeechRecognition</code> is available."
+       : "Not available. This needs desktop <b>Google Chrome</b> or Edge. " +
+         "Firefox and Safari cannot do this at all.");
+
+  const tts = "speechSynthesis" in window;
+  row("s-env","tts","Speech synthesis", tts ? "pass" : "fail",
+    tts ? "The narrator can speak." : "No <code>speechSynthesis</code>.");
+
+  const ac = window.AudioContext || window.webkitAudioContext;
+  row("s-env","ac","Web Audio", ac ? "pass" : "fail",
+    ac ? "Earcons, heartbeat and the stereo beacon can play."
+       : "No AudioContext — no earcons.");
+
+  row("s-env","bc","BroadcastChannel", "BroadcastChannel" in window ? "pass" : "warn",
+    "BroadcastChannel" in window
+      ? "The rider and driver apps can talk to each other."
+      : "Missing. The two apps will not see each other; the rig still works.");
+
+  const mods = ["audio","voice","nlu","wake","bus","auth","api"];
+  const missing = mods.filter(m => !window.CE || !CE[m]);
+  row("s-env","mods","App modules", missing.length ? "fail" : "pass",
+    missing.length
+      ? `Did not load: <code>${missing.join(", ")}</code>. Check that the
+         <code>js/</code> folder is next to this page.`
+      : `All ${mods.length} loaded: <code>${mods.join(", ")}</code>.`);
+}
+
+/* ── 2 · intent engine ───────────────────────────────────── */
+
+function checkNlu(){
+  if(!window.CE || !CE.nlu){
+    row("s-nlu","nlu","Intent engine","fail","<code>js/nlu.js</code> did not load.");
+    return;
+  }
+
+  // The ambiguity rule is the research claim, so test both sides of it.
+  const vague = CE.nlu.resolve("take me to Anna Nagar");
+  const exact = CE.nlu.resolve("take me to Anna Nagar East");
+
+  row("s-nlu","amb","Ambiguity rule",
+    (vague.ask && !exact.ask) ? "pass" : "fail",
+    (vague.ask && !exact.ask)
+      ? `&ldquo;Anna Nagar&rdquo; &rarr; <b>asks</b> which one
+         (${vague.div.toFixed(2)} km apart, above the ${CE.nlu.DIVERGE} km
+         threshold). &ldquo;Anna Nagar East&rdquo; &rarr; <b>books it</b>.`
+      : `Expected the vague one to ask and the exact one to book. Got
+         ask=${vague.ask} and ask=${exact.ask}.`);
+
+  // Every sample on the rider screen must resolve, or the demo dies.
+  const bad = CE.nlu.SAMPLES.filter(s => !CE.nlu.resolve(s).ok);
+  row("s-nlu","samples","Sample utterances", bad.length ? "fail" : "pass",
+    bad.length
+      ? `These did not resolve: <code>${bad.join(" | ")}</code>`
+      : `All ${CE.nlu.SAMPLES.length} resolve, including the Tamil code-mix
+         <code>Velachery-ku poganum</code>.`);
+
+  // The one that used to be silently wrong: "the second one" contains
+  // the word "one", so a naive first-then-second test sends the rider
+  // to the wrong place while looking perfectly confident.
+  const c = [{n:"Anna Nagar East"},{n:"Anna Nagar West"}];
+  const picks = [
+    ["east", 0], ["west", 1],
+    ["the first one", 0], ["the second one", 1]
+  ];
+  const wrong = picks.filter(([t,e]) => CE.voice.pickCandidate(t, c) !== e);
+  row("s-nlu","pick","Spoken answers", wrong.length ? "fail" : "pass",
+    wrong.length
+      ? `Wrong: ${wrong.map(([t,e])=>`&ldquo;${t}&rdquo; wanted ${e} got
+         ${CE.voice.pickCandidate(t,c)}`).join("; ")}`
+      : `&ldquo;east&rdquo;, &ldquo;west&rdquo;, &ldquo;the first one&rdquo; and
+         &ldquo;the second one&rdquo; all map correctly.`);
+
+  // Wake-word matching has two failure directions and they pull against
+  // each other. Too strict and the app looks deaf, because recognisers
+  // really do return "hey cap". Too loose and "call me a cab" wakes it
+  // mid-ride. So test both directions, not just the forgiving one.
+  const shouldWake = ["hey cab", "hey cap take me to adyar", "hey gab", "ok cab"];
+  const shouldNot  = ["call me a cab", "the cab is here", "take me to adyar"];
+  const missed = shouldWake.filter(h => !CE.wake.detect(h));
+  const falsePos = shouldNot.filter(h => CE.wake.detect(h));
+
+  row("s-nlu","wakefuzzy","Wake-word matching",
+    (missed.length === 0 && falsePos.length === 0) ? "pass"
+      : falsePos.length ? "fail" : "warn",
+    (missed.length === 0 && falsePos.length === 0)
+      ? `Matched all ${shouldWake.length} mishearings
+         (<code>${shouldWake.join(" / ")}</code>) and correctly ignored
+         <code>${shouldNot.join(" / ")}</code> — so a passing mention of a cab
+         will not wake it mid-ride.`
+      : [ missed.length   ? `Did not wake on: <code>${missed.join(" / ")}</code>.` : "",
+          falsePos.length ? `<b>Woke when it should not:</b>
+                             <code>${falsePos.join(" / ")}</code>. This is the
+                             dangerous direction — tighten
+                             <code>budget()</code> in <code>js/wake.js</code>.` : ""
+        ].join(" "));
+}
+
+/* ── 3 · backend ─────────────────────────────────────────── */
+
+async function checkApi(){
+  row("s-api","probe","Spring Boot service","run",
+      `Probing <code>${CE.api.base}</code>&hellip;`);
+
+  const t0 = performance.now();
+  const res = await CE.api.probe();
+  const ms = Math.round(performance.now() - t0);
+
+  if(!res.up){
+    row("s-api","probe","Spring Boot service","warn",
+      `Not running at <code>${CE.api.base}</code> &mdash; <b>and that is fine</b>.
+       The rider app resolves in the browser instead, using the same gazetteer
+       and the same ambiguity rule. Nothing is lost. To start it:
+       <code>cd backend</code> then <code>mvn spring-boot:run</code>.`);
+    verdict();
+    return;
+  }
+
+  row("s-api","probe","Spring Boot service","pass",
+    `Up at <code>${CE.api.base}</code>, answered in ${ms} ms.
+     Cloud speech is ${res.cloudSpeech ? "<b>on</b>" : "off (browser speech only)"}.`);
+
+  // If both engines are alive they must agree, or the fallback is a
+  // trap: the app would behave differently depending on whether a
+  // server happened to be running.
+  row("s-api","parity","Browser / server parity","run","Comparing&hellip;");
+  const cases = ["take me to Anna Nagar East","book an auto to T Nagar",
+                 "I want to go to the airport","drop me at Besant Nagar"];
+  const diffs = [];
+  for(const t of cases){
+    const local  = CE.nlu.resolve(t);
+    const remote = await CE.api.interpret(t);
+    if(!remote){ diffs.push(`${t} → server timed out`); continue; }
+    const lp = local.ask ? "ASK" : (local.place && local.place.n);
+    const rp = remote.ask ? "ASK" : (remote.place && remote.place.n);
+    if(lp !== rp) diffs.push(`&ldquo;${t}&rdquo;: browser ${lp}, server ${rp}`);
+  }
+  row("s-api","parity","Browser / server parity", diffs.length ? "fail" : "pass",
+    diffs.length
+      ? `They disagree, so the fallback changes behaviour: ${diffs.join("; ")}`
+      : `All ${cases.length} utterances resolve identically in both engines.
+         The fallback is invisible to the user.`);
+  verdict();
+}
+
+/* ── 4 · speakers ────────────────────────────────────────── */
+
+$("btn-out").onclick = async ()=>{
+  $("btn-out").disabled = true;
+  row("s-out","ac2","Audio output","run","Playing two beeps&hellip;");
+  try{
+    CE.audio.unlock();
+    CE.audio.earcon.booked();
+    await new Promise(r => setTimeout(r, 700));
+    row("s-out","ac2","Audio output","pass",
+      "Two rising beeps played. If you heard nothing, check the system volume " +
+      "and that this tab is not muted.");
+  }catch(e){
+    row("s-out","ac2","Audio output","fail", String(e));
+  }
+
+  // The watchdog case: Chrome's speechSynthesis sometimes never fires
+  // onend, and the app opens the microphone from that callback. A
+  // dropped event means a question nobody listens to.
+  row("s-out","tts2","Narrator + onend","run","Speaking&hellip;");
+  const t0 = performance.now();
+  const fired = await new Promise(res=>{
+    let done = false;
+    CE.audio.speak("Microphone test ready. Say Hey Cab when the next section starts.",
+                   0, ()=>{ done = true; res(true); });
+    setTimeout(()=>{ if(!done) res(false); }, 9000);
+  });
+  const ms = Math.round(performance.now() - t0);
+  row("s-out","tts2","Narrator + onend", fired ? "pass" : "fail",
+    fired
+      ? `Spoke and the completion callback fired after ${ms} ms. This is what the
+         app waits on before opening the microphone.`
+      : `The sentence finished but the callback never fired. The watchdog in
+         <code>audio.js</code> should have caught this.`);
+
+  $("btn-out").disabled = false;
+  verdict();
+};
+
+/* ── 5 · microphone ──────────────────────────────────────── */
+
+let micTimer = null, tick = null, heardCount = 0, wakeCount = 0;
+
+function paintCounters(){
+  const gum = window.__gum;
+  $("c-gum").textContent = gum;
+  $("c-gum").className = "k " + (gum <= 1 ? "pass" : "fail");
+  $("c-sr").textContent = window.__srStarts;
+  $("c-heard").textContent = heardCount;
+  $("c-wake").textContent = wakeCount;
+  $("c-wake").className = "k " + (wakeCount > 0 ? "pass" : "");
+}
+
+function logHeard(text, isWake){
+  if($("heard").dataset.empty !== "no"){
+    $("heard").textContent = ""; $("heard").dataset.empty = "no";
+  }
+  const s = document.createElement("div");
+  s.className = isWake ? "w" : "d";
+  s.textContent = (isWake ? "WAKE  " : "      ") + text;
+  $("heard").appendChild(s);
+  $("heard").scrollTop = $("heard").scrollHeight;
+}
+
+$("btn-mic").onclick = async ()=>{
+  $("btn-mic").disabled = true; $("btn-stop").disabled = false;
+  heardCount = wakeCount = 0;
+  $("heard").textContent = "Listening…"; $("heard").dataset.empty = "yes";
+
+  const before = window.__gum;
+
+  row("s-mic","perm","Permission","run","Asking once&hellip;");
+  const state = await CE.voice.queryPermission();
+  const res = await CE.voice.requestPermission();
+
+  if(!res.ok){
+    row("s-mic","perm","Permission","fail", res.msg);
+    $("btn-mic").disabled = false; $("btn-stop").disabled = true;
+    paintCounters(); verdict();
+    return;
+  }
+
+  row("s-mic","perm","Permission","pass",
+    (state === "granted"
+      ? "Already granted from a previous visit, so <b>no dialog appeared at all</b>."
+      : `Asked once and granted. It used <b>${window.__gum - before}</b>
+         acquisition, and Chrome has now remembered it for this origin.`) +
+    (CE.voice.holding
+      ? " The stream is <b>held open</b>, so nothing can prompt again."
+      : " Running without a held stream (this machine's audio driver would not " +
+        "share the device) &mdash; the saved permission covers it."));
+
+  row("s-mic","listen","Standing listener","run",
+      "Running. Say <b>&ldquo;Hey Cab, take me to Anna Nagar&rdquo;</b>.");
+
+  CE.voice.onInterim = t => { /* live, but the final is what we log */ };
+
+  CE.wake.arm({
+    onHeard: (text, wasWake)=>{
+      heardCount++; if(wasWake) wakeCount++;
+      logHeard(text, wasWake);
+      paintCounters();
+    },
+    onWake: payload=>{
+      wakeCount++;
+      logHeard("→ woke" + (payload ? ", heard: " + payload : ", waiting for the rest"), true);
+      if(payload){
+        const r = CE.nlu.resolve(payload);
+        logHeard("→ " + (r.ok
+          ? (r.ask ? "ambiguous, would ask which one"
+                   : "would book " + r.place.n + (r.fast ? "  [fast path]" : ""))
+          : "did not resolve"), true);
+      }
+      // Go straight back to sleep — this is a test, not a booking.
+      setTimeout(()=>CE.wake.sleep(), 600);
+      paintCounters();
+    }
+  });
+
+  let left = 25;
+  paintCounters();
+  tick = setInterval(()=>{
+    left--;
+    row("s-mic","listen","Standing listener","run",
+      `Listening — <b>${left}s</b> left. Say
+       <b>&ldquo;Hey Cab, take me to Anna Nagar&rdquo;</b>, then stay quiet a
+       moment, then say it again.`);
+    paintCounters();
+    if(left <= 0) finishMic();
+  }, 1000);
+
+  micTimer = setTimeout(finishMic, 25500);
+};
+
+function finishMic(){
+  clearInterval(tick); clearTimeout(micTimer);
+  CE.wake.disarm();
+  $("btn-mic").disabled = false; $("btn-stop").disabled = true;
+
+  const gum = window.__gum;
+  row("s-mic","prompts","Permission prompts", gum <= 1 ? "pass" : "fail",
+    gum <= 1
+      ? `<b>${gum}</b> microphone acquisition for the whole session. The broken
+         build made one roughly every three seconds; over 25 seconds that was
+         about eight dialogs.`
+      : `<b>${gum}</b> acquisitions — one of these is meant to be the only one.
+         Times (ms): <code>${window.__gumTimes.join(", ")}</code>.`);
+
+  row("s-mic","listen","Standing listener", heardCount ? "pass" : "warn",
+    heardCount
+      ? `Heard ${heardCount} phrase${heardCount===1?"":"s"} across the window,
+         and the recogniser restarted ${window.__srStarts} time${window.__srStarts===1?"":"s"}
+         without ever re-prompting. Restarts are normal — Chrome ends a session
+         after silence and the app reopens it.`
+      : `Nothing was heard. Check that the right input device is selected in
+         Chrome (padlock &rarr; Site settings &rarr; Microphone), and that the
+         browser tab is not muted.`);
+
+  row("s-mic","wake","Wake word", wakeCount ? "pass" : (heardCount ? "fail" : "warn"),
+    wakeCount
+      ? `Fired ${wakeCount} time${wakeCount===1?"":"s"}. The trigger works with
+         no tap.`
+      : heardCount
+        ? `Speech was heard but the wake phrase never matched. Look at the
+           transcript below — if it shows something like <code>hey cab</code>
+           spelled oddly, widen <code>PHRASES</code> in <code>js/wake.js</code>.`
+        : `Not exercised, because nothing was heard.`);
+
+  paintCounters();
+  verdict();
+}
+
+$("btn-stop").onclick = finishMic;
+
+/* ── 6 · the app-to-app channel ──────────────────────────── */
+
+function checkBus(){
+  if(!("BroadcastChannel" in window)){
+    row("s-bus","bus","Rider ↔ driver channel","warn",
+      "No BroadcastChannel in this browser.");
+    return;
+  }
+  row("s-bus","bus","Rider ↔ driver channel","run","Sending a test event&hellip;");
+  const a = new BroadcastChannel("cabeye.selftest");
+  const b = new BroadcastChannel("cabeye.selftest");
+  let got = false;
+  b.onmessage = e=>{
+    if(e.data && e.data.ping === 42) got = true;
+  };
+  a.postMessage({ping:42});
+  setTimeout(()=>{
+    row("s-bus","bus","Rider ↔ driver channel", got ? "pass" : "fail",
+      got ? "A message posted on one side arrived on the other. The rider and " +
+            "driver apps will see each other's events in separate windows."
+          : "The message never arrived. The two apps will not sync.");
+    a.close(); b.close();
+    verdict();
+  }, 300);
+}
+
+/* ── go ──────────────────────────────────────────────────── */
+
+checkEnv();
+checkNlu();
+checkBus();
+checkApi();
+paintCounters();
+setTimeout(verdict, 400);
+</script>
+</body>
+</html>

@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Cab Eye backend.
+
+  Deliberately thin. The tech-stack document lists Kafka, Redis,
+  Keycloak, PostGIS and Docker; none of them are here yet, because
+  right now the only thing this service does is turn a sentence into
+  a booking intent, and adding infrastructure before there is a
+  second consumer of it buys nothing but build time.
+
+  What IS here is the seam: the gazetteer sits behind a repository
+  interface so swapping the in-memory list for PostgreSQL + PostGIS
+  is one class, and the speech proxy sits behind an interface so the
+  rider app never learns which vendor transcribes it.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.3.5</version>
+    <relativePath/>
+  </parent>
+
+  <groupId>com.cabeye</groupId>
+  <artifactId>cabeye-backend</artifactId>
+  <version>0.1.0</version>
+  <name>Cab Eye Backend</name>
+  <description>Voice intent resolution and speech proxy for the Cab Eye rider app</description>
+
+  <properties>
+    <java.version>21</java.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-validation</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
+
+    <!--
+      Google Speech-to-Text and Text-to-Speech are reached over their
+      REST endpoints with Spring's own RestClient, not the
+      google-cloud-speech SDK. The SDK pulls in gRPC, Netty, protobuf
+      and a service-account file; the REST call needs an API key and
+      nothing else. For a prototype that difference is the whole
+      difference between "works this afternoon" and "works next week".
+    -->
+
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+      </plugin>
+    </plugins>
+  </build>
+</project>

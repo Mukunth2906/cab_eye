@@ -80,6 +80,32 @@
   .ear.on{border-color:var(--amber);color:var(--ink)}
   .ear.on .dot{background:var(--amber);animation:pulse 1.1s ease-in-out infinite}
   @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.75)}}
+
+  /* Sleeping on the wake word is not the same as listening to you.
+     Teal and slow = armed and filtering. Amber and quick = your turn. */
+  .ear.sleep.on{border-color:var(--teal);color:var(--ink)}
+  .ear.sleep.on .dot{background:var(--teal);animation:pulse 2.6s ease-in-out infinite}
+  .ear.bad{border-color:var(--red);color:var(--red)}
+  .ear.bad .dot{background:var(--red)}
+
+  .orb.sleep{border-color:var(--teal);background:rgba(78,211,193,.08);
+             animation:breathe 3.4s ease-in-out infinite}
+
+  /* The one failure a blind user cannot see. Say it on screen too,
+     for the sighted helper standing next to them. */
+  .micwarn{
+    max-width:360px;border:2px solid var(--red);border-radius:var(--r);
+    background:rgba(242,119,106,.10);color:var(--ink);
+    padding:.7rem .9rem;font-size:.95rem;line-height:1.4;
+  }
+
+  .micwarn .fix{margin:.55rem 0 0 1.1rem;padding:0;text-align:left}
+  .micwarn .fix li{margin:.2rem 0;font-size:.92rem;color:var(--ink-dim)}
+  .micwarn code{font-family:var(--mono);font-size:.88em;background:var(--raised);
+                padding:.1rem .3rem;border-radius:4px;color:var(--ink)}
+
+  .say em{font-style:normal;color:var(--ink-dim)}
+  .tiny .linkbtn{margin-left:.4rem}
 </style>
 </head>
 <body>
@@ -104,8 +130,10 @@
 <script src="js/auth.js"></script>
 <script src="js/bus.js"></script>
 <script src="js/audio.js"></script>
+<script src="js/api.js"></script>
 <script src="js/nlu.js"></script>
 <script src="js/voice.js"></script>
+<script src="js/wake.js"></script>
 <script src="js/rider.js"></script>
 </body>
 </html>

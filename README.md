@@ -5,14 +5,23 @@ talk to each other for real, plus a side-by-side test rig for demos and measurem
 
 ## Run it
 
-**Double-click `rig.html`.** That's it — no server, no install. Everything runs.
+**Double-click `serve.bat`**, then open <http://localhost:8000/rig.html>.
+Or run `python -m http.server 8000` in this folder yourself.
 
-Use **Google Chrome**; speech recognition only works there.
+Use **Google Chrome**; speech recognition only works there. Allow the microphone once.
 
-If you want the rider and driver as two genuinely separate windows (or on two phones over
-wifi), you need a server. Double-click `serve.bat`, or run `python -m http.server 8000`,
-then open `http://localhost:8000`. Opened straight from a file, only `rig.html` works,
-because that's the page that hosts both apps.
+> **Do not double-click `rig.html`.** Chrome refuses microphone access to any page loaded
+> from `file://`, so the app comes up looking completely healthy — indicator lit, buttons
+> live — with a microphone that was never opened. That one fact accounted for most of
+> "the mic doesn't work". `rig.html` now shows a red banner when it detects this, but
+> serving the folder is the fix. `localhost` counts as a secure context; no certificate
+> needed.
+
+To see them as genuinely separate apps, open `rider.html` in one window and `driver.html`
+in another — or on two phones on the same wifi (use the laptop's LAN address; note that
+a plain `http://192.168.…` address is *not* a secure context, so on a phone you need
+`ngrok`, a self-signed HTTPS server, or Chrome's
+`chrome://flags/#unsafely-treat-insecure-origin-as-secure`).
 
 | Page | What it is |
 |---|---|
@@ -20,6 +29,25 @@ because that's the page that hosts both apps.
 | `rider.html` | The blind user's app. One surface, no navigation |
 | `driver.html` | The driver's app. Conventional, sighted |
 | `rig.html` | Both apps side by side + instrumentation. **This is the paper view** |
+
+## There is no button. Say "Hey Cab"
+
+Tap-to-speak asks a blind user to find a target on a flat sheet of glass — the one thing
+this app exists to avoid. So the trigger is a wake word.
+
+| You say | What happens |
+|---|---|
+| *"Hey Cab."* | it answers "Yes. Where to?" and listens |
+| *"Hey Cab, take me to Adyar."* | **books it, one breath, no round trip** |
+| *"Hey Cab, status"* · *"Hey Cab, cancel"* | any time, mid-ride |
+
+The one-breath form is the number worth reporting: a complete booking from a single
+utterance, zero taps and zero turns.
+
+Everything else was considered and lost. Hardware keys are invisible to a browser. Shake
+fires on every pothole. Long-press is still a touch, and TalkBack claims the gesture. A
+wake word is the only trigger that costs nothing to reach — phone in a pocket, screen off,
+both hands on a cane. `ANDROID_VOICE_SPEC.md` covers what changes on a real phone.
 
 ## The rule this app follows
 
@@ -29,14 +57,14 @@ That sounds obvious, and almost no voice app does it. The earlier version said
 *"East or West?"* and then expected a finger, and said *"say cancel to stop"* while
 nothing was listening. A blind user cannot answer a spoken question by finding a button.
 
-Now every spoken prompt is answerable by speaking:
+Which gives the wake word its one exception, and it matters:
 
-| The app says | You say |
-|---|---|
-| *"Ready. Just say where you want to go."* | "take me to Anna Nagar" |
-| *"Did you mean Anna Nagar East, or West?"* | "east" · "the first one" |
-| *"Say cancel to stop."* | "cancel" — and it really cancels |
-| anything, any time | "status" · "call driver" · "repeat" · "book again" · "help" |
+> **The app asked a question → answer it bare. You are starting something → say "Hey Cab".**
+
+Inside a turn the app itself opened — *"Did you mean East, or West?"* — you just say
+"east". Demanding the wake word again would be absurd. Outside one, in a moving
+auto-rickshaw, unprompted speech is probably aimed at the driver, and *"no, not that way"*
+must never cancel a ride.
 
 **A complete ride takes zero taps.** The `Rider taps` gauge in the rig shows `0`.
 
@@ -46,20 +74,25 @@ every button still works.
 
 ## Try this first
 
-Double-click **rig.html** and put headphones on. On the driver phone (right) press
-**Go online**, then set **Auto: on**.
+Run `serve.bat`, open <http://localhost:8000/rig.html>, put headphones on. On the driver
+phone (right) press **Go online**, then set **Auto: on**.
 
 Click once anywhere on the rider phone — browsers need one gesture before they'll make a
-sound. It says *"Ready. Just say where you want to go"* and the mic opens on its own.
+sound, and that same click is when the app asks for the microphone. Allow it. It says
+*"Ready. Say Hey Cab, then tell me where to go"* and then sits there filtering.
 
-Now **say** *"take me to Anna Nagar"* and don't touch the screen again. It will ask which
-Anna Nagar; **say "east"**. Then just listen.
+Now **say** *"Hey Cab, take me to Anna Nagar"* and don't touch the screen again. It will
+ask which Anna Nagar; **say "east"** — no wake word needed, it asked you. Then just listen.
 
-Run it again with *"take me to Anna Nagar East"* and watch the `AMBIGUITY` line change
-from `→ ask` to `→ book it`.
+Watch the log while you do it. Everything the recogniser hears that *isn't* the wake word
+is logged as `ASLEEP … ignored`, so you can see the filter working rather than guessing.
 
-To see them as genuinely separate apps, open `rider.html` in one window and
-`driver.html` in another — or on two phones on the same wifi.
+Run it again with *"Hey Cab, take me to Anna Nagar East"* and watch the `AMBIGUITY` line
+change from `→ ask` to `→ book it`.
+
+**If nothing happens when you speak,** the log will say why — `MIC BLOCKED` with the
+reason, and the app reads it out loud. It is almost always one of: opened from `file://`,
+microphone permission denied, or Chrome not being the browser.
 
 ## Sign in
 
@@ -120,29 +153,82 @@ login.html        driver login + one-time rider setup
 rider.html        rider app
 driver.html       driver app
 rig.html          side-by-side + instrumentation
-serve.bat         starts a local server on Windows
+serve.bat         starts a local server on Windows  ← use this
 
 css/theme.css     colours, type, components — shared by every page
 js/bus.js         BroadcastChannel event bus between the two apps
 js/audio.js       tone(), earcons, heartbeat, the narrator
 js/voice.js       the ear — dictation, spoken answers, standing commands
-js/nlu.js         places, patterns, the ambiguity rule
+js/wake.js        "Hey Cab" — the trigger that replaced tap-to-speak
+js/api.js         thin client for the backend, with hard millisecond deadlines
+js/nlu.js         places, patterns, the ambiguity rule (+ server fallback)
 js/auth.js        demo accounts, per-role sessions
 js/rider.js       the rider state machine
 js/driver.js      the driver screens
+
+backend/          Spring Boot — intent resolution + Google speech proxy
 ```
 
 `CODE_WALKTHROUGH.md` explains every file in detail.
+`ANDROID_VOICE_SPEC.md` covers what the wake word becomes in Kotlin.
+
+## The backend
+
+Optional. The app works without it — `js/nlu.js` has the same gazetteer and the same
+ambiguity rule, so if the service is down the browser answers in about 40 ms and nothing
+is lost. That is deliberate: **the backend may never be the reason a booking fails.**
+
+```
+cd backend
+mvn spring-boot:run          # http://localhost:8080
+```
+
+| Endpoint | What it does |
+|---|---|
+| `POST /api/v1/voice/interpret` | sentence → destination, ride type, ask-or-book, and the gap/divergence that decided it |
+| `POST /api/v1/voice/clarify` | "east" + the two candidates → which one |
+| `GET /api/v1/places` | the gazetteer, so the browser copy can't drift |
+| `POST /api/v1/speech/transcribe` | audio → text via Google, **including Tamil** |
+| `POST /api/v1/speech/synthesize` | text → MP3 via Google |
+| `GET /api/v1/speech/capabilities` | whether cloud speech is configured at all |
+| `GET /actuator/health` | health |
+
+The rig's log says which resolved each utterance — *resolved on the server* or
+*resolved in the browser* — so you can see how often the network was load-bearing.
+
+**Cloud speech is off until you give it a key**, and off is a fine place to leave it: the
+browser's Web Speech API is free and instant. Turn it on for the one thing the browser
+cannot do — Tamil, and code-mixed Tamil-English in one utterance:
+
+```
+set CABEYE_GOOGLE_API_KEY=...      &:: Windows
+export CABEYE_GOOGLE_API_KEY=...   #   macOS / Linux
+```
+
+Enable *Cloud Speech-to-Text API* and *Cloud Text-to-Speech API* on the same Google Cloud
+project, and restrict the key to those two — it travels in a query string. The
+`alternativeLanguageCodes: [ta-IN]` setting in `application.yml` is what makes
+*"Velachery-ku poganum"* transcribe correctly.
+
+Google is reached over its REST endpoints with Spring's `RestClient`, not the
+`google-cloud-speech` SDK — the SDK drags in gRPC, Netty, protobuf and a service-account
+file to do what two HTTP calls do here.
+
+Not in the backend yet, on purpose: Kafka, Redis, Keycloak, PostGIS, Docker. There is
+nothing yet for them to carry. The seams are there — `PlaceRepository` for PostGIS,
+`SpeechService` for the vendor — so each is one class when it earns its place.
 
 ## Tech stack
 
-**This prototype** — no dependencies, no build step:
+**This prototype** — no frontend dependencies, no build step:
 
 | Piece | What it uses |
 |---|---|
-| Everything | Plain HTML + CSS + JavaScript |
-| Voice out | Web Speech API (`speechSynthesis`) |
-| Voice in | Web Speech API (`webkitSpeechRecognition`), Chrome only |
+| Frontend | Plain HTML + CSS + JavaScript |
+| Backend | Java 21 + Spring Boot 3.3 (optional) |
+| Voice out | Web Speech API (`speechSynthesis`); Google TTS via the backend |
+| Voice in | Web Speech API (`webkitSpeechRecognition`), Chrome only; Google STT via the backend for Tamil |
+| Wake word | the same recogniser, filtering on an edit-distance match |
 | Earcons, heartbeat, beacon | Web Audio API oscillators |
 | Bearing audio | Web Audio `StereoPannerNode` |
 | App-to-app | `BroadcastChannel` — same shape as the production WebSocket |
@@ -157,7 +243,8 @@ js/driver.js      the driver screens
 | Speech | Android `SpeechRecognizer` and `TextToSpeech` |
 | Earcons | `SoundPool`; `AudioTrack` for panning |
 | Bearing | Device magnetometer |
-| Backend | Ktor |
+| Wake word | Porcupine or Vosk, on-device, in a foreground service |
+| Backend | Java + Spring Boot |
 | Database | PostgreSQL + PostGIS |
 | Real-time | One WebSocket |
 

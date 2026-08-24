@@ -1,0 +1,59 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: cabeye-backend
+  servlet:
+    multipart:
+      # One spoken sentence of WebM/Opus is tens of kilobytes. Anything
+      # near this ceiling is not an utterance and should be refused.
+      max-file-size: 4MB
+      max-request-size: 5MB
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
+
+cabeye:
+  cors:
+    allowed-origins:
+      - http://localhost:8000
+      - http://127.0.0.1:8000
+      - http://localhost:5500
+      - http://localhost:3000
+
+  google:
+    # ─────────────────────────────────────────────────────────────
+    # Leave these empty and everything still works: the rider app
+    # falls back to the browser's Web Speech API, which is free and
+    # needs no account. Fill one in when you want Tamil.
+    #
+    #   export CABEYE_GOOGLE_API_KEY=...
+    #   mvn spring-boot:run
+    #
+    # Get a key at console.cloud.google.com → APIs & Services →
+    # Credentials, then enable "Cloud Speech-to-Text API" and
+    # "Cloud Text-to-Speech API" on the same project. Restrict the
+    # key to those two APIs — it travels in a query string.
+    # ─────────────────────────────────────────────────────────────
+    api-key: ${CABEYE_GOOGLE_API_KEY:}
+    access-token: ${CABEYE_GOOGLE_ACCESS_TOKEN:}
+    language-code: en-IN
+    # The setting that makes "Velachery-ku poganum" transcribe
+    # correctly — Google is allowed to switch languages inside one
+    # utterance. The browser's recogniser cannot do this at all.
+    alternative-language-codes:
+      - ta-IN
+    voice-name: ""
+    speaking-rate: 1.06
+    timeout-seconds: 12
+
+logging:
+  level:
+    com.cabeye: INFO

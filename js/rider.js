@@ -11,14 +11,14 @@
    ═══════════════════════════════════════════════════════════ */
 
 (function(){
-const A = CE.audio, N = CE.nlu, B = CE.bus, V = CE.voice, T = CE.bus.T;
+const A = CE.audio, N = CE.nlu, B = CE.bus, V = CE.voice, W = CE.wake, T = CE.bus.T;
 const $ = id => document.getElementById(id);
 
 const session = CE.auth.require("rider");
 if(!session) return;
 $("hello").textContent = "Hello, " + session.name;
 
-let S, lastSpoken = "", handsFree = true, primed = false;
+let S, lastSpoken = "", handsFree = true, primed = false, micProblem = null;
 
 function fresh(keep){
   S = {
@@ -52,7 +52,23 @@ function say(text, tier, then){
 function go(state){ S.state = state; render(); pushState(); listenForState(); }
 
 /* ═══ THE EAR ═══════════════════════════════════════════
-   Which listening mode belongs to which state.            */
+
+   ONE RULE, TWO HALVES:
+
+     The app asked a question   → answer it bare. "East." "Cancel."
+     You are starting something → say "Hey Cab" first.
+
+   That asymmetry is deliberate. An open turn the app itself opened is
+   a conversation, and making the user re-announce themselves inside
+   one would be absurd. But an unprompted utterance in a moving
+   auto-rickshaw is probably the user talking to the driver, not to
+   the phone — and "no, not that way" must never cancel a ride. The
+   wake word is what separates speech aimed at the app from speech
+   that merely happens near it.
+
+   States with a dedicated listener (clarify, confirming) are open
+   turns and take bare answers. Everything else sleeps on the wake
+   word.                                                            */
 function listenForState(){
   if(!V.supported() || !handsFree) return;
   const s = S.state;
@@ -61,37 +77,81 @@ function listenForState(){
   // question is asked. Don't stomp on them.
   if(s === "listening" || s === "resolving" || s === "clarify" || s === "confirming") return;
 
-  if(s === "idle"){ idleListen(); return; }
-
-  // Everything after booking: a standing command loop.
-  V.open("command", onCommand);
+  armWake();
 }
 
-/* ── idle: speak to start, no tap needed ───────────────── */
-function idleListen(){
-  V.open("command", text=>{
-    log("user","Heard",text);
-    if(V.G.help.test(text)){ sayHelp(); return true; }
-    if(V.G.again.test(text) && !N.resolve(text).ok){
-      say("Where would you like to go?", 0, idleListen);
-      return true;
-    }
-    V.stop();
-    startFrom(text);
-    return true;
+/* ── the sleeping listener ─────────────────────────────── */
+function armWake(){
+  if(!V.supported() || !handsFree) return;
+
+  const d = V.diagnose();
+  if(!d.ok){ showMicProblem(d); return; }
+  micProblem = null;
+
+  W.arm({
+    onWake: onWakeUtterance,
+    onHeard: (text, hit)=>{
+      if(hit) log("user","Wake",`&ldquo;${text}&rdquo;`);
+      else    log("note","Asleep",`heard &ldquo;<em>${text}</em>&rdquo; — no wake word, ignored`);
+    },
+    onArmChange: ()=> paintEar()
   });
 }
 
-/* ── the global command grammar ────────────────────────── */
-function onCommand(text){
+/**
+ * Something got past the wake filter.
+ * `payload` is whatever followed "Hey Cab", or null if nothing did.
+ */
+function onWakeUtterance(payload){
+  W.keepAwake();
+
+  if(!payload){
+    // Bare "Hey Cab" — acknowledge and open a proper dictation window.
+    // This is the two-breath path; the one-breath path skips it.
+    log("note","Awake","wake word only — opening dictation");
+    const q = S.state === "idle" || S.state === "done" ? "Yes. Where to?" : "Yes?";
+    say(q, 0, ()=>{
+      S.transcript = "";
+      if(S.state === "idle") { S.state = "listening"; render(); pushState(); }
+      V.onInterim = t=>{ if(S.state !== "listening") return;   // the sleeping
+                                            // loop emits interims too
+        S.transcript = t; render(); };
+      V.open("dictate", text=>{ handleAwake(text); return true; }, {timeout:9000});
+    });
+    return;
+  }
+
+  log("note","Awake",`one breath — wake word and request together`);
+  handleAwake(payload);
+}
+
+/** Route an utterance the user aimed at the app. */
+function handleAwake(text){
+  W.keepAwake();
   log("user","Heard",text);
 
-  if(V.G.repeat.test(text)){ say(lastSpoken || "Nothing to repeat yet."); return true; }
+  if(handleCommand(text)) return;
+
+  // Not a command. In idle or after a finished trip, it's a destination.
+  if(S.state === "idle" || S.state === "listening" || S.state === "done"){
+    if(S.state === "done") { newRideSilently(); }
+    startFrom(text);
+    return;
+  }
+
+  A.earcon.error();
+  say("Sorry, I didn't understand that. You can say status, cancel, or repeat.", 0, ()=>W.sleep());
+}
+
+/* ── the global command grammar ────────────────────────── */
+/** Returns true if `text` was a recognised command and was acted on. */
+function handleCommand(text){
+  if(V.G.repeat.test(text)){ say(lastSpoken || "Nothing to repeat yet.", 1, ()=>W.sleep()); return true; }
   if(V.G.help.test(text)){ sayHelp(); return true; }
   if(V.G.status.test(text)){ sayStatus(); return true; }
   if(V.G.call.test(text) && S.drv){
     log("note","Call","masked call placed by voice");
-    say("Calling " + S.drv.name + ".");
+    say("Calling " + S.drv.name + ".", 1, ()=>W.sleep());
     return true;
   }
   if(V.G.again.test(text) && S.state === "done"){ newRide(); return true; }
@@ -105,26 +165,42 @@ function onCommand(text){
   if(S.sos && (V.G.cancel.test(text) || V.G.yes.test(text))){
     S.sos = false; render();
     log("note","Dismissed","false alarm, by voice");
-    say("Alright. Cancelling the alert.", 0);
+    say("Alright. Cancelling the alert.", 0, ()=>W.sleep());
     return true;
   }
-  return true;   // unrecognised — the loop just keeps listening
+  return false;
+}
+
+/* ── when the microphone cannot work at all ────────────── */
+/* A blind user cannot see a dead indicator, and the old build failed
+   exactly here in silence. Every fatal microphone fault is now named
+   on screen, written to the log, and — once — read out loud. */
+function showMicProblem(d){
+  if(micProblem && micProblem.code === d.code) { render(); return; }
+  micProblem = d;
+  log("warn","Mic blocked", d.msg);
+  render();
+  A.earcon.error();
+  say(d.msg, 0);
 }
 
 function sayStatus(){
-  if(S.state === "finding")  return say("Still looking for a driver.");
+  const done = ()=>W.sleep();
+  if(S.state === "finding")  return say("Still looking for a driver.", 1, done);
   if(S.state === "assigned" || S.state === "approaching")
-    return say(`${S.drv.name} is on the way, about ${S.eta} minutes.`);
-  if(S.state === "arrived")  return say(`${S.drv.name} has arrived. ${S.drv.car}, ${S.drv.plate}.`);
-  if(S.state === "intrip")   return say(`On the way to ${S.dest.n}. About ${S.eta} minutes left.`);
-  if(S.state === "done")     return say(`Trip finished. Fare ${S.fare} rupees.`);
-  return say("Nothing booked yet. Say where you want to go.");
+    return say(`${S.drv.name} is on the way, about ${S.eta} minutes.`, 1, done);
+  if(S.state === "arrived")  return say(`${S.drv.name} has arrived. ${S.drv.car}, ${S.drv.plate}.`, 1, done);
+  if(S.state === "intrip")   return say(`On the way to ${S.dest.n}. About ${S.eta} minutes left.`, 1, done);
+  if(S.state === "done")     return say(`Trip finished. Fare ${S.fare} rupees.`, 1, done);
+  return say("Nothing booked yet. Say Hey Cab, then where you want to go.", 1, done);
 }
 
 function sayHelp(){
+  const done = ()=>W.sleep();
   if(S.state === "idle")
-    return say("Just say where you want to go. For example, take me to Anna Nagar.");
-  say("You can say: status, call driver, repeat, cancel, or book again.");
+    return say("Say Hey Cab to wake me, then tell me where to go. " +
+               "Or say it all at once — Hey Cab, take me to Anna Nagar.", 1, done);
+  say("Say Hey Cab, then: status, call driver, repeat, cancel, or book again.", 1, done);
 }
 
 /* ── dictation ─────────────────────────────────────────── */
@@ -136,6 +212,9 @@ function startFrom(text){
   setTimeout(()=>heard(text), 260);
 }
 
+/* The button still works — for low-vision users, sighted helpers, and
+   for anyone whose room is too loud for a wake word. It is no longer
+   the way in, only a way in. */
 function startListening(){
   A.unlock(); prime(); tap();
   S.t0 = 0; S.marks = [null,null,null,null,null]; pushMarks();
@@ -143,13 +222,17 @@ function startListening(){
   S.state = "listening"; render(); pushState();
   A.earcon.listen();
   A.heartbeat(false);
-  log("user","Mic","listening…");
+  log("user","Mic","listening… (button, not wake word)");
 
+  const d = V.diagnose();
+  if(!d.ok){ showMicProblem(d); S.state = "idle"; render(); pushState(); return; }
   if(!V.supported()){
     log("note","No ASR","this browser has no speech recognition — use a sample phrase");
     return;
   }
-  V.onInterim = t=>{ S.transcript = t; render(); };
+  V.onInterim = t=>{ if(S.state !== "listening") return;   // the sleeping
+                                            // loop emits interims too
+        S.transcript = t; render(); };
   V.open("dictate", text=>{
     S.transcript = text;
     heard(text);
@@ -175,13 +258,13 @@ function heard(text){
   S.state = "resolving"; render(); pushState();
   A.earcon.thinking();
 
-  setTimeout(()=>{
-    const r = N.resolve(text);
+  N.resolveAsync(text, session.name).then(r=>{
     S.rideType = r.rideType;
     mark(2);
     log("note", r.fast ? "Fast path" : "Fallback",
-        r.fast ? `rule matched → "<em>${r.q}</em>" · ${r.rideType}`
-               : `no rule matched, whole utterance used → "<em>${r.q}</em>"`);
+        (r.fast ? `rule matched → "<em>${r.q}</em>" · ${r.rideType}`
+                : `no rule matched, whole utterance used → "<em>${r.q}</em>"`) +
+        ` · <em>${r.via === "server" ? "resolved on the server" : "resolved in the browser"}</em>`);
     mark(3);
 
     if(!r.ok){
@@ -200,7 +283,7 @@ function heard(text){
         `gap ${r.gap.toFixed(2)} but only ${r.div.toFixed(1)} km apart &rarr; <b>don't ask</b>, book it`);
     }
     commit(r.place);
-  }, 320);
+  });
 }
 
 /* ── the question that used to need a finger ───────────── */
@@ -352,17 +435,77 @@ function ear(label){
   return `<div class="ear ${V.live ? "on" : ""}"><span class="dot"></span>${label}</div>`;
 }
 
+/* The sleeping indicator. Distinct from `ear`, because "I am running
+   and filtering" and "I am listening to you right now" are different
+   states and conflating them is what made the old build feel broken. */
+function earSleep(){
+  if(!handsFree || !V.supported()) return "";
+  if(micProblem) return `<div class="ear bad"><span class="dot"></span>Microphone blocked</div>`;
+  return `<div class="ear sleep ${V.live ? "on" : ""}"><span class="dot"></span>Say &ldquo;Hey&nbsp;Cab&rdquo;</div>`;
+}
+
+/* Post-booking states sleep on the wake word too, so the hint has to
+   carry the wake word with it. "Say cancel" was a lie the moment the
+   filter went in. */
+function earWake(hint){
+  if(!handsFree || !V.supported()) return "";
+  if(micProblem) return `<div class="ear bad"><span class="dot"></span>Microphone blocked</div>`;
+  return `<div class="ear sleep ${V.live ? "on" : ""}"><span class="dot"></span>${hint}</div>`;
+}
+
+/* A denied microphone cannot be un-denied from JavaScript. Once we are
+   here the only useful thing left is to say precisely which clicks fix
+   it — on screen for the sighted helper, and aloud for the rider. */
+const MIC_FIX = {
+  "not-allowed": [
+    "Click the padlock (or sliders) icon in the address bar",
+    "Choose <b>Site settings</b>",
+    "Set <b>Microphone</b> to <b>Allow</b>",
+    "Reload this page"
+  ],
+  "service-not-allowed": [
+    "Click the padlock icon in the address bar",
+    "Choose <b>Site settings</b> → <b>Microphone</b> → <b>Allow</b>",
+    "Reload this page"
+  ],
+  "storm": [
+    "Click the padlock icon in the address bar",
+    "Set <b>Microphone</b> to <b>Allow</b> — not <b>Ask</b>",
+    "Reload this page"
+  ],
+  "insecure": [
+    "Close this tab",
+    "Run <code>serve.bat</code> in the project folder",
+    "Open <code>http://localhost:8000/rig.html</code>"
+  ],
+  "unsupported": [
+    "Open this page in <b>Google Chrome</b>"
+  ]
+};
+
+function micBanner(){
+  if(!micProblem) return "";
+  const steps = MIC_FIX[micProblem.code];
+  const how = steps
+    ? `<ol class="fix">${steps.map(s=>`<li>${s}</li>`).join("")}</ol>`
+    : "";
+  return `<div class="micwarn"><b>Microphone blocked.</b> ${micProblem.msg}${how}</div>`;
+}
+
 function render(){
   const s = S.state;
   let h = "";
 
   if(s === "idle") h = `
-    <button class="orb talk" id="mic">🎙</button>
-    <div class="display">Speak to book</div>
-    <div class="say">Say where you want to go. One sentence is enough.</div>
-    ${handsFree && V.supported() ? ear("Listening — just talk") : ""}
+    <div class="orb ${V.live && !micProblem ? "sleep" : ""}" id="orb">👂</div>
+    <div class="display">Say &ldquo;Hey Cab&rdquo;</div>
+    <div class="say">Then tell me where to go — or say it all in one breath:
+      <em>&ldquo;Hey Cab, take me to Anna Nagar.&rdquo;</em></div>
+    ${earSleep()}
+    ${micBanner()}
     <div class="chips">${N.SAMPLES.map((x,i)=>`<button class="chip" data-s="${i}">${x}</button>`).join("")}</div>
-    <div class="tiny">Samples let you demo without a microphone.</div>`;
+    <div class="tiny">Samples let you demo without a microphone.
+      <button class="linkbtn" id="mic">Or tap to talk</button></div>`;
 
   if(s === "listening") h = `
     <button class="orb live talk" id="mic">🎙</button>
@@ -394,7 +537,7 @@ function render(){
     <div class="orb">◍</div>
     <div class="big">Finding a driver</div>
     <div class="say">You'll hear a heartbeat while I work. Silence would mean something is wrong.</div>
-    ${handsFree && V.supported() ? ear("Say “cancel” or “status”") : ""}`;
+    ${earWake("Hey Cab, cancel &middot; Hey Cab, status")}`;
 
   if(s === "assigned" || s === "approaching") h = `
     <div class="orb ok">🚗</div>
@@ -402,7 +545,7 @@ function render(){
     <div class="mid">${S.drv.car}</div>
     <div class="plate teal">${S.drv.plate}</div>
     <div class="say">${s === "approaching" ? "Getting closer — listen to the tone" : "About " + S.eta + " minutes away"}</div>
-    ${handsFree && V.supported() ? ear("Say “status” or “call driver”") : ""}
+    ${earWake("Hey Cab, status &middot; Hey Cab, call driver")}
     <button class="act maxw" id="call">Call driver</button>`;
 
   if(s === "arrived") h = `
@@ -410,14 +553,14 @@ function render(){
     <div class="display teal">Car is here</div>
     <div class="plate">${S.drv.plate}</div>
     <div class="say">Bearing ${S.bearing}° — the tone comes from that side</div>
-    ${handsFree && V.supported() ? ear("Say “call driver”") : ""}
+    ${earWake("Hey Cab, call driver")}
     <button class="act maxw" id="call">Call driver</button>`;
 
   if(s === "intrip") h = `
     <div class="orb ok">➔</div>
     <div class="display">On the way</div>
     <div class="mid">${S.dest.n}</div>
-    ${handsFree && V.supported() ? ear("Say “where are we?”") : ""}
+    ${earWake("Hey Cab, where are we?")}
     <div class="stack maxw">
       <button class="act" id="status">Status now</button>
       <button class="act ghost" id="call">Call driver</button>
@@ -427,7 +570,7 @@ function render(){
     <div class="orb ok">✓</div>
     <div class="display">₹${S.fare}</div>
     <div class="mid">Pay ${S.drv ? S.drv.name : "the driver"} in cash</div>
-    ${handsFree && V.supported() ? ear("Say “book again”") : ""}
+    ${earWake("Hey Cab, book again")}
     <button class="act pri maxw" id="again">Book again</button>`;
 
   $("surface").innerHTML = h;
@@ -440,7 +583,7 @@ function render(){
     o.innerHTML = `
       <div class="display red">Route changed</div>
       <div class="say">Your guardian has been notified.</div>
-      ${handsFree && V.supported() ? ear("Say “cancel” if this is fine") : ""}
+      ${earWake("Hey Cab, cancel &mdash; if this is fine")}
       <div class="stack">
         <button class="act danger" id="sos-call">Call emergency</button>
         <button class="act ghost" id="sos-ok">This is fine</button>
@@ -449,10 +592,40 @@ function render(){
   }
 }
 
-// Repaint the little ear indicator whenever the mic opens or closes.
-V.onStateChange = ()=>{
+/* Repaint the indicator whenever the mic opens or closes.
+   Three distinguishable states, not two: blocked, sleeping on the
+   wake word, and listening to you right now. */
+function paintEar(){
+  // Recovered? Clear the warning. A stale "microphone blocked" banner on
+  // a working mic is its own bug — and the hold-conflict fallback is
+  // designed to recover, so this path really does get taken.
+  if(micProblem && !V.fatal && V.live){
+    micProblem = null;
+    log("note","Mic recovered", "listening again" +
+        (V.holding ? " — stream held" : " — using the saved permission"));
+    render();
+  }
+
   document.querySelectorAll(".ear").forEach(e => e.classList.toggle("on", V.live));
-  $("mic-state").textContent = V.live ? "Mic open" : "Mic closed";
+  const orb = $("orb");
+  if(orb) orb.classList.toggle("sleep", V.live && !micProblem);
+  // "Mic held" is worth showing: it is the state in which no further
+  // permission prompt is possible, and the old build never reached it.
+  const label = micProblem     ? "Mic blocked"
+              : W.awake        ? "Listening to you"
+              : V.live         ? "Awake for “Hey Cab”"
+              : V.holding      ? "Mic held — no more prompts"
+              :                  "Mic closed";
+  $("mic-state").textContent = label;
+}
+V.onStateChange = paintEar;
+
+/* A fatal microphone fault must reach the user, not just the console. */
+V.onError = e=>{
+  if(e.permanent){ showMicProblem({ok:false, code:e.code, msg:e.msg}); return; }
+  // Recoverable. Notably "hold-conflict": we let go of the device and
+  // are about to try again, which is a note, not a failure.
+  log("note","Mic", e.msg);
 };
 
 /* ── events ────────────────────────────────────────────── */
@@ -481,7 +654,9 @@ document.addEventListener("click", e=>{
     t.textContent = "Hands-free: " + (handsFree ? "on" : "off");
     log("note","Hands-free", handsFree ? "on — the mic reopens after every question"
                                        : "off — buttons only");
-    if(handsFree) listenForState(); else V.stop();
+    // Hands-free off gives the microphone back: the browser's recording
+    // indicator must never claim we are listening when we are not.
+    if(handsFree){ armWake(); } else { W.disarm(); V.releaseMic(); }
     render();
     return;
   }
@@ -513,25 +688,89 @@ function newRide(){
   A.shutUp();
   fresh({taps:S.taps, turns:S.turns});
   render(); pushState(); pushMarks(); pushMetrics();
-  log("note","Ready","new booking — say where you want to go");
-  say("Ready. Where would you like to go?", 0, listenForState);
+  log("note","Ready","new booking — say Hey Cab, then where you want to go");
+  say("Ready. Say Hey Cab whenever you want another ride.", 0, listenForState);
 }
 
-/* ── first sound needs a user gesture in every browser ── */
+/** Reset for a new booking without the spoken preamble — used when
+    the user has already said where they want to go. */
+function newRideSilently(){
+  clearInterval(S.undoTimer); clearInterval(S.approachTimer);
+  A.heartbeat(false);
+  fresh({taps:S.taps, turns:S.turns});
+  pushState(); pushMarks(); pushMetrics();
+}
+
+/* ── first sound needs a user gesture in every browser ──
+   And so, in practice, does the microphone: SpeechRecognition raises
+   its own permission prompt mid-utterance, which eats the first
+   sentence. Asking for the grant here, during the priming gesture,
+   means the wake word is live before the user has said anything. */
 function prime(){
   if(primed) return;
   primed = true;
   A.unlock();
-  const greet = V.supported()
-    ? "Ready. Just say where you want to go."
-    : "Ready. This browser cannot hear you — use the sample phrases.";
-  say(greet, 0, listenForState);
+
+  const d = V.diagnose();
+  if(!d.ok){
+    say("Ready, but I cannot hear you. " + d.msg, 0);
+    showMicProblem(d);
+    return;
+  }
+
+  V.requestPermission().then(res=>{
+    if(!res.ok){
+      showMicProblem(res);
+      return;
+    }
+    log("note","Mic granted",
+      V.holding
+        ? "stream <b>held open</b> — Chrome cannot prompt again for this page"
+        : "permission granted (this browser will not let us hold the stream)");
+    say("Ready. Say Hey Cab, then tell me where to go.", 0, listenForState);
+  });
 }
 document.addEventListener("pointerdown", prime, {once:true});
 document.addEventListener("keydown", prime, {once:true});
 
 render(); pushState(); pushMetrics();
-log("note","Rider ready", V.supported()
-  ? "hands-free is on — the mic reopens after every question the app asks"
-  : "no speech recognition in this browser — use the sample phrases");
+
+(function boot(){
+  const d = V.diagnose();
+  if(d.ok){
+    log("note","Rider ready",
+      `wake word <b>&ldquo;Hey Cab&rdquo;</b> — touch the screen once to grant the microphone, then never again`);
+
+    // Say out loud, in the log, what Chrome already thinks. A returning
+    // user on a remembered origin sees "granted" here and will get no
+    // prompt at all; "prompt" means exactly one is coming.
+    V.queryPermission().then(state=>{
+      if(state === "granted")
+        log("note","Microphone","already allowed for this origin — no prompt will appear");
+      else if(state === "denied")
+        log("warn","Microphone","blocked for this origin. " + V.message("not-allowed"));
+      else if(state === "prompt")
+        log("note","Microphone","Chrome will ask once, on your first touch, and remember it");
+    });
+  }else{
+    log("warn","Rider ready", d.msg);
+    micProblem = d; render();
+  }
+
+  // Ask the backend whether it is there — once, without blocking
+  // anything. A "no" costs the app nothing; nlu.js resolves locally.
+  if(CE.api){
+    CE.api.probe().then(p=>{
+      if(p.up){
+        log("note","Backend",
+          `Spring Boot at <em>${CE.api.base}</em> — intent resolved server-side` +
+          (p.cloudSpeech ? " · Google cloud speech available" : " · browser speech only"));
+      }else{
+        log("note","Backend",
+          `not running at <em>${CE.api.base}</em> — resolving in the browser instead. ` +
+          `Nothing is lost; the gazetteer and the ambiguity rule are the same.`);
+      }
+    });
+  }
+})();
 })();

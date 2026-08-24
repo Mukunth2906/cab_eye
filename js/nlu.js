@@ -109,5 +109,37 @@ CE.nlu = (function(){
     return {ok:true, ask:false, place:ranked[0].p, q, rideType, fast, gap, div, tied};
   }
 
-  return {PLACES, SAMPLES, PATTERNS, DELTA, DIVERGE, parseIntent, score, km, resolve};
+  /* ═══ THE SAME RULE, TWO PLACES ═══════════════════════════
+
+     Everything above also exists in Java, in the Spring Boot service
+     (com.cabeye.nlu). That duplication is deliberate and it is the
+     point: the server is where the rule gets tuned, logged and
+     eventually backed by a real geocoder, but the browser must be able
+     to answer on its own, because a blind user standing on a pavement
+     with a bad signal still needs a cab.
+
+     resolveAsync asks the server and falls back here — silently, and
+     fast enough that the fallback is not perceptible. `via` says which
+     one answered, so the rig can report how often the network was
+     actually load-bearing.                                            */
+
+  async function resolveAsync(text, sessionId){
+    if(window.CE && CE.api){
+      const r = await CE.api.interpret(text, sessionId);
+      if(r){
+        // Server shape and local shape are the same by construction;
+        // NluServiceTest pins the parity.
+        r.via = "server";
+        if(r.place)      r.place = {n:r.place.n, lat:r.place.lat, lng:r.place.lng};
+        if(r.candidates) r.candidates = r.candidates.map(c=>({n:c.n, lat:c.lat, lng:c.lng}));
+        return r;
+      }
+    }
+    const local = resolve(text);
+    local.via = "local";
+    return local;
+  }
+
+  return {PLACES, SAMPLES, PATTERNS, DELTA, DIVERGE,
+          parseIntent, score, km, resolve, resolveAsync};
 })();

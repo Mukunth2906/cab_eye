@@ -111,8 +111,86 @@ which one?" works without extra plumbing.
 `second`. `pickCandidate(text, candidates)` decides which of two places the rider meant —
 by name, by "first"/"second", or by the distinguishing word alone ("east").
 
-One honest caveat for the paper: a standing mic drains battery and mis-fires, which is why
-real assistants use a hardware key. `Hands-free: off` exists so you can compare both.
+**Five faults this file used to have, all of which looked identical from outside** — the
+indicator says listening, nothing is heard, nothing is reported:
+
+1. **Insecure context.** Opened from `file://`, Chrome denies the microphone.
+   `SpeechRecognition` raised `not-allowed`; `onerror` handled only `no-speech`, so the
+   failure vanished. Now `diagnose()` names it, `showMicProblem()` speaks it.
+2. **The double-loop race.** `open()` aborted the live recogniser, but that recogniser's
+   `onend` still fired, read the shared `loop` flag and queued its own restart. Two
+   recognisers raced, the second `start()` threw `InvalidStateError`, and the ear died
+   silently. Fixed with a generation token: every `open()` bumps `gen`, and any callback
+   from an older generation returns immediately.
+3. **Restart gaps.** `continuous=false` plus restart-on-`onend` means a fresh handshake
+   after every utterance — 300–800 ms deaf. The standing loop is now `continuous=true`
+   and detects end-of-utterance itself from interim results going quiet.
+4. **Self-hearing.** The old echo guard polled a `speaking` flag that `audio.js` could
+   leave stale. `noteSpeechEnded()` now stamps the moment narration stops, and no
+   transcript is trusted inside the guard window after it.
+5. **No recovery.** A transient `network` or `aborted` ended the session for good.
+   Restarts now back off and retry.
+
+`requestPermission()` asks for the microphone during the priming gesture rather than
+letting `SpeechRecognition` raise its own prompt mid-utterance, which used to eat the
+first sentence.
+
+One honest caveat for the paper: a standing mic drains battery, which is why the Android
+build must do hotword detection on device — see `ANDROID_VOICE_SPEC.md`.
+`Hands-free: off` exists so you can compare both.
+
+---
+
+## js/wake.js — "Hey Cab", the trigger
+
+The answer to *what replaces tap-to-speak*. A button asks a blind user to find a target on
+a flat sheet of glass, which is the one thing this app exists to avoid.
+
+One microphone, two moods. **Asleep**, the standing recogniser runs but every transcript is
+discarded unless it opens with the wake phrase. **Awake**, transcripts reach the app. There
+is no second recogniser and no second permission prompt — sleeping is a filtering decision,
+not a different audio path.
+
+Two shapes of utterance, both accepted:
+
+| You say | What happens |
+|---|---|
+| *"Hey Cab."* | wakes, says "Yes. Where to?", listens |
+| *"Hey Cab, take me to Adyar."* | wakes and books, one breath, no round trip |
+
+The second is the number to report: a complete booking from a single utterance, zero taps,
+zero turns.
+
+**Matching a phrase the recogniser gets wrong.** Speech recognisers hear "hey cab" as
+"hey cap", "a cab", "hey gab", "hey cub", "hakab". A literal compare rejects all of those
+and the app appears deaf for no visible reason. `detect()` is edit-distance based over a
+small set of canonical forms (`heycab`, `hicab`, `okcab`, `cabeye`…), applied only within
+the first four tokens — so *"call me a cab"* cannot trigger it. Budget is 1 character for
+short phrases, 2 for long ones.
+
+**The rule the wake word buys:**
+
+> The app asked a question → answer it bare. You are starting something → say "Hey Cab".
+
+Inside a turn the app itself opened, demanding the wake word again would be absurd. Outside
+one, in a moving auto-rickshaw, unprompted speech is probably aimed at the driver — and
+*"no, not that way"* must never cancel a ride. That asymmetry is the whole justification.
+
+---
+
+## js/api.js — the thin client
+
+**The backend may never be the reason a booking fails.** The rider app already has a
+complete gazetteer and a complete ambiguity rule; the server has the same ones in Java. So
+the server is an upgrade, never a dependency.
+
+Every call has a hard deadline in milliseconds — 900 for `interpret`. A blind user waiting
+on a hung fetch has no spinner to look at; the silence is the whole failure. Better a local
+answer in 40 ms than a perfect one in four seconds. `CE.nlu.resolveAsync()` tries the
+server and falls back to `resolve()`, reporting which answered as `via`.
+
+Point it elsewhere with `?api=http://192.168.1.9:8080` when the phone and the laptop are
+different machines.
 
 ---
 
@@ -243,7 +321,11 @@ Zero duplicated code.
 | Redesign an earcon | `earcon` in `js/audio.js` |
 | Change heartbeat rate | `heartbeat()` in `js/audio.js` |
 | Change what interrupts | the `tier` argument on each `say()` call |
-| Add a voice command | `G` in `js/voice.js`, then `onCommand()` in `js/rider.js` |
+| Add a voice command | `G` in `js/voice.js`, then `handleCommand()` in `js/rider.js` |
+| Change the wake word | `PHRASES` in `js/wake.js` (add the misrecognitions too) |
+| Tune wake sensitivity | `budget()` and `SCAN_TOKENS` in `js/wake.js` |
+| Point at another backend | `?api=…`, or `baseUrl()` in `js/api.js` |
+| Tune the rule server-side | `DELTA` / `DIVERGENCE_KM` in `NluService.java` |
 | Colours, fonts, sizes | `:root` in `css/theme.css` |
 | Driver position phrases | `POSITIONS` in `js/driver.js` |
 | Add driver accounts | `DRIVERS` in `js/auth.js` |
