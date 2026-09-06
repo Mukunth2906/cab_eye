@@ -1,0 +1,28 @@
+// Cab Eye — Android settings.
+// One app module. The brief's "one app, two modes" (Rider / Driver) is a runtime toggle
+// inside `:app`, not a second module — so there is exactly one thing to build and install.
+
+pluginManagement {
+    repositories {
+        google {
+            content {
+                includeGroupByRegex("com\\.android.*")
+                includeGroupByRegex("com\\.google.*")
+                includeGroupByRegex("androidx.*")
+            }
+        }
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = "CabEye"
+include ':app'

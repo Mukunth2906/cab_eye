@@ -1,0 +1,188 @@
+// =====================================================================================
+//  Cab Eye — rider/driver app module
+//  Versions are pinned in the root build.gradle; see the header there.
+// =====================================================================================
+
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+    id 'org.jetbrains.kotlin.plugin.compose'
+}
+
+android {
+    namespace 'com.cabeye.rider'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "com.cabeye.rider"
+
+        // minSdk 26 is a hard floor, not a preference:
+        //   - VibrationEffect (the distinct arrival haptic) is API 26+
+        //   - AudioTrack.Builder / AudioAttributes path for the earcon engine is API 26+
+        //   - AudioTrack.setVolume per-channel behaviour is reliable from 26
+        minSdk 26
+        targetSdk 35
+
+        versionCode 1
+        versionName "0.1.0"
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+
+        // -------------------------------------------------------------------------------
+        //  DEFAULT_BACKEND_URL — the address baked into the APK.
+        //
+        //  This is what makes the app shareable. A friend installs the APK and it already
+        //  points at the right backend; they never open settings and never paste anything.
+        //  An app that required configuration before its first run would be unusable by
+        //  exactly the person it is built for.
+        //
+        //  It is overridden at build time by the `-PbackendUrl=` Gradle property, which is
+        //  what share-with-friends.ps1 passes after it reads the live ngrok URL. It is also
+        //  overridable at runtime from the debug settings screen and persisted in DataStore
+        //  — the runtime value always wins over this one.
+        //
+        //  The default below is the phone's OWN localhost, which reaches this PC because
+        //  install-app.ps1 runs `adb reverse tcp:8080 tcp:8080` on every device it installs
+        //  to. Deliberately not 10.0.2.2 (the emulator's alias for the host): that address
+        //  works only on an emulator, whereas `adb reverse` works on emulators AND real
+        //  phones, so localhost is the one default that covers both.
+        // -------------------------------------------------------------------------------
+        def backendUrl = project.findProperty('backendUrl') ?: 'http://localhost:8080'
+        buildConfigField "String", "DEFAULT_BACKEND_URL", "\"${backendUrl}\""
+
+        // Google Maps Platform key is read from android/local.properties so it is never
+        // committed to source control. The same Android-restricted key is used by the
+        // Places SDK and Maps SDK; Google validates the package name + SHA-1 restriction.
+        def googleKey = project.findProperty('GOOGLE_MAPS_API_KEY')
+        if (googleKey == null) {
+            def localPropertiesFile = rootProject.file('local.properties')
+            if (localPropertiesFile.exists()) {
+                def props = new Properties()
+                localPropertiesFile.withInputStream { props.load(it) }
+                googleKey = props.getProperty('GOOGLE_MAPS_API_KEY')
+            }
+        }
+        googleKey = googleKey ?: ''
+        buildConfigField "String", "GOOGLE_MAPS_API_KEY", "\"${googleKey}\""
+        manifestPlaceholders = [GOOGLE_MAPS_API_KEY: googleKey]
+    }
+
+    buildTypes {
+        debug {
+            // Keep the debug build unminified so logcat stack traces stay readable —
+            // this is the build you will actually demo from.
+            minifyEnabled false
+            applicationIdSuffix ""
+        }
+        release {
+            minifyEnabled false   // MVP: no shrinking, so nothing can silently strip
+                                  // the Compose or TTS classes before the demo.
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'),
+                          'proguard-rules.pro'
+
+            // Signed with the debug key so `assembleRelease` produces an APK that actually
+            // installs. Without this the release APK is unsigned and every phone refuses it
+            // with a bare "App not installed" — the least diagnosable failure in Android, and
+            // one that would land on a friend rather than on the person who can fix it.
+            // A real release key belongs here before this ever reaches a store.
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+
+    buildFeatures {
+        compose true
+        // BuildConfig is needed so the app can branch on debug vs release for the
+        // mode toggle and the backend URL.
+        buildConfig true
+    }
+
+    packaging {
+        resources {
+            excludes += '/META-INF/{AL2.0,LGPL2.1}'
+        }
+    }
+}
+
+dependencies {
+
+    // ---- Compose ---------------------------------------------------------------------
+    // The BOM sets every androidx.compose.* version, so those artifacts are declared
+    // WITHOUT a version. Do not add versions to them — that defeats the BOM.
+    def composeBom = platform('androidx.compose:compose-bom:2024.10.01')
+    implementation composeBom
+    androidTestImplementation composeBom
+
+    implementation 'androidx.compose.ui:ui'
+    implementation 'androidx.compose.ui:ui-graphics'
+    implementation 'androidx.compose.ui:ui-tooling-preview'
+    implementation 'androidx.compose.material3:material3'
+    implementation 'androidx.compose.material:material-icons-extended'
+
+    // ---- Lifecycle & activity --------------------------------------------------------
+    implementation 'androidx.core:core-ktx:1.15.0'
+    implementation 'androidx.activity:activity-compose:1.9.3'
+    implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.8.7'
+    implementation 'androidx.lifecycle:lifecycle-runtime-compose:2.8.7'
+    implementation 'androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7'
+    // Foreground service for background narration (wired up in a later step).
+    implementation 'androidx.lifecycle:lifecycle-service:2.8.7'
+
+    // ---- Networking ------------------------------------------------------------------
+    // NOTE: OkHttp's WebSocket client lives in the CORE `okhttp` artifact — there is no
+    // separate "okhttp-websocket" dependency to add. `okhttp3.WebSocket` and
+    // `okhttp3.WebSocketListener` are already on the classpath from this one line.
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+    implementation 'com.squareup.okhttp3:logging-interceptor:4.12.0'
+
+    // ---- Google Maps Platform --------------------------------------------------------
+    // Current native Android SDKs (September 2026): Places 5.3.0, Maps 20.0.0,
+    // Play services Location 21.4.0. No Firebase or additional backend technology is added.
+    implementation 'com.google.android.libraries.places:places:5.3.0'
+    implementation 'com.google.android.gms:play-services-maps:20.0.0'
+    implementation 'com.google.android.gms:play-services-location:21.4.0'
+
+    // ---- Settings storage ------------------------------------------------------------
+    // DataStore, for the backend URL and the role toggle. SharedPreferences is still used
+    // for the rider's city and theme (see RiderPreferences) — those are read synchronously
+    // during composition and are tiny. These two are read from coroutines and must be
+    // OBSERVABLE: changing the backend URL has to reach a live WebSocket and make it
+    // reconnect, and a Flow is how that happens without a callback registry.
+    //
+    // JSON is parsed with org.json, which ships inside Android — no Moshi, no Gson, no
+    // kapt/KSP step. The envelope has eight fields and one shape in both directions.
+    implementation 'androidx.datastore:datastore-preferences:1.1.1'
+
+    // ---- Coroutines ------------------------------------------------------------------
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0'
+
+    // ---- Debug tooling ---------------------------------------------------------------
+    debugImplementation 'androidx.compose.ui:ui-tooling'
+    debugImplementation 'androidx.compose.ui:ui-test-manifest'
+
+    // ---- Test ------------------------------------------------------------------------
+    testImplementation 'junit:junit:4.13.2'
+
+    // The REAL org.json, on the unit-test classpath only.
+    //
+    // Why this is needed: the `android.jar` that JVM unit tests compile against is a
+    // *stub*. Every org.json method in it throws "not mocked", so a test that parses a
+    // RideEvent gets an exception rather than an object — which would leave the wire
+    // parsing, the eventId de-duplication key and the snapshot reconciliation completely
+    // untested. Those are exactly the pieces that fail invisibly on a device.
+    //
+    // This is `testImplementation`, so it is not in the APK and adds nothing to the app.
+    // On a real device the platform's own org.json is used, as before.
+    testImplementation 'org.json:json:20231013'
+    androidTestImplementation 'androidx.test.ext:junit:1.2.1'
+    androidTestImplementation 'androidx.compose.ui:ui-test-junit4'
+}

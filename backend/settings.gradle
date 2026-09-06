@@ -1,0 +1,2 @@
+// Cab Eye backend — Gradle settings.
+rootProject.name = 'cabeye-backend'

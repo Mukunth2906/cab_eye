@@ -1,0 +1,54 @@
+// =====================================================================================
+//  Cab Eye — Backend build file
+//
+//  EXACT VERSIONS TARGETED (do not bump casually; these are a tested-together set):
+//    Gradle ......................... 8.11.1   (see gradle/wrapper/gradle-wrapper.properties)
+//    Spring Boot plugin ............. 3.3.5
+//    Spring dependency-management ... 1.1.6
+//    Java source/target ............. 17       (compiled and run by Android Studio's JBR 21)
+//
+//  Only two starters are declared, exactly as the brief specifies: `web` and `websocket`.
+//  No Postgres, no Redis, no Kafka, no Spring Security — state lives in a
+//  ConcurrentHashMap inside RideSessionManager.
+// =====================================================================================
+
+plugins {
+    id 'java'
+    id 'org.springframework.boot'            version '3.3.5'
+    id 'io.spring.dependency-management'     version '1.1.6'
+}
+
+group   = 'com.cabeye'
+version = '0.1.0-SNAPSHOT'
+
+// NOTE: deliberately NOT using a Gradle `toolchain { }` block. Toolchain resolution tries
+// to auto-provision a JDK on first run, which is a common and confusing failure on a
+// fresh machine. Plain source/target compatibility compiled by whatever JDK 17+ is
+// running Gradle (here: Android Studio's bundled JBR 21) is far more predictable.
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // --- Required by the brief -------------------------------------------------------
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-websocket'
+
+    // --- Test (harmless; lets `gradlew test` succeed rather than error on no config) ---
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testRuntimeOnly   'org.junit.platform:junit-platform-launcher'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+}
+
+// Make the console output UTF-8 on Windows so log arrows/box characters don't mojibake.
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}

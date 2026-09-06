@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cab Eye — backend test console</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; padding:24px; background:#0b0b0d; color:#f2f2f4;
+         font:15px/1.5 ui-monospace, "Cascadia Code", Consolas, monospace; }
+  h1 { font-size:18px; margin:0 0 4px; }
+  p.sub { margin:0 0 20px; color:#a0a0aa; font-size:13px; }
+  fieldset { border:1px solid #2c2c33; border-radius:8px; margin:0 0 16px; padding:14px 16px; }
+  legend { color:#8ab4ff; font-size:12px; text-transform:uppercase; letter-spacing:.08em; padding:0 6px; }
+  label { display:inline-block; min-width:70px; color:#a0a0aa; font-size:13px; }
+  input { background:#17171c; border:1px solid #33333c; color:#f2f2f4; border-radius:5px;
+          padding:6px 9px; font:inherit; font-size:13px; margin:3px 0; }
+  button { background:#2b6cf6; border:0; color:#fff; border-radius:5px; padding:8px 15px;
+           font:inherit; font-size:13px; cursor:pointer; margin-right:6px; }
+  button.alt { background:#3a3a44; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  #log { background:#08080a; border:1px solid #2c2c33; border-radius:8px; padding:12px;
+         height:340px; overflow-y:auto; white-space:pre-wrap; font-size:12.5px; }
+  .in   { color:#7ee787; }
+  .out  { color:#8ab4ff; }
+  .meta { color:#8b8b96; }
+  .err  { color:#ff7b72; }
+  #dot { display:inline-block; width:9px; height:9px; border-radius:50%; background:#666; margin-right:7px; }
+  #dot.on { background:#7ee787; }
+</style>
+</head>
+<body>
+
+<h1><span id="dot"></span>Cab Eye — backend test console</h1>
+<p class="sub">Proves join / leave / broadcast without needing the Android app.
+Open this page in <b>two browser tabs</b> to simulate a rider and a driver.</p>
+
+<fieldset>
+  <legend>Connection</legend>
+  <label for="ride">rideId</label><input id="ride" value="demo" size="10">
+  <label for="user">userId</label><input id="user" value="rider-1" size="12">
+  <label for="role">role</label><input id="role" value="RIDER" size="8"><br>
+  <button id="connect">Connect</button>
+  <button id="disconnect" class="alt" disabled>Disconnect</button>
+</fieldset>
+
+<fieldset>
+  <legend>Send an event on this socket</legend>
+  <label for="type">type</label><input id="type" value="POSITION_PRESET" size="20">
+  <label for="payload">payload</label><input id="payload" value='{"text":"I am twenty metres to your left, near the gate"}' size="52"><br>
+  <button id="send" disabled>Send</button>
+  <button id="serverPush" class="alt">Push via REST /debug/broadcast</button>
+</fieldset>
+
+<div id="log"></div>
+
+<script>
+  let ws = null;
+  const $ = id => document.getElementById(id);
+  const logEl = $('log');
+
+  function log(cls, text) {
+    const time = new Date().toTimeString().slice(0, 8);
+    const line = document.createElement('div');
+    line.className = cls;
+    line.textContent = `[${time}] ${text}`;
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function setConnected(on) {
+    $('dot').classList.toggle('on', on);
+    $('connect').disabled = on;
+    $('disconnect').disabled = !on;
+    $('send').disabled = !on;
+  }
+
+  $('connect').onclick = () => {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const url = `${proto}://${location.host}/ws/ride`
+              + `?rideId=${encodeURIComponent($('ride').value)}`
+              + `&userId=${encodeURIComponent($('user').value)}`
+              + `&role=${encodeURIComponent($('role').value)}`;
+    log('meta', `connecting -> ${url}`);
+
+    ws = new WebSocket(url);
+    ws.onopen    = ()  => { setConnected(true);  log('meta', 'socket OPEN'); };
+    ws.onmessage = e   => log('in',  'RECV  ' + e.data);
+    ws.onerror   = ()  => log('err', 'socket ERROR (is the backend running on this port?)');
+    ws.onclose   = e   => { setConnected(false); log('meta', `socket CLOSED code=${e.code}`); };
+  };
+
+  $('disconnect').onclick = () => ws && ws.close();
+
+  $('send').onclick = () => {
+    let payload;
+    try {
+      payload = $('payload').value.trim() ? JSON.parse($('payload').value) : {};
+    } catch (err) {
+      log('err', 'payload is not valid JSON: ' + err.message);
+      return;
+    }
+    const msg = JSON.stringify({ type: $('type').value, payload });
+    ws.send(msg);
+    log('out', 'SEND  ' + msg);
+    log('meta', 'note: the server echoes to the OTHER tab only, never back to the sender');
+  };
+
+  $('serverPush').onclick = async () => {
+    const url = `/debug/broadcast?rideId=${encodeURIComponent($('ride').value)}`
+              + `&type=${encodeURIComponent($('type').value)}`;
+    try {
+      const res  = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: $('payload').value.trim() || '{}'
+      });
+      const body = await res.json();
+      log('out', `REST  POST ${url} -> delivered to ${body.delivered} session(s)`);
+    } catch (err) {
+      log('err', 'REST call failed: ' + err.message);
+    }
+  };
+
+  log('meta', 'Ready. Click Connect, then open a second tab with a different userId/role.');
+</script>
+
+</body>
+</html>

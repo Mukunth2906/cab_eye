@@ -1,0 +1,56 @@
+# =====================================================================================
+#  Cab Eye — .gitignore
+#
+#  Rule of thumb: commit the SOURCE, ignore anything a build or a tool regenerates,
+#  and ignore anything that is specific to one machine.
+# =====================================================================================
+
+# --- Gradle / Android / Java build output ------------------------------------------
+# These are rebuilt every time you run gradlew or the install script. The release APK
+# alone is ~11 MB and changes on every build, so it must never be committed.
+build/
+.gradle/
+.kotlin/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+*.jar
+!**/gradle/wrapper/gradle-wrapper.jar
+local.properties
+
+# --- Signing keys --------------------------------------------------------------------
+# A keystore signs your app as YOU. If one leaks, someone else can publish updates that
+# phones will accept as genuine. Never commit these, even for a hobby project.
+*.jks
+*.keystore
+keystore.properties
+
+# --- Secrets and machine-specific config ---------------------------------------------
+.env
+.env.*
+!.env.example
+secrets.properties
+
+# --- Tools that are downloaded, not authored -----------------------------------------
+# ngrok is a 33 MB third-party binary. share-with-friends.ps1 already tells you to
+# download it yourself and drop it next to the script, so git does not need a copy.
+ngrok.exe
+ngrok.yml
+
+# --- Run logs ------------------------------------------------------------------------
+# share-with-friends.ps1 rewrites this on every run; it is a record of one session,
+# not part of the project.
+*.log
+
+# --- IDE / editor --------------------------------------------------------------------
+.idea/
+*.iml
+.vscode/
+*.swp
+
+# --- OS clutter ----------------------------------------------------------------------
+Thumbs.db
+desktop.ini
+.DS_Store

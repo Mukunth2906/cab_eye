@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android has blocked plain HTTP by default since API 28. The MVP backend runs on
+  http://localhost:8080 with no TLS, so cleartext has to be re-enabled or every request
+  fails with "CLEARTEXT communication not permitted".
+
+  cleartextTrafficPermitted is set to true on the base config so that BOTH ways of
+  reaching the backend work without a code change:
+    - `adb reverse` (the phone's own localhost, tunnelled over USB) — the default here
+    - a LAN IP such as 192.168.1.42, if you later demo over Wi-Fi
+
+  The named domains below are redundant given the base config, but they document the
+  addresses this app is actually expected to talk to.
+
+  THIS IS AN MVP SETTING. Before anything ships publicly, delete the base-config override
+  and put the backend behind HTTPS.
+-->
+<network-security-config>
+
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+
+    <domain-config cleartextTrafficPermitted="true">
+        <!-- Reached through `adb reverse tcp:8080 tcp:8080` over the USB cable. -->
+        <domain includeSubdomains="true">localhost</domain>
+        <domain includeSubdomains="true">127.0.0.1</domain>
+        <!-- The host machine as seen from the Android *emulator*. -->
+        <domain includeSubdomains="true">10.0.2.2</domain>
+    </domain-config>
+
+</network-security-config>

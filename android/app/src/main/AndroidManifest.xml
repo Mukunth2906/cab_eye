@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      Permissions.
+      RECORD_AUDIO, VIBRATE and INTERNET are needed by step 1's surface and the steps
+      immediately after it. The rest are declared now because adding a permission later
+      means re-granting it on the device mid-demo, which is exactly the kind of avoidable
+      interruption this project cannot afford.
+    -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <!-- Narration must survive backgrounding and a locked screen, so it runs in a
+         foreground service. From API 34 the service type must be declared here too. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Bearing-panned earcons need the magnetometer; driver proximity needs location. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <!-- "call driver" global voice command. -->
+    <uses-permission android:name="android.permission.CALL_PHONE" />
+
+    <!-- Meeting contact for a vague destination: the rider says "my friend Ravi" and the
+         driver is given someone to ring when the drop-off is a five-kilometre road rather
+         than a building. Requested at the moment it is needed, never at launch, and only
+         after the app has said out loud why. Exactly one contact — the one the rider named
+         and confirmed — is ever sent anywhere; the phonebook is read on-device and never
+         uploaded in bulk. A rider who refuses still gets their cab. -->
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
+
+    <!-- Android 11+ package visibility: without this the app cannot see that an on-device
+         speech recognition service exists, and SpeechRecognizer silently does nothing. -->
+    <queries>
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
+
+    <!-- A magnetometer is used for bearing panning but the app degrades gracefully
+         without one, so it is not required for installation. -->
+    <uses-feature android:name="android.hardware.sensor.compass" android:required="false" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+    <application
+        android:hardwareAccelerated="true"
+        android:name=".CabEyeApp"
+        android:allowBackup="true"
+        android:label="@string/app_name"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.CabEye">
+
+        <!-- The same Android-restricted key is used by Places SDK and Maps SDK. -->
+        <meta-data
+            android:name="com.google.android.geo.API_KEY"
+            android:value="${GOOGLE_MAPS_API_KEY}" />
+
+        <!--
+          Exactly one Activity. This is principle 1 ("one surface, zero navigation")
+          expressed in the manifest: there is no second Activity to navigate to.
+
+          configChanges: handling these ourselves stops Android destroying and recreating
+          the Activity on rotation or a keyboard change. A recreate mid-ride would restart
+          the audio engine and cut the narrator off mid-sentence.
+
+          screenOrientation=portrait: a blind user cannot see that the screen rotated, and
+          a rotation would otherwise reshuffle the touch target under their finger.
+        -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="portrait"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode"
+            android:windowSoftInputMode="stateAlwaysHidden">
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          Keeps narration alive while the app is backgrounded or the screen is off, which is
+          the normal case for this product rather than an edge case. The mediaPlayback type
+          is required from API 34 and must match the FOREGROUND_SERVICE_MEDIA_PLAYBACK
+          permission declared above.
+        -->
+        <service
+            android:name=".service.NarrationService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
+
+    </application>
+
+</manifest>

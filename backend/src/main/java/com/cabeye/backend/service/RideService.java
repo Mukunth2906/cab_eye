@@ -1,0 +1,459 @@
+package com.cabeye.backend.service;
+
+import com.cabeye.backend.model.Ride;
+import com.cabeye.backend.model.RideEvent;
+import com.cabeye.backend.model.RideEventType;
+import com.cabeye.backend.model.RidePhase;
+import com.cabeye.backend.websocket.RideSessionManager;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+
+import java.security.SecureRandom;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+
+/**
+ * The ride state machine, and the only thing allowed to move a ride between phases.
+ *
+ * <p>Every transition does exactly two things, in this order and never in the other:
+ * <ol>
+ *   <li>mutate the ride and append the event to its log (so the evidence exists), then</li>
+ *   <li>broadcast it (so clients learn about it).</li>
+ * </ol>
+ * A reconnecting client reconciles against the phase, so a phase that had moved without its
+ * event being recorded would be a state the client could see but never explain.
+ *
+ * <h2>The dispatch topic</h2>
+ * Drivers who are online but not yet on a ride join a reserved pseudo-ride, {@link #DISPATCH_TOPIC}.
+ * It gives drivers somewhere to listen before there is a ride to listen to, without inventing a
+ * second socket endpoint. It is not a {@link Ride} and never appears in {@link #all()}, so it
+ * cannot be a debug-broadcast target.
+ */
+@Service
+public class RideService {
+
+    private static final Logger log = LoggerFactory.getLogger(RideService.class);
+
+    /** Reserved topic name that online drivers subscribe to for ride offers. */
+    public static final String DISPATCH_TOPIC = "dispatch";
+
+    private final RideSessionManager sessions;
+
+    private final Map<String, Ride> rides = new ConcurrentHashMap<>();
+    private final AtomicLong rideCounter = new AtomicLong(1000);
+    private final SecureRandom random = new SecureRandom();
+
+    public RideService(RideSessionManager sessions) {
+        this.sessions = sessions;
+    }
+
+    // ===================================================================================
+    //  Lookup
+    // ===================================================================================
+
+    public Optional<Ride> find(String rideId) {
+        return Optional.ofNullable(rides.get(rideId));
+    }
+
+    /** @return true when this ride genuinely exists — the scope check for the debug endpoint. */
+    public boolean exists(String rideId) {
+        return rideId != null && rides.containsKey(rideId);
+    }
+
+    public Collection<Ride> all() {
+        return rides.values();
+    }
+
+    /** Rides a driver may accept: requested, unassigned, not terminal. */
+    public List<Ride> openRequests() {
+        List<Ride> out = new ArrayList<>();
+        for (Ride ride : rides.values()) {
+            if (ride.phase() == RidePhase.REQUESTED && ride.driverId() == null) {
+                out.add(ride);
+            }
+        }
+        return out;
+    }
+
+    // ===================================================================================
+    //  Transitions
+    // ===================================================================================
+
+    /**
+     * Creates a ride and offers it to every online driver.
+     *
+     * <p>The boarding code is generated <b>here</b>, server-side, and never by either phone.
+     * The rider's app is told the code so it can verify what it hears; the driver's app is told
+     * the code so it can display it. Neither one invents it, which is what makes the code
+     * evidence rather than a shared guess.
+     */
+    public Ride create(String riderId, String destination, String rideType) {
+        return create(riderId, destination, "", null, null, "", null, null, rideType);
+    }
+
+    public Ride create(String riderId,
+                       String destination,
+                       String destinationAddress,
+                       Double destinationLatitude,
+                       Double destinationLongitude,
+                       String destinationPlaceId,
+                       Double pickupLatitude,
+                       Double pickupLongitude,
+                       String rideType) {
+        return create(riderId, destination, destinationAddress, destinationLatitude,
+                destinationLongitude, destinationPlaceId, pickupLatitude, pickupLongitude,
+                "", "", "", rideType);
+    }
+
+    /**
+     * Creates a ride that may carry a meeting contact.
+     *
+     * <p>{@code contactName} and {@code contactPhone} are blank for the ordinary case — a ride
+     * to a building needs no one to ring. They are populated only when the destination was
+     * vague enough that the rider named someone waiting there.
+     */
+    public Ride create(String riderId,
+                       String destination,
+                       String destinationAddress,
+                       Double destinationLatitude,
+                       Double destinationLongitude,
+                       String destinationPlaceId,
+                       Double pickupLatitude,
+                       Double pickupLongitude,
+                       String contactName,
+                       String contactPhone,
+                       String dropNote,
+                       String rideType) {
+        String rideId = "ride-" + rideCounter.incrementAndGet();
+        String code = generateBoardingCode();
+
+        Ride ride = new Ride(rideId, riderId, destination, destinationAddress,
+                destinationLatitude, destinationLongitude, destinationPlaceId,
+                pickupLatitude, pickupLongitude, contactName, contactPhone, dropNote, rideType, code);
+        rides.put(rideId, ride);
+
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("rideId", rideId);
+        payload.put("riderId", riderId);
+        payload.put("destination", destination);
+        payload.put("destinationAddress", destinationAddress);
+        payload.put("destinationLatitude", destinationLatitude);
+        payload.put("destinationLongitude", destinationLongitude);
+        payload.put("destinationPlaceId", destinationPlaceId);
+        payload.put("pickupLatitude", pickupLatitude);
+        payload.put("pickupLongitude", pickupLongitude);
+        payload.put("contactName", contactName);
+        payload.put("contactPhone", contactPhone);
+        payload.put("dropNote", dropNote);
+        payload.put("rideType", rideType);
+
+        RideEvent event = record(ride, RideEventType.RIDE_CREATED, "server", "SYSTEM", payload);
+
+        sessions.broadcast(rideId, event);
+        // Offer it to the driver pool. Drivers are not on the ride topic yet — they have not
+        // accepted anything — so this is a separate fan-out, not a duplicate of the line above.
+        sessions.broadcast(DISPATCH_TOPIC, event);
+
+        log.info("RIDE_CREATED ride={} rider={} destination=\"{}\" type={} code={}",
+                rideId, riderId, destination, rideType, code);
+        return ride;
+    }
+
+    /** A driver accepted. Returns empty if the ride is gone or somebody else already took it. */
+    public synchronized Optional<Ride> assign(String rideId,
+                                              String driverId,
+                                              String driverName,
+                                              String vehicleModel,
+                                              String vehiclePlate,
+                                              String driverPhone,
+                                              int etaMinutes) {
+        Ride ride = rides.get(rideId);
+        if (ride == null || ride.phase() != RidePhase.REQUESTED || ride.driverId() != null) {
+            return Optional.empty();
+        }
+
+        ride.assignDriver(driverId, driverName, vehicleModel, vehiclePlate, driverPhone, etaMinutes);
+        ride.phase(RidePhase.ASSIGNED);
+
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("driverId", driverId);
+        payload.put("driverName", driverName);
+        payload.put("vehicleModel", vehicleModel);
+        payload.put("vehiclePlate", vehiclePlate);
+        payload.put("driverPhone", driverPhone);
+        payload.put("etaMinutes", etaMinutes);
+
+        publish(ride, RideEventType.RIDE_ASSIGNED, driverId, "DRIVER", payload);
+
+        // Withdraw the offer from every other online driver.
+        sessions.broadcast(DISPATCH_TOPIC, RideEvent.system("REQUEST_TAKEN", rideId,
+                Map.of("rideId", rideId, "driverId", driverId)));
+
+        log.info("RIDE_ASSIGNED ride={} driver={} eta={}min", rideId, driverId, etaMinutes);
+        return Optional.of(ride);
+    }
+
+    /** Driver started navigating to the pickup. */
+    public Optional<Ride> enroute(String rideId, String driverId) {
+        return transition(rideId, RidePhase.ENROUTE, RideEventType.DRIVER_ENROUTE, driverId,
+                Map.of(), RidePhase.ASSIGNED);
+    }
+
+    /**
+     * A driver position update.
+     *
+     * <p>Deliberately does <b>not</b> change the phase. It fires many times per ride and is
+     * tier 2 on the rider's phone — an earcon whose pitch carries the distance and whose pan
+     * carries the bearing. Coupling it to a phase change would make every tone a state
+     * transition the reconnect logic would then have to reconcile against.
+     */
+    public Optional<Ride> location(String rideId, String driverId, int distanceMeters, float bearingDeg) {
+        Ride ride = rides.get(rideId);
+        if (ride == null || ride.phase().isTerminal()) {
+            return Optional.empty();
+        }
+        ride.distance(distanceMeters);
+        ride.bearing(bearingDeg);
+
+        publish(ride, RideEventType.DRIVER_LOCATION, driverId, "DRIVER", Map.of(
+                "distanceMeters", distanceMeters,
+                "bearingDeg", bearingDeg
+        ));
+        return Optional.of(ride);
+    }
+
+    /**
+     * A canned position phrase from the driver, spoken by the rider's phone.
+     *
+     * <p>The driver never speaks it and the rider never reads it. Text travels; audio is
+     * produced at the ear that needs it.
+     */
+    public Optional<Ride> positionPreset(String rideId, String driverId, String text) {
+        Ride ride = rides.get(rideId);
+        if (ride == null || ride.phase().isTerminal()) {
+            return Optional.empty();
+        }
+        publish(ride, RideEventType.POSITION_PRESET, driverId, "DRIVER", Map.of("text", text));
+        return Optional.of(ride);
+    }
+
+    /** Audio beacon, panned on the rider's phone to the bearing given here. */
+    public Optional<Ride> beacon(String rideId, String driverId, float bearingDeg) {
+        Ride ride = rides.get(rideId);
+        if (ride == null || ride.phase().isTerminal()) {
+            return Optional.empty();
+        }
+        ride.bearing(bearingDeg);
+        publish(ride, RideEventType.BEACON, driverId, "DRIVER", Map.of("bearingDeg", bearingDeg));
+        return Optional.of(ride);
+    }
+
+    /**
+     * Driver is at the pickup point. Carries the boarding code the driver will read aloud.
+     *
+     * <p>Tier 0 on the rider's phone, and the only ride event besides deviation and connection
+     * loss permitted to interrupt.
+     */
+    public Optional<Ride> arrived(String rideId, String driverId) {
+        Ride ride = rides.get(rideId);
+        if (ride == null || ride.phase().isTerminal()) {
+            return Optional.empty();
+        }
+        ride.phase(RidePhase.ARRIVED);
+        publish(ride, RideEventType.DRIVER_ARRIVED, driverId, "DRIVER", Map.of(
+                "boardingCode", ride.boardingCode()
+        ));
+        log.info("DRIVER_ARRIVED ride={} code={}", rideId, ride.boardingCode());
+        return Optional.of(ride);
+    }
+
+    /** The rider's app verified the code it heard the driver say aloud. */
+    public Optional<Ride> confirmCode(String rideId, String riderId, boolean matched) {
+        Ride ride = rides.get(rideId);
+        if (ride == null || ride.phase().isTerminal()) {
+            return Optional.empty();
+        }
+        ride.codeConfirmed(matched);
+        publish(ride, RideEventType.CODE_CONFIRMED, riderId, "RIDER", Map.of("matched", matched));
+        return Optional.of(ride);
+    }
+
+    /**
+     * The driver confirmed the passenger is physically in the vehicle.
+     *
+     * <p>This is a hard gate, not a courtesy: {@link #startTrip} refuses to run until it has
+     * happened. A blind passenger who has not finished getting in is the one person who cannot
+     * see a car start moving, so "the trip started" must never be able to precede "they are in".
+     */
+    public Optional<Ride> passengerSeated(String rideId, String driverId) {
+        Ride ride = rides.get(rideId);
+        if (ride == null || ride.phase().isTerminal()) {
+            return Optional.empty();
+        }
+        ride.phase(RidePhase.SEATED);
+        publish(ride, RideEventType.PASSENGER_SEATED, driverId, "DRIVER", Map.of());
+        return Optional.of(ride);
+    }
+
+    /** Starts the journey. Refuses unless the passenger has been confirmed seated. */
+    public Optional<Ride> startTrip(String rideId, String driverId, int etaMinutes) {
+        Ride ride = rides.get(rideId);
+        if (ride == null || ride.phase() != RidePhase.SEATED) {
+            log.warn("TRIP_START_REFUSED ride={} phase={} (passenger not confirmed seated)",
+                    rideId, ride == null ? "MISSING" : ride.phase());
+            return Optional.empty();
+        }
+        ride.phase(RidePhase.IN_TRIP);
+        ride.etaMinutes(etaMinutes);
+        publish(ride, RideEventType.TRIP_STARTED, driverId, "DRIVER", Map.of(
+                "destination", ride.destination(),
+                "etaMinutes", etaMinutes
+        ));
+        return Optional.of(ride);
+    }
+
+    /** Ends the journey. */
+    public Optional<Ride> complete(String rideId, String driverId, int fareRupees, int durationMinutes) {
+        Ride ride = rides.get(rideId);
+        if (ride == null || ride.phase().isTerminal()) {
+            return Optional.empty();
+        }
+        ride.phase(RidePhase.COMPLETED);
+        ride.fare(fareRupees);
+        ride.durationMinutes(durationMinutes);
+        publish(ride, RideEventType.TRIP_COMPLETED, driverId, "DRIVER", Map.of(
+                "destination", ride.destination(),
+                "fareRupees", fareRupees,
+                "durationMinutes", durationMinutes
+        ));
+        return Optional.of(ride);
+    }
+
+    /** Cancelled by either party. */
+    public Optional<Ride> cancel(String rideId, String actorId, String actorRole, String reason) {
+        Ride ride = rides.get(rideId);
+        if (ride == null || ride.phase().isTerminal()) {
+            return Optional.empty();
+        }
+        ride.phase(RidePhase.CANCELLED);
+        publish(ride, RideEventType.RIDE_CANCELLED, actorId, actorRole,
+                Map.of("reason", reason == null ? "" : reason));
+        sessions.broadcast(DISPATCH_TOPIC, RideEvent.system("REQUEST_TAKEN", rideId,
+                Map.of("rideId", rideId, "cancelled", true)));
+        return Optional.of(ride);
+    }
+
+    /** Route deviation. Tier 0 on the rider's phone. */
+    public Optional<Ride> deviation(String rideId, String note) {
+        Ride ride = rides.get(rideId);
+        if (ride == null || ride.phase().isTerminal()) {
+            return Optional.empty();
+        }
+        publish(ride, RideEventType.ROUTE_DEVIATION, "server", "SYSTEM",
+                Map.of("note", note == null ? "" : note));
+        return Optional.of(ride);
+    }
+
+    // ===================================================================================
+    //  Replay
+    // ===================================================================================
+
+    /**
+     * Replays a ride's event log to one freshly reconnected session.
+     *
+     * <p>Every replayed event keeps its original {@code eventId}, so a client that already
+     * handled it will discard it. This is the mechanism, not a side effect: without stable ids,
+     * "replay everything since you left" and "say everything twice" are the same operation.
+     *
+     * @param afterSeq client's last-seen sequence number; 0 replays the whole retained log
+     * @return how many events were sent
+     */
+    public int replayTo(String rideId, long afterSeq, org.springframework.web.socket.WebSocketSession session) {
+        Ride ride = rides.get(rideId);
+        if (ride == null) {
+            return 0;
+        }
+        List<RideEvent> pending = ride.eventsAfter(afterSeq);
+        for (RideEvent event : pending) {
+            sessions.sendTo(session, event);
+        }
+        // Bookend so the client knows the backlog is done and live events resume. It is a
+        // transport notice, not a ride event, so it is not logged against the ride.
+        sessions.sendTo(session, RideEvent.system("REPLAY_COMPLETE", rideId, Map.of(
+                "replayed", pending.size(),
+                "lastSeq", ride.lastSeq(),
+                "phase", ride.phase().name()
+        )));
+        log.info("REPLAY ride={} afterSeq={} -> {} event(s)", rideId, afterSeq, pending.size());
+        return pending.size();
+    }
+
+    // ===================================================================================
+    //  Internals
+    // ===================================================================================
+
+    /** Records an event against a ride's log without broadcasting it. */
+    private RideEvent record(Ride ride, RideEventType type, String senderId, String role,
+                             Map<String, Object> payload) {
+        return ride.append(RideEvent.now(type.name(), ride.rideId(), senderId, role, payload));
+    }
+
+    /** Records an event and then broadcasts it to everyone on the ride topic. */
+    private RideEvent publish(Ride ride, RideEventType type, String senderId, String role,
+                              Map<String, Object> payload) {
+        RideEvent event = record(ride, type, senderId, role, payload);
+        sessions.broadcast(ride.rideId(), event);
+        return event;
+    }
+
+    /**
+     * A phase change that is only legal from certain phases.
+     *
+     * @param allowedFrom phases this transition may be made from; empty means any non-terminal
+     */
+    private Optional<Ride> transition(String rideId, RidePhase to, RideEventType type,
+                                      String actorId, Map<String, Object> payload,
+                                      RidePhase... allowedFrom) {
+        Ride ride = rides.get(rideId);
+        if (ride == null || ride.phase().isTerminal()) {
+            return Optional.empty();
+        }
+        if (allowedFrom.length > 0) {
+            boolean ok = false;
+            for (RidePhase from : allowedFrom) {
+                if (ride.phase() == from) { ok = true; break; }
+            }
+            if (!ok) {
+                log.warn("TRANSITION_REFUSED ride={} from={} to={}", rideId, ride.phase(), to);
+                return Optional.empty();
+            }
+        }
+        ride.phase(to);
+        publish(ride, type, actorId, "DRIVER", payload);
+        return Optional.of(ride);
+    }
+
+    /**
+     * A three-digit boarding code, spoken as "four, seven, two".
+     *
+     * <p>Three digits, not six: the driver has to say it aloud and the rider has to hold it in
+     * working memory while a car door is open on a street. A longer code is more secure against
+     * an attacker who is not present, and this code exists entirely to defend against one who is.
+     *
+     * <p>{@link SecureRandom} rather than {@code Math.random()} because a predictable code is
+     * the same as no code — anyone able to guess the next one could walk up and say it.
+     */
+    private String generateBoardingCode() {
+        int a = random.nextInt(10);
+        int b = random.nextInt(10);
+        int c = random.nextInt(10);
+        return a + "-" + b + "-" + c;
+    }
+}

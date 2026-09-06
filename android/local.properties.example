@@ -1,0 +1,6 @@
+# Copy this file to android/local.properties and replace the placeholder.
+# local.properties is ignored by git; never commit the real API key.
+GOOGLE_MAPS_API_KEY=YOUR_GOOGLE_MAPS_API_KEY
+
+# Android Studio normally writes sdk.dir automatically. If it is missing, Android Studio will
+# recreate it when the project is opened.
