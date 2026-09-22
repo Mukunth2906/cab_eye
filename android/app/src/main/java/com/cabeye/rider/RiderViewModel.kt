@@ -29,6 +29,7 @@ import com.cabeye.rider.net.PaymentOrderStatus
 import com.cabeye.rider.net.UpiResponse
 import com.cabeye.rider.net.lastFourSpoken
 import com.cabeye.rider.places.City
+import com.cabeye.rider.security.BiometricGate
 import com.cabeye.rider.places.ContactLookup
 import com.cabeye.rider.places.ContactMatch
 import com.cabeye.rider.places.Gazetteer
@@ -200,6 +201,13 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
      * cannot be asked for must not strand a rider mid-booking.
      */
     var contactPermissionRequest: (() -> Unit)? = null
+
+    /**
+     * Set by the Activity: shows Android's fingerprint / face / screen-lock prompt for a
+     * payment and reports the outcome. Lives on the Activity because the system prompt needs
+     * one; null (for example in tests) means pay without the prompt.
+     */
+    var paymentAuthRequest: ((Int, (BiometricGate.Result) -> Unit) -> Unit)? = null
 
     /**
      * The rider answered the system contacts dialog.
@@ -863,7 +871,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     fun onPayTapped() {
         when (uiState.payment?.phase) {
             null, PaymentPhase.ERROR, PaymentPhase.FAILED -> startPayment(announceFare = true)
-            PaymentPhase.AWAITING -> confirmPayment()
+            PaymentPhase.AWAITING -> authorizeAndPay()
             PaymentPhase.PAID -> uiState.payment?.let {
                 speak(receiptSentence(it.amountRupees, it.bankRef), NarrationTier.INTERRUPT)
             }
@@ -951,6 +959,64 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                     setPayment(PaymentUi(PaymentPhase.ERROR, done.fareRupees, message = result.spoken))
                     engine.earcon(Earcon.ERROR)
                     speak("${result.spoken} Tap Pay to try again.", NarrationTier.INTERRUPT)
+                }
+            }
+        }
+    }
+
+    /**
+     * The owner confirms with fingerprint, face or screen lock, then the payment is sent.
+     *
+     * Nothing reaches the gateway until the phone's owner has confirmed. Cancelling costs
+     * nothing and says so — "nothing was charged" is the sentence a customer who cannot see
+     * the screen most needs to hear after backing out.
+     */
+    private fun authorizeAndPay() {
+        val current = uiState.payment ?: return
+        if (current.phase != PaymentPhase.AWAITING) return
+        val request = paymentAuthRequest
+        if (request == null) {
+            confirmPayment()
+            return
+        }
+
+        setPayment(current.copy(phase = PaymentPhase.PROCESSING, message = "Confirm with fingerprint or screen lock"))
+        speak("Confirm with your fingerprint or screen lock.", NarrationTier.INTERRUPT)
+
+        request(current.amountRupees) { result ->
+            when (result) {
+                BiometricGate.Result.Confirmed -> {
+                    engine.earcon(Earcon.UNDERSTOOD)
+                    setPayment(current)
+                    confirmPayment()
+                }
+
+                BiometricGate.Result.Unavailable -> {
+                    // No fingerprint, face or screen lock exists on this phone. Refusing would
+                    // strand the customer at the end of the ride, so pay — and say why.
+                    speak(
+                        "This phone has no fingerprint or screen lock, so I'll pay without one.",
+                        NarrationTier.QUEUED
+                    )
+                    setPayment(current)
+                    confirmPayment()
+                }
+
+                BiometricGate.Result.Cancelled -> {
+                    setPayment(current)
+                    speak(
+                        "Payment not confirmed. Nothing was charged. Tap Pay when you're ready.",
+                        NarrationTier.INTERRUPT
+                    )
+                }
+
+                is BiometricGate.Result.Failed -> {
+                    setPayment(current)
+                    engine.earcon(Earcon.ERROR)
+                    speak(
+                        "The fingerprint check didn't work. Nothing was charged. Tap Pay to try again.",
+                        NarrationTier.INTERRUPT
+                    )
                 }
             }
         }
@@ -1103,7 +1169,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         if (awaiting && method != null) {
             val current = uiState.payment ?: return true
             setPayment(current.copy(method = method))
-            if (wantsPay) confirmPayment() else speak("Paying by ${spokenMethod(method)}.", NarrationTier.INTERRUPT)
+            if (wantsPay) authorizeAndPay() else speak("Paying by ${spokenMethod(method)}.", NarrationTier.INTERRUPT)
             return true
         }
         if (wantsPay) {

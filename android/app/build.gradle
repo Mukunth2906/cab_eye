@@ -148,6 +148,11 @@ dependencies {
     // payment screen; nothing here scans, and nothing talks to a bank.
     implementation 'com.google.zxing:core:3.5.3'
 
+    // ---- Payment confirmation --------------------------------------------------------
+    // Android's system fingerprint / face / screen-lock prompt, shown before a payment is
+    // sent. The biometric never reaches the app; Android only reports that the owner confirmed.
+    implementation 'androidx.biometric:biometric:1.1.0'
+
     // ---- Google Maps Platform --------------------------------------------------------
     // Current native Android SDKs (September 2026): Places 5.3.0, Maps 20.0.0,
     // Play services Location 21.4.0. No Firebase or additional backend technology is added.

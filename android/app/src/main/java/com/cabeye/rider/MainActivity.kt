@@ -5,7 +5,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.view.KeyEvent
-import androidx.activity.ComponentActivity
+import androidx.fragment.app.FragmentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.LaunchedEffect
@@ -22,6 +22,7 @@ import com.cabeye.rider.driver.DriverSurface
 import com.cabeye.rider.driver.DriverViewModel
 import com.cabeye.rider.net.ApiResult
 import com.cabeye.rider.net.AppRole
+import com.cabeye.rider.security.BiometricGate
 import com.cabeye.rider.ui.DebugSettingsScreen
 import com.cabeye.rider.ui.RiderSurface
 import com.cabeye.rider.ui.theme.CabEyeTheme
@@ -44,7 +45,10 @@ import kotlinx.coroutines.launch
  * a visible button, precisely so a rider cannot reach it by accident — a blind user landing on
  * a settings screen with no idea how they got there is the worst possible navigation failure.
  */
-class MainActivity : ComponentActivity() {
+// FragmentActivity (a ComponentActivity subclass) only because Android's fingerprint prompt,
+// BiometricPrompt, requires one. setContent, the permission launchers and everything else
+// behave exactly as before.
+class MainActivity : FragmentActivity() {
 
     private var viewModel: RiderViewModel? = null
 
@@ -132,6 +136,9 @@ class MainActivity : ComponentActivity() {
                         vm.micPermissionGranted = hasMicPermission()
                         vm.contactPermissionRequest = {
                             contactsPermissionLauncher.launch(Manifest.permission.READ_CONTACTS)
+                        }
+                        vm.paymentAuthRequest = { amount, onResult ->
+                            BiometricGate.authenticate(this@MainActivity, amount, onResult)
                         }
 
                         // Permission is requested from inside rider mode only. Asking a driver
