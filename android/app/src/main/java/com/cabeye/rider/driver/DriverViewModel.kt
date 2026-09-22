@@ -14,6 +14,8 @@ import com.cabeye.rider.net.RideEvent
 import com.cabeye.rider.net.RideEventType
 import com.cabeye.rider.net.RidePhase
 import com.cabeye.rider.net.RideSnapshot
+import com.cabeye.rider.net.PaymentOrder
+import com.cabeye.rider.net.PaymentOrderStatus
 import com.cabeye.rider.telemetry.Telemetry
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -50,6 +52,7 @@ class DriverViewModel(application: Application) : AndroidViewModel(application) 
         private set
 
     private var pollJob: Job? = null
+    private var paymentJob: Job? = null
     private var bannerJob: Job? = null
 
     /** The ride this driver is currently on. */
@@ -69,6 +72,7 @@ class DriverViewModel(application: Application) : AndroidViewModel(application) 
 
     private companion object {
         const val TAG = "CabEye.Driver"
+        const val PAYMENT_POLL_MS = 3_000L
 
         /**
          * How often to poll for open requests while online.
@@ -434,14 +438,67 @@ class DriverViewModel(application: Application) : AndroidViewModel(application) 
                         ),
                         banner = ""
                     )
+                    watchPayment(id)
                 }
                 is ApiResult.Failed -> showBanner(result.spoken)
             }
         }
     }
 
+    /**
+     * Keeps the Complete screen's payment line current until the fare is settled.
+     *
+     * The PAYMENT_UPDATED event normally arrives first over the socket; this poll is the
+     * fallback for a dropped socket, so a driver is never left staring at "waiting" for a fare
+     * that was paid a minute ago.
+     */
+    private fun watchPayment(id: String) {
+        paymentJob?.cancel()
+        paymentJob = viewModelScope.launch {
+            while (true) {
+                val current = uiState.state as? DriverState.Complete ?: return@launch
+                if (current.rideId != id || current.paymentStatus == "CONFIRMED") return@launch
+                (api.paymentStatus(id) as? ApiResult.Ok<RideSnapshot>)?.value?.let { snap ->
+                    applyPayment(id, snap.paymentStatus, snap.paymentRef)
+                }
+                refreshQr(id)
+                delay(PAYMENT_POLL_MS)
+            }
+        }
+    }
+
+    /**
+     * Keeps the QR code pointing at a payable order. The server's create call is idempotent:
+     * it returns the same open order the customer's phone is using, and only makes a new one
+     * after the last one failed or expired — so the customer and the QR always pay the same
+     * order, and a stale QR is replaced by itself.
+     */
+    private suspend fun refreshQr(id: String) {
+        val order = (api.createPaymentOrder(id) as? ApiResult.Ok<PaymentOrder>)?.value ?: return
+        val current = uiState.state as? DriverState.Complete ?: return
+        if (current.rideId != id) return
+        if (order.status == PaymentOrderStatus.PAID) {
+            applyPayment(id, "CONFIRMED", order.bankRef)
+            return
+        }
+        if (current.checkoutUrl != order.checkoutUrl) {
+            uiState = uiState.copy(state = current.copy(checkoutUrl = order.checkoutUrl))
+        }
+    }
+
+    private fun applyPayment(id: String, status: String, ref: String) {
+        val current = uiState.state as? DriverState.Complete ?: return
+        if (current.rideId != id || current.paymentStatus == status) return
+        uiState = uiState.copy(state = current.copy(paymentStatus = status, paymentRef = ref))
+        when (status) {
+            "CONFIRMED" -> showBanner("Payment received: ₹${current.fareRupees}.")
+            "FAILED" -> showBanner("The rider's payment failed. They can try again.")
+        }
+    }
+
     /** Back to waiting, ready for the next request. */
     fun finishAndGoOnline() {
+        paymentJob?.cancel()
         socket.unsubscribe("ride finished")
         rideId = null
         uiState = uiState.copy(state = DriverState.Online(), banner = "")
@@ -508,6 +565,10 @@ class DriverViewModel(application: Application) : AndroidViewModel(application) 
                 finishAndGoOnline()
             }
 
+            // The fare's payment moved on the server — paid, failed, or reported by the rider.
+            RideEventType.PAYMENT_UPDATED ->
+                applyPayment(event.rideId, event.string("status"), event.string("paymentRef"))
+
             else -> Unit
         }
     }
@@ -543,6 +604,7 @@ class DriverViewModel(application: Application) : AndroidViewModel(application) 
 
     override fun onCleared() {
         pollJob?.cancel()
+        paymentJob?.cancel()
         bannerJob?.cancel()
         super.onCleared()
     }

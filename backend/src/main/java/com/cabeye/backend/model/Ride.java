@@ -35,6 +35,9 @@ public class Ride {
      */
     public static final int MAX_LOG_EVENTS = 500;
 
+    /** See {@link #paymentStatus}. */
+    public enum PaymentStatus { NONE, REPORTED, CONFIRMED, FAILED }
+
     private final String rideId;
     private final String riderId;
     private final String destination;
@@ -66,6 +69,20 @@ public class Ride {
      * than a geocoder's failure to match it, and the rider has already said it out loud once.
      */
     private final String dropNote;
+
+    /**
+     * Payment lifecycle: NONE -> REPORTED -> CONFIRMED, or FAILED.
+     *
+     * <p>REPORTED means the rider's phone relayed what its UPI app claimed. That claim arrives
+     * over an Intent from an app on the same device and is a hint, never evidence — only a
+     * payment provider's webhook can justify CONFIRMED. The two are kept distinct because a
+     * rider who cannot see the screen has no way to notice that "paid" was wrong, and would
+     * walk away from an unpaid fare believing it settled.
+     */
+    private volatile PaymentStatus paymentStatus = PaymentStatus.NONE;
+
+    /** Transaction reference the UPI app returned, for reconciliation. Never a credential. */
+    private volatile String paymentRef = "";
 
     private final String rideType;
     private final String boardingCode;
@@ -218,6 +235,8 @@ public class Ride {
             boolean codeConfirmed,
             int fareRupees,
             int durationMinutes,
+            String paymentStatus,
+            String paymentRef,
             long lastSeq,
             Instant createdAt
     ) {}
@@ -229,7 +248,9 @@ public class Ride {
                 pickupLatitude, pickupLongitude, contactName, contactPhone, dropNote, rideType, boardingCode,
                 driverId, driverName, vehicleModel, vehiclePlate, driverPhone,
                 etaMinutes, distanceMeters, bearingDeg, codeConfirmed,
-                fareRupees, durationMinutes, sequence.get(), createdAt);
+                fareRupees, durationMinutes,
+                paymentStatus.name(), paymentRef,
+                sequence.get(), createdAt);
     }
 
     // -----------------------------------------------------------------------------------
@@ -247,6 +268,10 @@ public class Ride {
     public Double pickupLongitude() { return pickupLongitude; }
     public String contactName()  { return contactName; }
     public String contactPhone() { return contactPhone; }
+    public PaymentStatus paymentStatus() { return paymentStatus; }
+    public void paymentStatus(PaymentStatus status) { this.paymentStatus = status; }
+    public String paymentRef() { return paymentRef; }
+    public void paymentRef(String ref) { this.paymentRef = ref == null ? "" : ref; }
     public String dropNote()     { return dropNote; }
     public String rideType()     { return rideType; }
     public String boardingCode() { return boardingCode; }
@@ -265,6 +290,7 @@ public class Ride {
     public void bearing(float degrees)         { this.bearingDeg = degrees; }
     public void codeConfirmed(boolean value)   { this.codeConfirmed = value; }
     public void fare(int rupees)               { this.fareRupees = rupees; }
+    public int fareRupees()                    { return fareRupees; }
     public void durationMinutes(int minutes)   { this.durationMinutes = minutes; }
 
     public void assignDriver(String id, String name, String model, String plate, String phone, int eta) {

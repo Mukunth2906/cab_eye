@@ -406,6 +406,100 @@ public class RideService {
     }
 
     /** Records an event and then broadcasts it to everyone on the ride topic. */
+    // ===================================================================================
+    //  Payment
+    // ===================================================================================
+
+    /**
+     * Records what the rider's phone said its UPI app claimed.
+     *
+     * <p>Deliberately never reaches CONFIRMED. The claim crosses an Intent boundary on the
+     * rider's own device and can be wrong, stale or forged, so the most it can justify is
+     * REPORTED. Treating it as proof would mean eventually telling a blind rider their fare is
+     * settled when it is not — and unlike a sighted rider they cannot glance at a screen and
+     * catch it.
+     *
+     * <p>A FAILURE is the exception and is trusted at once: a false failure costs one retry,
+     * whereas a false success costs an unpaid fare nobody notices.
+     */
+    public synchronized Optional<Ride> reportPayment(String rideId, String status, String txnRef) {
+        Ride ride = rides.get(rideId);
+        if (ride == null) return Optional.empty();
+
+        // A settled fare is never downgraded by a late or stale claim from the phone. Without
+        // this, a UPI app returning FAILURE after the gateway already confirmed would tell the
+        // driver an already-paid fare had failed.
+        if (ride.paymentStatus() == Ride.PaymentStatus.CONFIRMED) {
+            log.info("PAYMENT_REPORT_IGNORED ride={} already CONFIRMED", rideId);
+            return Optional.of(ride);
+        }
+
+        String claimed = status == null ? "" : status.trim().toUpperCase();
+        Ride.PaymentStatus next = switch (claimed) {
+            case "FAILURE", "FAILED" -> Ride.PaymentStatus.FAILED;
+            default -> Ride.PaymentStatus.REPORTED;
+        };
+
+        ride.paymentStatus(next);
+        ride.paymentRef(txnRef);
+        log.info("PAYMENT_REPORTED ride={} claimed=\"{}\" stored={} ref={}",
+                rideId, claimed, next, ride.paymentRef());
+        publishPayment(ride, next == Ride.PaymentStatus.FAILED ? "Your payment app reported a failure" : "");
+        return Optional.of(ride);
+    }
+
+    /**
+     * The only transition that means money actually arrived.
+     *
+     * <p>In production this is driven by the payment provider's webhook. On a plain
+     * {@code upi://} deep link there is no provider and therefore no webhook, so nothing calls
+     * this automatically — which is a limitation stated in the open rather than papered over
+     * by having the client confirm its own payment.
+     */
+    public synchronized Optional<Ride> confirmPayment(String rideId) {
+        return confirmPayment(rideId, null);
+    }
+
+    /**
+     * Marks the fare paid on the gateway's word, recording its bank reference, and tells both
+     * phones. Called by {@code MockPaymentGateway} today and by a provider webhook later.
+     *
+     * @param bankRef the settlement reference; null or blank keeps whatever was recorded
+     */
+    public synchronized Optional<Ride> confirmPayment(String rideId, String bankRef) {
+        Ride ride = rides.get(rideId);
+        if (ride == null) return Optional.empty();
+        ride.paymentStatus(Ride.PaymentStatus.CONFIRMED);
+        if (bankRef != null && !bankRef.isBlank()) ride.paymentRef(bankRef);
+        log.info("PAYMENT_CONFIRMED ride={} ref={}", rideId, ride.paymentRef());
+        publishPayment(ride, "");
+        return Optional.of(ride);
+    }
+
+    /**
+     * The gateway refused the payment. Ignored once the fare is confirmed: a failed retry
+     * after a successful payment does not un-pay the ride.
+     */
+    public synchronized Optional<Ride> failPayment(String rideId, String reason) {
+        Ride ride = rides.get(rideId);
+        if (ride == null) return Optional.empty();
+        if (ride.paymentStatus() == Ride.PaymentStatus.CONFIRMED) return Optional.of(ride);
+        ride.paymentStatus(Ride.PaymentStatus.FAILED);
+        log.info("PAYMENT_FAILED ride={} reason=\"{}\"", rideId, reason);
+        publishPayment(ride, reason);
+        return Optional.of(ride);
+    }
+
+    /** Tells everyone still on the ride topic — in practice the driver's Complete screen. */
+    private void publishPayment(Ride ride, String reason) {
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("status", ride.paymentStatus().name());
+        payload.put("paymentRef", ride.paymentRef());
+        payload.put("fareRupees", ride.fareRupees());
+        if (reason != null && !reason.isBlank()) payload.put("reason", reason);
+        publish(ride, RideEventType.PAYMENT_UPDATED, "server", "SYSTEM", payload);
+    }
+
     private RideEvent publish(Ride ride, RideEventType type, String senderId, String role,
                               Map<String, Object> payload) {
         RideEvent event = record(ride, type, senderId, role, payload);

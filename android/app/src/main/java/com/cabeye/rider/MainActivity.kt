@@ -149,6 +149,10 @@ class MainActivity : ComponentActivity() {
                             onCodeConfirmed = vm::onCodeConfirmed,
                             onSos = vm::onSos,
                             onDismissSos = vm::onDismissSos,
+                            onPaymentResult = vm::onPaymentResult,
+                            onPay = vm::onPayTapped,
+                            onPaymentMethod = vm::onPaymentMethod,
+                            onDeclinePayment = vm::onDeclinePayment,
                             onOpenSettings = { showSettings = true }
                         )
                     }

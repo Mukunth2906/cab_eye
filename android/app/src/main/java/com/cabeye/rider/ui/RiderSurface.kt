@@ -1,5 +1,9 @@
 package com.cabeye.rider.ui
 
+import androidx.activity.compose.ManagedActivityResultLauncher
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.ActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
@@ -66,6 +70,8 @@ import com.cabeye.rider.BuildConfig
 import com.cabeye.rider.state.PlaceOption
 import com.cabeye.rider.state.RiderState
 import com.cabeye.rider.state.RiderUiState
+import com.cabeye.rider.state.PaymentPhase
+import com.cabeye.rider.state.PaymentUi
 import com.cabeye.rider.places.Gazetteer
 import com.cabeye.rider.ui.theme.FocusIndicatorWidth
 import com.cabeye.rider.ui.theme.LocalPalette
@@ -128,6 +134,10 @@ fun RiderSurface(
     onCodeConfirmed: () -> Unit,
     onSos: () -> Unit,
     onDismissSos: () -> Unit,
+    onPaymentResult: (String?) -> Unit,
+    onPay: () -> Unit,
+    onPaymentMethod: (String) -> Unit,
+    onDeclinePayment: () -> Unit,
     onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -197,7 +207,10 @@ fun RiderSurface(
                 // focusable. These custom actions put those affordances back for a
                 // TalkBack user, reachable from the single merged node.
                 customActions = buildCustomActions(
-                    uiState, onCancel, onClarifyChoice, onNearMissAnswer, onSos
+                    uiState, onCancel, onClarifyChoice, onNearMissAnswer, onSos,
+                    onPay = onPay,
+                    onPaymentMethod = onPaymentMethod,
+                    onDeclinePayment = onDeclinePayment
                 )
             }
     ) {
@@ -304,26 +317,38 @@ fun RiderSurface(
                 micOpen = uiState.micOpen
             )
 
-            is RiderState.Done -> StateScaffold(
-                icon = "★",
-                word = "Complete",
-                headline = "You've\narrived",
-                support = "${ride.destination}  ·  ₹${ride.fareRupees}  ·  ${ride.durationMinutes} min",
-                accent = palette.confirm,
-                micOpen = uiState.micOpen,
-                // Payment is the one step this app deliberately does not own. Handing off to
-                // the rider's own UPI app means the PIN is entered in the app they already
-                // trust, with the accessibility setup they have already configured there —
-                // rather than this app collecting a payment credential through a screen a
-                // blind rider cannot verify.
-                primary = ButtonSpec("PROCEED TO PAYMENT", palette.confirm) {
-                    payWithUpi(
-                        context = context,
-                        amountRupees = ride.fareRupees,
-                        note = "Cab Eye ride to ${ride.destination}"
-                    )
-                }
-            )
+            is RiderState.Done -> {
+                val payment = uiState.payment
+                val paid = payment?.phase == PaymentPhase.PAID
+                StateScaffold(
+                    icon = if (paid) "✓" else "★",
+                    word = if (paid) "Paid" else "Complete",
+                    headline = "You've\narrived",
+                    support = "${ride.destination}  ·  ₹${ride.fareRupees}  ·  ${ride.durationMinutes} min",
+                    accent = palette.confirm,
+                    micOpen = uiState.micOpen,
+                    extraContent = payment?.let { p ->
+                        @Composable { PaymentPanel(p, onPaymentMethod) }
+                    },
+                    // Payment happens inside this app: no browser, no other app. The server's
+                    // sandbox gateway decides the outcome. The QR code for a sighted companion
+                    // is on the driver's screen, not here.
+                    primary = when (payment?.phase) {
+                        null, PaymentPhase.ERROR ->
+                            ButtonSpec("PAY ₹${ride.fareRupees}", palette.confirm, onPay)
+                        PaymentPhase.AWAITING ->
+                            ButtonSpec("PAY ₹${payment?.amountRupees ?: ride.fareRupees}", palette.confirm, onPay)
+                        PaymentPhase.STARTING, PaymentPhase.PROCESSING -> null
+                        PaymentPhase.FAILED ->
+                            ButtonSpec("TRY AGAIN", palette.confirm, onPay)
+                        PaymentPhase.PAID ->
+                            ButtonSpec("HEAR RECEIPT", palette.onBackground, onPay)
+                    },
+                    secondary = if (payment?.phase == PaymentPhase.AWAITING) {
+                        ButtonSpec("DECLINE", palette.danger, onDeclinePayment)
+                    } else null
+                )
+            }
         }
 
         // Connection state, and the hidden way into settings.
@@ -826,52 +851,126 @@ private fun SosButton(onSos: () -> Unit, modifier: Modifier = Modifier) {
 // =====================================================================================
 
 /**
- * Opens the rider's UPI app to settle the fare.
+ * The payment panel on the Done screen: amount, how to pay, status, receipt.
  *
- * A `upi://pay` deep link rather than a payment SDK. Nothing to integrate, nothing billed,
- * no card or PIN ever touches this app — the rider authorises in the app they already have
- * set up, which for a blind rider means the accessibility configuration they have already
- * done there carries over. That is the whole reason to hand off rather than embed.
- *
- * Navi is tried by package first because it is the app this deployment targets. If it is not
- * installed the same URI goes to the system chooser, so any UPI app still works — a hard
- * requirement, since a rider cannot be stranded at the end of a ride because one particular
- * app is missing.
+ * Entirely in-app. Every phase has its own words, so colour is never the only signal, and
+ * everything shown here is also spoken by the view model.
  */
-private fun payWithUpi(context: Context, amountRupees: Int, note: String) {
-    val uri = Uri.parse(
-        "upi://pay" +
-            "?pa=$PAYEE_VPA" +
-            "&pn=${Uri.encode(PAYEE_NAME)}" +
-            "&am=$amountRupees" +
-            "&cu=INR" +
-            "&tn=${Uri.encode(note)}"
-    )
+@Composable
+private fun PaymentPanel(payment: PaymentUi, onPaymentMethod: (String) -> Unit) {
+    val palette = LocalPalette.current
 
-    val toNavi = Intent(Intent.ACTION_VIEW, uri).setPackage(NAVI_PACKAGE)
-    val toAnyUpiApp = Intent.createChooser(Intent(Intent.ACTION_VIEW, uri), "Pay with")
+    Spacer(Modifier.height(16.dp))
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(2.dp, palette.muted, RoundedCornerShape(20.dp))
+            .padding(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            text = when (payment.phase) {
+                PaymentPhase.PAID -> "✓ PAID  ₹${payment.amountRupees}"
+                PaymentPhase.FAILED -> "✕ NOT PAID"
+                PaymentPhase.ERROR -> "PAYMENT UNAVAILABLE"
+                PaymentPhase.STARTING -> "PREPARING…"
+                PaymentPhase.PROCESSING -> "PROCESSING…"
+                PaymentPhase.AWAITING -> "₹${payment.amountRupees}"
+            },
+            style = MaterialTheme.typography.headlineMedium,
+            color = when (payment.phase) {
+                PaymentPhase.PAID -> palette.confirm
+                PaymentPhase.FAILED, PaymentPhase.ERROR -> palette.danger
+                else -> palette.onBackground
+            },
+            textAlign = TextAlign.Center
+        )
 
-    for (intent in listOf(toNavi, toAnyUpiApp)) {
-        try {
-            context.startActivity(intent)
-            return
-        } catch (_: ActivityNotFoundException) {
-            // Navi absent — fall through to whatever UPI app the rider does have.
+        if (payment.phase == PaymentPhase.AWAITING) {
+            Spacer(Modifier.height(12.dp))
+            Text(
+                text = "Pay by",
+                style = MaterialTheme.typography.bodyLarge,
+                color = palette.muted
+            )
+            Spacer(Modifier.height(8.dp))
+            Row(Modifier.fillMaxWidth()) {
+                PAYMENT_METHODS.forEachIndexed { index, (code, label) ->
+                    if (index > 0) Spacer(Modifier.width(8.dp))
+                    MethodChip(
+                        label = label,
+                        selected = payment.method == code,
+                        modifier = Modifier.weight(1f),
+                        onClick = { onPaymentMethod(code) }
+                    )
+                }
+            }
+        }
+
+        if (payment.message.isNotBlank()) {
+            Spacer(Modifier.height(10.dp))
+            Text(
+                text = payment.message,
+                style = MaterialTheme.typography.bodyLarge,
+                color = palette.muted,
+                textAlign = TextAlign.Center
+            )
+        }
+
+        if (payment.phase == PaymentPhase.PAID && payment.bankRef.isNotBlank()) {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = "Ref ${payment.bankRef.chunked(4).joinToString(" ")}" +
+                    if (payment.method.isNotBlank()) "  ·  ${payment.method}" else "",
+                style = MaterialTheme.typography.bodyLarge,
+                color = palette.onBackground,
+                textAlign = TextAlign.Center
+            )
+        }
+
+        if (payment.phase == PaymentPhase.AWAITING || payment.phase == PaymentPhase.PROCESSING) {
+            Spacer(Modifier.height(6.dp))
+            Text(
+                text = "TEST MODE · no real money",
+                style = MaterialTheme.typography.labelLarge,
+                color = palette.muted,
+                textAlign = TextAlign.Center
+            )
         }
     }
-    Log.w(PAY_TAG, "PAYMENT no UPI app available for ₹$amountRupees")
 }
 
-/** Navi's Android application id. Verify with `adb shell pm list packages | findstr navi`. */
-private const val NAVI_PACKAGE = "com.naviapp"
+/** One payment-method choice. The selected one says so in words ("✓ UPI"), not only colour. */
+@Composable
+private fun MethodChip(label: String, selected: Boolean, modifier: Modifier, onClick: () -> Unit) {
+    val palette = LocalPalette.current
+    val accent = if (selected) palette.confirm else palette.muted
+    Button(
+        onClick = onClick,
+        shape = RoundedCornerShape(16.dp),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = palette.background,
+            contentColor = accent
+        ),
+        modifier = modifier
+            .defaultMinSize(minHeight = MinTouchTarget)
+            .border(if (selected) 3.dp else 1.dp, accent, RoundedCornerShape(16.dp))
+    ) {
+        Text(
+            text = if (selected) "✓ $label" else label,
+            style = MaterialTheme.typography.bodyLarge,
+            textAlign = TextAlign.Center
+        )
+    }
+}
 
-/**
- * Placeholder payee. MUST be replaced with the real collecting VPA before any live use —
- * as written the link opens the UPI app with an address that will not resolve.
- */
-private const val PAYEE_VPA = "cabeye@naviaxis"
-private const val PAYEE_NAME = "Cab Eye"
-private const val PAY_TAG = "CabEye.Payment"
+/** Code the gateway records, and the label shown. */
+private val PAYMENT_METHODS = listOf(
+    "UPI" to "UPI",
+    "CARD" to "Card",
+    "NETBANKING" to "Net banking"
+)
+
 
 /** How much of the surface the headline block occupies. The brief's floor is 60%. */
 private const val PRIMARY_TARGET_FRACTION = 0.60f
@@ -1018,8 +1117,19 @@ private fun announcementFor(uiState: RiderUiState): String {
         is RiderState.InTrip ->
             "On the way to ${ride.destination}, ${ride.etaMinutes} minutes."
 
-        is RiderState.Done ->
-            "You have arrived at ${ride.destination}. Fare ${ride.fareRupees} rupees."
+        is RiderState.Done -> when (uiState.payment?.phase) {
+            PaymentPhase.PAID ->
+                "Paid ${uiState.payment?.amountRupees ?: ride.fareRupees} rupees. Action: hear receipt."
+            PaymentPhase.AWAITING ->
+                "Pay ${uiState.payment?.amountRupees ?: ride.fareRupees} rupees by " +
+                    "${uiState.payment?.method.orEmpty()}. Actions: pay, change method, or decline."
+            PaymentPhase.PROCESSING ->
+                "Processing payment."
+            PaymentPhase.FAILED ->
+                "Payment not completed. ${uiState.payment?.message.orEmpty()}. Action: try again."
+            else ->
+                "You have arrived at ${ride.destination}. Fare ${ride.fareRupees} rupees. Action: pay."
+        }
     }
 }
 
@@ -1056,7 +1166,10 @@ private fun buildCustomActions(
     onCancel: () -> Unit,
     onClarifyChoice: (PlaceOption) -> Unit,
     onNearMissAnswer: (Boolean) -> Unit,
-    onSos: () -> Unit
+    onSos: () -> Unit,
+    onPay: () -> Unit = {},
+    onPaymentMethod: (String) -> Unit = {},
+    onDeclinePayment: () -> Unit = {}
 ): List<CustomAccessibilityAction> {
     val actions = mutableListOf<CustomAccessibilityAction>()
 
@@ -1081,6 +1194,29 @@ private fun buildCustomActions(
         }
         is RiderState.Assigned, is RiderState.Approaching -> {
             actions += CustomAccessibilityAction("Cancel ride") { onCancel(); true }
+        }
+        is RiderState.Done -> {
+            val payment = uiState.payment
+            when (payment?.phase) {
+                PaymentPhase.AWAITING -> {
+                    actions += CustomAccessibilityAction("Pay ${payment?.amountRupees ?: ride.fareRupees} rupees") {
+                        onPay(); true
+                    }
+                    actions += CustomAccessibilityAction("Pay by UPI") { onPaymentMethod("UPI"); true }
+                    actions += CustomAccessibilityAction("Pay by card") { onPaymentMethod("CARD"); true }
+                    actions += CustomAccessibilityAction("Pay by net banking") {
+                        onPaymentMethod("NETBANKING"); true
+                    }
+                    actions += CustomAccessibilityAction("Decline payment") { onDeclinePayment(); true }
+                }
+                PaymentPhase.PAID ->
+                    actions += CustomAccessibilityAction("Hear receipt") { onPay(); true }
+                PaymentPhase.STARTING, PaymentPhase.PROCESSING -> Unit
+                PaymentPhase.FAILED ->
+                    actions += CustomAccessibilityAction("Try payment again") { onPay(); true }
+                null, PaymentPhase.ERROR ->
+                    actions += CustomAccessibilityAction("Pay ${ride.fareRupees} rupees") { onPay(); true }
+            }
         }
         else -> Unit
     }

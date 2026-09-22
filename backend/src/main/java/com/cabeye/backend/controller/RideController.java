@@ -129,6 +129,47 @@ public class RideController {
     }
 
     // ===================================================================================
+    //  Payment
+    // ===================================================================================
+
+    /**
+     * The rider's app relaying what its UPI app claimed.
+     *
+     * <p>Stored as REPORTED, never CONFIRMED — see {@link RideService#reportPayment}.
+     */
+    @PostMapping("/{rideId}/payment")
+    public ResponseEntity<Ride.Snapshot> reportPayment(
+            @PathVariable String rideId,
+            @RequestBody(required = false) Map<String, Object> body) {
+
+        Map<String, Object> b = body == null ? Map.of() : body;
+        return respond(rides.reportPayment(
+                rideId,
+                str(b.get("status"), "SUBMITTED"),
+                str(b.get("txnRef"), "")));
+    }
+
+    /** Polled by the rider's app until the payment status settles, so it can speak the result. */
+    @GetMapping("/{rideId}/payment")
+    public ResponseEntity<Ride.Snapshot> paymentStatus(@PathVariable String rideId) {
+        return rides.find(rideId)
+                .map(ride -> ResponseEntity.ok(ride.snapshot()))
+                .orElseGet(() -> ResponseEntity.notFound().build());
+    }
+
+    /**
+     * Stands in for the payment provider webhook that does not exist on the deep-link path.
+     *
+     * <p>Kept as an explicit endpoint so the CONFIRMED transition is demonstrable and so it is
+     * obvious in the code that nothing produces it automatically. A real integration replaces
+     * this with a signed webhook from the provider.
+     */
+    @PostMapping("/{rideId}/payment/confirm")
+    public ResponseEntity<Ride.Snapshot> confirmPayment(@PathVariable String rideId) {
+        return respond(rides.confirmPayment(rideId));
+    }
+
+    // ===================================================================================
     //  Driver
     // ===================================================================================
 

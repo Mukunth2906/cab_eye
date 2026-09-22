@@ -158,6 +158,88 @@ class RideApi(private val settings: AppSettings) {
         }
     }
 
+    /**
+     * Relays what the rider's UPI app claimed. The server records it as a claim, not as proof.
+     */
+    suspend fun reportPayment(
+        rideId: String,
+        status: String,
+        txnRef: String
+    ): ApiResult<RideSnapshot> =
+        postForSnapshot(
+            "${base()}/rides/$rideId/payment",
+            JSONObject().put("status", status).put("txnRef", txnRef)
+        )
+
+    /** Polled until the payment status settles, so the rider can be told the real outcome. */
+    suspend fun paymentStatus(rideId: String): ApiResult<RideSnapshot> {
+        val request = Request.Builder().url("${base()}/rides/$rideId/payment").get().build()
+        return when (val result = call(request)) {
+            is ApiResult.Ok -> RideSnapshot.parse(result.value)
+                ?.let { ApiResult.Ok(it) }
+                ?: ApiResult.Failed("The server sent something I couldn't read.", result.value.take(200))
+            is ApiResult.Failed -> result
+        }
+    }
+
+    // ===================================================================================
+    //  Payment gateway (sandbox)
+    // ===================================================================================
+
+    /**
+     * Creates — or returns the still-open — payment order for a finished ride's fare.
+     * Idempotent on the server, so a double tap cannot create two orders.
+     */
+    suspend fun createPaymentOrder(rideId: String): ApiResult<PaymentOrder> {
+        val request = Request.Builder()
+            .url("${base()}/rides/$rideId/payment/order")
+            .post("{}".toRequestBody(JSON))
+            .build()
+        return orderResult(call(request))
+    }
+
+    /** Polled while the rider is paying. Only the gateway can move an order to PAID. */
+    suspend fun paymentOrder(orderId: String): ApiResult<PaymentOrder> {
+        val request = Request.Builder().url("${base()}/payments/$orderId").get().build()
+        return orderResult(call(request))
+    }
+
+    /**
+     * Pays (or declines) an order through the sandbox gateway, from inside the app.
+     * The server decides and returns the final order — PAID with a bank reference, or FAILED.
+     */
+    suspend fun simulatePayment(
+        orderId: String,
+        success: Boolean,
+        method: String,
+        reason: String = ""
+    ): ApiResult<PaymentOrder> {
+        val body = JSONObject()
+            .put("outcome", if (success) "SUCCESS" else "FAILURE")
+            .put("method", method.ifBlank { "UPI" })
+        if (reason.isNotBlank()) body.put("reason", reason)
+        val request = Request.Builder()
+            .url("${base()}/payments/$orderId/simulate")
+            .post(body.toString().toRequestBody(JSON))
+            .build()
+        return orderResult(call(request))
+    }
+
+    /**
+     * Maps a gateway reply. On a refusal the server sends `{"error": "..."}` already phrased
+     * to be spoken ("This ride is already paid."), which is far more useful to the rider than
+     * the generic sentence for the status code, so it is preferred when present.
+     */
+    private fun orderResult(result: ApiResult<String>): ApiResult<PaymentOrder> = when (result) {
+        is ApiResult.Ok -> PaymentOrder.parse(result.value)
+            ?.let { ApiResult.Ok(it) }
+            ?: ApiResult.Failed("The server sent something I couldn't read.", result.value.take(200))
+        is ApiResult.Failed -> {
+            val serverSaid = PaymentOrder.errorMessage(result.detail.substringAfter(": ", ""))
+            if (serverSaid != null) ApiResult.Failed(serverSaid, result.detail) else result
+        }
+    }
+
     /** Reports whether the code the rider heard the driver say matched the expected one. */
     suspend fun confirmCode(rideId: String, matched: Boolean): ApiResult<RideSnapshot> =
         postForSnapshot("${base()}/rides/$rideId/code", JSONObject().put("matched", matched))

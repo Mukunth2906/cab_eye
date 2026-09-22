@@ -220,7 +220,53 @@ data class RiderUiState(
     val micOpen: Boolean = false,
     val activeCityName: String = "",
     /** The real destination selected by Places, kept separately so the map can render it. */
-    val selectedDestination: PlaceOption? = null
+    val selectedDestination: PlaceOption? = null,
+    /**
+     * The fare payment in progress on the Done screen, or null before the rider taps Pay.
+     * Orthogonal to [ride] for the same reason [sosActive] is: paying does not change where
+     * the ride is, and a Done ride must stay Done whatever happens to the payment.
+     */
+    val payment: PaymentUi? = null
+)
+
+/**
+ * Where the fare payment stands, as the rider's screen shows it.
+ *
+ * Every phase has a sentence, because each one is announced: a payment that goes quiet is,
+ * to a rider who cannot see the screen, indistinguishable from an app that has crashed.
+ */
+enum class PaymentPhase {
+    /** Asking the server for an order. */
+    STARTING,
+    /** Order open: amount and method on screen, waiting for the customer to confirm. */
+    AWAITING,
+    /** Confirm (or decline) sent to the gateway; waiting for its answer. */
+    PROCESSING,
+    /** The gateway confirmed it. The only phase that may be spoken as "paid". */
+    PAID,
+    /** Declined, or the order expired. Retry makes a fresh order. */
+    FAILED,
+    /** The order could not even be created (server unreachable, ride already paid, ...). */
+    ERROR
+}
+
+/**
+ * @param method UPI, CARD or NETBANKING — while AWAITING, the one the customer has chosen;
+ *   once PAID, the one the gateway recorded
+ * @param checkoutUrl unused by the customer screen (the QR lives on the driver's screen)
+ * @param upiUri unused by the customer screen
+ * @param bankRef shown on the receipt once [phase] is [PaymentPhase.PAID]
+ * @param message the line shown under the amount; the same words that were spoken
+ */
+data class PaymentUi(
+    val phase: PaymentPhase,
+    val amountRupees: Int,
+    val orderId: String = "",
+    val checkoutUrl: String = "",
+    val upiUri: String = "",
+    val method: String = "",
+    val bankRef: String = "",
+    val message: String = ""
 )
 
 /**

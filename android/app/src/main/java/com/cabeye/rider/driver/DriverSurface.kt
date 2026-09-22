@@ -39,6 +39,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.cabeye.rider.ui.QrCode
 import com.cabeye.rider.ui.theme.LocalPalette
 import com.cabeye.rider.ui.theme.MinTouchTarget
 
@@ -685,7 +686,52 @@ private fun CompleteScreen(state: DriverState.Complete, onFinish: () -> Unit) {
         style = MaterialTheme.typography.bodyLarge,
         color = palette.muted
     )
-    Spacer(Modifier.height(40.dp))
+    Spacer(Modifier.height(24.dp))
+
+    // Live payment line. Words carry the meaning, colour only reinforces it.
+    val (paymentText, paymentColor) = when (state.paymentStatus) {
+        "CONFIRMED" -> "✓ PAYMENT RECEIVED  ₹${state.fareRupees}" to palette.confirm
+        "REPORTED" -> "Rider says paid — waiting for confirmation…" to palette.onBackground
+        "FAILED" -> "✕ Payment failed — rider can retry" to palette.danger
+        else -> "Waiting for the rider to pay…" to palette.muted
+    }
+    Text(
+        paymentText,
+        style = MaterialTheme.typography.titleLarge,
+        color = paymentColor,
+        textAlign = TextAlign.Center
+    )
+    // QR for a sighted companion: they scan it with their own phone camera, which opens the
+    // sandbox checkout on THEIR phone. The blind customer pays inside their own app instead.
+    if (state.paymentStatus != "CONFIRMED" && state.checkoutUrl.isNotBlank()) {
+        Spacer(Modifier.height(16.dp))
+        Text(
+            "Or scan to pay ₹${state.fareRupees}",
+            style = MaterialTheme.typography.bodyLarge,
+            color = palette.onBackground
+        )
+        Spacer(Modifier.height(8.dp))
+        QrCode(
+            content = state.checkoutUrl,
+            size = 200.dp,
+            description = "QR code to pay ${state.fareRupees} rupees"
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "TEST MODE · no real money",
+            style = MaterialTheme.typography.labelLarge,
+            color = palette.muted
+        )
+    }
+    if (state.paymentStatus == "CONFIRMED" && state.paymentRef.isNotBlank()) {
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "Ref ${state.paymentRef.chunked(4).joinToString(" ")}",
+            style = MaterialTheme.typography.bodyLarge,
+            color = palette.muted
+        )
+    }
+    Spacer(Modifier.height(32.dp))
     DriverButton("BACK ONLINE", palette.listening, onClick = onFinish)
 }
 

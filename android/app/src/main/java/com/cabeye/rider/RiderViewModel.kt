@@ -24,6 +24,10 @@ import com.cabeye.rider.net.RideEvent
 import com.cabeye.rider.net.RideEventType
 import com.cabeye.rider.net.RidePhase
 import com.cabeye.rider.net.RideSnapshot
+import com.cabeye.rider.net.PaymentOrder
+import com.cabeye.rider.net.PaymentOrderStatus
+import com.cabeye.rider.net.UpiResponse
+import com.cabeye.rider.net.lastFourSpoken
 import com.cabeye.rider.places.City
 import com.cabeye.rider.places.ContactLookup
 import com.cabeye.rider.places.ContactMatch
@@ -37,6 +41,8 @@ import com.cabeye.rider.state.PlaceOption
 import com.cabeye.rider.state.RideType
 import com.cabeye.rider.state.RiderState
 import com.cabeye.rider.state.RiderUiState
+import com.cabeye.rider.state.PaymentPhase
+import com.cabeye.rider.state.PaymentUi
 import com.cabeye.rider.state.ThemeChoice
 import com.cabeye.rider.telemetry.Telemetry
 import kotlinx.coroutines.Dispatchers
@@ -164,6 +170,20 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
 
     /** The bounded "I didn't hear the code" listen. Cancelled the moment the code is settled. */
     private var codeListenJob: Job? = null
+
+    /**
+     * The ride just finished, kept after [endRide] clears [activeRideId].
+     *
+     * Payment happens on the Done screen, which is *after* the ride has ended — so without
+     * holding the id here there would be nothing to report the payment against.
+     */
+    private var lastCompletedRideId: String? = null
+
+    /** The in-flight "has it settled yet?" poll. */
+    private var paymentPollJob: Job? = null
+
+    /** The Done screen a press started from, so "pay" can return to it. See [handleTranscript]. */
+    private var doneBeforeListening: RiderState.Done? = null
 
     // ---------------------------------------------------------------------------------
     //  Meeting-contact ladder
@@ -316,6 +336,24 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
 
         /** A landmark further than this from the road is a different place with a similar name. */
         const val LANDMARK_MAX_KM = 3.0
+
+        /** How often to ask the server whether the payment has actually settled. */
+        const val PAYMENT_POLL_INTERVAL_MS = 2_000L
+
+        /**
+         * How long to keep watching an open order: the gateway's own ten-minute window plus a
+         * margin. A screen-reader user working through a checkout page is not fast, and giving
+         * up before the order itself expires would announce "unknown" for a payment that is
+         * still perfectly able to succeed.
+         */
+        const val PAYMENT_WATCH_TIMEOUT_MS = 11 * 60_000L
+
+        /** "pay", "payment", "paid", "receipt" as whole words — never "Paytm" or "Payyanur". */
+        val PAYMENT_WORDS = Regex("\\b(pay|payment|paid|receipt)\\b")
+        val DECLINE_WORDS = Regex("\\b(decline|don'?t pay|do not pay|cancel payment|not now)\\b")
+        val CARD_WORDS = Regex("\\b(card|debit|credit)\\b")
+        val NETBANKING_WORDS = Regex("\\b(net ?banking|bank)\\b")
+        val UPI_WORDS = Regex("\\b(upi|u p i)\\b")
     }
 
     init {
@@ -601,6 +639,9 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                 narrate(event, "You've arrived. $fare rupees.")
                 lastSpokenPhase = RidePhase.COMPLETED
                 endRide("completed")
+                // Open the payment panel straight away: the customer should not have to find
+                // a payment screen. The fare was just spoken, so it is not repeated.
+                if (fare > 0) startPayment(announceFare = false)
             }
 
             RideEventType.RIDE_CANCELLED -> {
@@ -623,6 +664,8 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             RideEventType.REQUEST_TAKEN,
             RideEventType.PONG,
             RideEventType.ERROR,
+            // The rider learns the payment outcome from the order it is watching.
+            RideEventType.PAYMENT_UPDATED,
             RideEventType.UNKNOWN -> Unit
         }
     }
@@ -796,6 +839,334 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    // =================================================================================
+    //  Payment — in-app, sandbox gateway, end to end
+    // =================================================================================
+    //
+    //  Ride completes  →  the app opens the payment panel by itself: amount + "Pay by UPI"
+    //  →  customer taps PAY (or says "pay"; "card" / "net banking" changes the method;
+    //     "decline" declines) — all inside this app, no browser, no other app
+    //  →  the server's gateway decides the outcome and returns a 12-digit bank reference
+    //  →  one spoken ending: paid (with receipt), failed (try again), or unknown.
+    //
+    //  A sighted companion can also pay by scanning the QR code on the DRIVER's screen; this
+    //  app is watching the same order and announces that payment too.
+    //
+    //  Nothing on this phone can mark a payment as paid. The gateway on the server does.
+
+    /**
+     * The customer tapped the payment button, or said "pay".
+     *
+     * One button, meaning the obvious next thing: start a payment, confirm it, retry it, or —
+     * once paid — read the receipt back.
+     */
+    fun onPayTapped() {
+        when (uiState.payment?.phase) {
+            null, PaymentPhase.ERROR, PaymentPhase.FAILED -> startPayment(announceFare = true)
+            PaymentPhase.AWAITING -> confirmPayment()
+            PaymentPhase.PAID -> uiState.payment?.let {
+                speak(receiptSentence(it.amountRupees, it.bankRef), NarrationTier.INTERRUPT)
+            }
+            PaymentPhase.STARTING, PaymentPhase.PROCESSING -> Unit
+        }
+    }
+
+    /** UPI, CARD or NETBANKING, chosen by tap or by voice. */
+    fun onPaymentMethod(method: String) {
+        val current = uiState.payment ?: return
+        if (current.phase != PaymentPhase.AWAITING) return
+        setPayment(current.copy(method = method))
+        speak("Paying by ${spokenMethod(method)}.", NarrationTier.INTERRUPT)
+    }
+
+    /** The customer chose not to pay now. The gateway records a declined payment. */
+    fun onDeclinePayment() {
+        val current = uiState.payment ?: return
+        if (current.phase != PaymentPhase.AWAITING) return
+        setPayment(current.copy(phase = PaymentPhase.PROCESSING, message = "Declining…"))
+        viewModelScope.launch {
+            when (val result = api.simulatePayment(current.orderId, success = false,
+                method = current.method, reason = "You declined the payment")) {
+                is ApiResult.Ok -> onOrderFailed(result.value.amountRupees, result.value.failureReason)
+                is ApiResult.Failed -> {
+                    setPayment(current)
+                    speak(result.spoken, NarrationTier.INTERRUPT)
+                }
+            }
+        }
+    }
+
+    /**
+     * Gets (or reuses) the order for this ride's fare and shows the confirm panel.
+     *
+     * Called automatically when the ride completes, so a blind customer is never left to find
+     * a payment screen on their own — and by TRY AGAIN after a failure.
+     */
+    private fun startPayment(announceFare: Boolean) {
+        val done = uiState.ride as? RiderState.Done
+        val rideId = activeRideId ?: lastCompletedRideId
+        if (done == null || rideId == null) {
+            speak("There's no finished ride to pay for.", NarrationTier.QUEUED)
+            return
+        }
+
+        paymentPollJob?.cancel()
+        setPayment(PaymentUi(PaymentPhase.STARTING, done.fareRupees, message = "Preparing payment…"))
+
+        viewModelScope.launch {
+            when (val result = api.createPaymentOrder(rideId)) {
+                is ApiResult.Ok -> {
+                    val order = result.value
+                    if (order.status == PaymentOrderStatus.PAID) {
+                        onOrderPaid(order.amountRupees, order.bankRef, order.method)
+                        return@launch
+                    }
+                    setPayment(
+                        PaymentUi(
+                            phase = PaymentPhase.AWAITING,
+                            amountRupees = order.amountRupees,
+                            orderId = order.orderId,
+                            method = "UPI",
+                            message = "Tap Pay or say \"pay\""
+                        )
+                    )
+                    val fare = if (announceFare) "Your fare is ${order.amountRupees} rupees. " else ""
+                    speak(
+                        "${fare}Paying by UPI. Tap Pay, or say pay, to confirm.",
+                        NarrationTier.QUEUED
+                    )
+                    // Watches for payment by any route — including a companion scanning the
+                    // QR code on the driver's screen.
+                    watchOrder(order.orderId)
+                }
+
+                is ApiResult.Failed -> {
+                    // "Already paid" arrives as a refusal. Check first, so a customer who paid
+                    // is told so rather than told something went wrong.
+                    val snapshot = (api.paymentStatus(rideId) as? ApiResult.Ok<RideSnapshot>)?.value
+                    if (snapshot?.paymentStatus == "CONFIRMED") {
+                        onOrderPaid(snapshot.fareRupees, snapshot.paymentRef, "")
+                        return@launch
+                    }
+                    setPayment(PaymentUi(PaymentPhase.ERROR, done.fareRupees, message = result.spoken))
+                    engine.earcon(Earcon.ERROR)
+                    speak("${result.spoken} Tap Pay to try again.", NarrationTier.INTERRUPT)
+                }
+            }
+        }
+    }
+
+    /** Sends the payment to the gateway and speaks what the gateway decided. */
+    private fun confirmPayment() {
+        val current = uiState.payment ?: return
+        setPayment(current.copy(phase = PaymentPhase.PROCESSING, message = "Processing payment…"))
+        speak("Processing.", NarrationTier.INTERRUPT)
+
+        viewModelScope.launch {
+            when (val result = api.simulatePayment(current.orderId, success = true, method = current.method)) {
+                is ApiResult.Ok -> {
+                    val order = result.value
+                    when (order.status) {
+                        PaymentOrderStatus.PAID -> onOrderPaid(order.amountRupees, order.bankRef, order.method)
+                        PaymentOrderStatus.FAILED, PaymentOrderStatus.EXPIRED ->
+                            onOrderFailed(order.amountRupees, order.failureReason)
+                        else -> Unit // the watcher will settle it
+                    }
+                }
+
+                is ApiResult.Failed -> {
+                    // The order may have been paid or expired meanwhile; the server's refusal
+                    // says which. Otherwise put the confirm panel back.
+                    val order = (api.paymentOrder(current.orderId) as? ApiResult.Ok<PaymentOrder>)?.value
+                    when (order?.status) {
+                        PaymentOrderStatus.PAID -> onOrderPaid(order.amountRupees, order.bankRef, order.method)
+                        PaymentOrderStatus.FAILED, PaymentOrderStatus.EXPIRED ->
+                            onOrderFailed(order.amountRupees, order.failureReason)
+                        else -> {
+                            setPayment(current)
+                            engine.earcon(Earcon.ERROR)
+                            speak("${result.spoken} Nothing was charged. Tap Pay to try again.",
+                                NarrationTier.INTERRUPT)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Watches one order until it is final. Silent while waiting, and ends in exactly one
+     * sentence. Also how a payment made from the driver's QR code reaches this customer.
+     */
+    private fun watchOrder(orderId: String) {
+        paymentPollJob?.cancel()
+        paymentPollJob = viewModelScope.launch {
+            val deadline = System.currentTimeMillis() + PAYMENT_WATCH_TIMEOUT_MS
+
+            while (System.currentTimeMillis() < deadline) {
+                delay(PAYMENT_POLL_INTERVAL_MS)
+                val order = (api.paymentOrder(orderId) as? ApiResult.Ok<PaymentOrder>)?.value ?: continue
+
+                when (order.status) {
+                    PaymentOrderStatus.PAID -> {
+                        onOrderPaid(order.amountRupees, order.bankRef, order.method)
+                        return@launch
+                    }
+                    PaymentOrderStatus.FAILED, PaymentOrderStatus.EXPIRED -> {
+                        onOrderFailed(order.amountRupees, order.failureReason)
+                        return@launch
+                    }
+                    else -> Unit
+                }
+            }
+
+            if (uiState.payment?.phase == PaymentPhase.AWAITING) {
+                speak("The payment is still waiting. Tap Pay when you're ready.", NarrationTier.QUEUED)
+            }
+        }
+    }
+
+    private fun onOrderPaid(amountRupees: Int, bankRef: String, method: String) {
+        // Both the confirm call and the watcher can see PAID; say it once.
+        if (uiState.payment?.phase == PaymentPhase.PAID) return
+        paymentPollJob?.cancel()
+        setPayment(
+            PaymentUi(
+                phase = PaymentPhase.PAID,
+                amountRupees = amountRupees,
+                method = method,
+                bankRef = bankRef,
+                message = "Payment received"
+            )
+        )
+        engine.earcon(Earcon.UNDERSTOOD)
+        speak(receiptSentence(amountRupees, bankRef), NarrationTier.INTERRUPT)
+    }
+
+    private fun onOrderFailed(amountRupees: Int, failureReason: String) {
+        if (uiState.payment?.phase == PaymentPhase.FAILED) return
+        paymentPollJob?.cancel()
+        val reason = failureReason.ifBlank { "The payment was declined" }
+        setPayment(PaymentUi(PaymentPhase.FAILED, amountRupees, message = reason))
+        engine.earcon(Earcon.ERROR)
+        speak(
+            "That payment didn't go through. ${reason.trimEnd('.')}. No money was taken. " +
+                "Tap Try again, or say pay.",
+            NarrationTier.INTERRUPT
+        )
+    }
+
+    private fun receiptSentence(amountRupees: Int, bankRef: String): String =
+        if (bankRef.length >= 4) {
+            "Payment of $amountRupees rupees received. Reference ending ${bankRef.lastFourSpoken()}. Thank you."
+        } else {
+            "Payment of $amountRupees rupees received. Thank you."
+        }
+
+    private fun spokenMethod(method: String): String = when (method) {
+        "CARD" -> "card"
+        "NETBANKING" -> "net banking"
+        else -> "UPI"
+    }
+
+    private fun setPayment(payment: PaymentUi?) {
+        uiState = uiState.copy(payment = payment)
+    }
+
+    private fun isPaymentSpeech(text: String): Boolean {
+        val t = text.lowercase()
+        return listOf(PAYMENT_WORDS, DECLINE_WORDS, CARD_WORDS, NETBANKING_WORDS, UPI_WORDS)
+            .any { it.containsMatchIn(t) }
+    }
+
+    /**
+     * Voice on the Done screen. Returns true when the words were about payment and were
+     * handled, so they are never parsed as a new destination.
+     */
+    private fun handlePaymentSpeech(text: String): Boolean {
+        val t = text.lowercase()
+        val awaiting = uiState.payment?.phase == PaymentPhase.AWAITING
+
+        if (awaiting && DECLINE_WORDS.containsMatchIn(t)) {
+            onDeclinePayment()
+            return true
+        }
+
+        val method = when {
+            CARD_WORDS.containsMatchIn(t) -> "CARD"
+            NETBANKING_WORDS.containsMatchIn(t) -> "NETBANKING"
+            UPI_WORDS.containsMatchIn(t) -> "UPI"
+            else -> null
+        }
+        val wantsPay = PAYMENT_WORDS.containsMatchIn(t)
+
+        if (awaiting && method != null) {
+            val current = uiState.payment ?: return true
+            setPayment(current.copy(method = method))
+            if (wantsPay) confirmPayment() else speak("Paying by ${spokenMethod(method)}.", NarrationTier.INTERRUPT)
+            return true
+        }
+        if (wantsPay) {
+            onPayTapped()
+            return true
+        }
+        return false
+    }
+
+    /**
+     * The rider's UPI app came back (the "UPI APP" button).
+     *
+     * What a UPI app returns is a claim from another app on this phone, so it is relayed to the
+     * server as REPORTED and never spoken as "paid". The order watcher — already running —
+     * speaks the real outcome when the gateway settles it. A FAILURE claim is believed at once:
+     * a false failure costs one retry; a false success costs an unpaid fare nobody notices.
+     *
+     * @param response the raw `response` extra, e.g. `txnId=..&Status=SUCCESS&txnRef=..`,
+     *   or null when no UPI app handled the request
+     */
+    fun onPaymentResult(response: String?) {
+        val upi = UpiResponse.parse(response)
+        Log.i(TAG, "PAYMENT upi-app status=\"${upi.status}\" ref=\"${upi.txnRef}\"")
+        val rideId = activeRideId ?: lastCompletedRideId
+
+        when (upi.status) {
+            "FAILURE", "FAILED" -> {
+                engine.earcon(Earcon.ERROR)
+                speak(
+                    "Your UPI app says the payment didn't go through. You can tap Pay now instead.",
+                    NarrationTier.INTERRUPT
+                )
+            }
+            "SUCCESS" -> speak(
+                "Your UPI app reported success. I'm waiting for the gateway to confirm it.",
+                NarrationTier.QUEUED
+            )
+            "SUBMITTED" -> speak("Payment submitted. I'm checking.", NarrationTier.QUEUED)
+            else -> {
+                speak(
+                    "I didn't get a response from the UPI app. Nothing has been charged as far " +
+                        "as I can tell. You can tap Pay now instead.",
+                    NarrationTier.QUEUED
+                )
+                return
+            }
+        }
+
+        if (rideId == null) {
+            Log.w(TAG, "PAYMENT no ride id to report against")
+            return
+        }
+
+        viewModelScope.launch {
+            api.reportPayment(rideId, upi.status.ifBlank { "SUBMITTED" }, upi.txnRef)
+        }
+        // Keep (or restart) watching the open order: the gateway is the only source of "paid".
+        val open = uiState.payment
+        if (open != null && open.phase == PaymentPhase.AWAITING && paymentPollJob?.isActive != true) {
+            watchOrder(open.orderId)
+        }
+    }
+
     /** The rider (or a helper) tapped "Code is right" instead of letting the app hear it. */
     fun onCodeConfirmed() {
         trace?.tapCount = (trace?.tapCount ?: 0) + 1
@@ -843,6 +1214,9 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             speakStatus()
             return
         }
+
+        // Remembered so that saying "pay" from here can come back to this screen.
+        doneBeforeListening = uiState.ride as? RiderState.Done
 
         trace = Telemetry.RideTrace(rideId = activeRideId ?: "local").also { it.tapCount++ }
 
@@ -1107,6 +1481,16 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         // else, because a driver saying "four seven two" must not be parsed as a destination.
         if (micPurpose == MicPurpose.CODE_VERIFY) {
             verifyBoardingCode(text)
+            return
+        }
+
+        // Held from the Done screen, "pay" means pay — not a destination called Pay. The mic
+        // moved the screen to Listening, so the finished ride is restored before paying.
+        val doneScreen = doneBeforeListening
+        doneBeforeListening = null
+        if (micPurpose == MicPurpose.BOOKING && doneScreen != null && isPaymentSpeech(text)) {
+            transition(doneScreen, announce = false)
+            if (!handlePaymentSpeech(text)) speak("Say pay to confirm, or decline.", NarrationTier.QUEUED)
             return
         }
 
@@ -1879,6 +2263,9 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                     val snapshot = result.value
                     activeRideId = snapshot.rideId
                     expectedCode = snapshot.boardingCode
+                    // A new ride: the last ride's payment panel and watcher belong to it, not this.
+                    paymentPollJob?.cancel()
+                    setPayment(null)
                     lastSpokenPhase = RidePhase.REQUESTED
 
                     Log.i(TAG, "RIDE created id=${snapshot.rideId} code=${snapshot.boardingCode}")
@@ -1907,6 +2294,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     /** Closes the socket for a finished ride and forgets its state. */
     private fun endRide(reason: String) {
         socket.unsubscribe(reason)
+        lastCompletedRideId = activeRideId
         activeRideId = null
         expectedCode = ""
         lastSpokenPhase = null
@@ -2225,6 +2613,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         silenceJob?.cancel()
         micReopenJob?.cancel()
         codeListenJob?.cancel()
+        paymentPollJob?.cancel()
         listPlacesJob?.cancel()
         demoRideJob?.cancel()
         stt?.cancel()
