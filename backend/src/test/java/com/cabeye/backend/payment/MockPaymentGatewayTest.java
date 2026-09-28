@@ -50,6 +50,7 @@ class MockPaymentGatewayTest {
     private String completedRide(int fare) {
         String id = rides.create("rider-test", "Gandhipuram", "AUTO").rideId();
         rides.assign(id, "driver-test", "Karthik", "Auto", "TN 37 BX 4412", "+910000000000", 5);
+        rides.confirmCode(id, "rider", true);
         rides.passengerSeated(id, "driver-test");
         rides.startTrip(id, "driver-test", 12);
         rides.complete(id, "driver-test", fare, 12);
@@ -217,6 +218,7 @@ class MockPaymentGatewayTest {
     void checkoutPageShowsAmountAndTestModeAndEscapesText() {
         String id = rides.create("rider-test", "<script>x</script>", "AUTO").rideId();
         rides.assign(id, "d", "K", "Auto", "P", "+91", 5);
+        rides.confirmCode(id, "rider", true);
         rides.passengerSeated(id, "d");
         rides.startTrip(id, "d", 1);
         rides.complete(id, "d", 148, 1);

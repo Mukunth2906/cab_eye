@@ -134,6 +134,31 @@ enum class RideEventType(
      */
     PAYMENT_UPDATED(NarrationTier.EARCON_ONLY),
 
+    // ---- The live camera ------------------------------------------------------------
+    // "Help me find my passenger". Not phase changes, so they sit outside [isRideLifecycle],
+    // and they are never replayed: the server broadcasts them without logging them, so a
+    // reconnect cannot ask the rider an old question again. The rider's view model speaks its
+    // own sentences for these; the tier only matters to [narrate]'s callers.
+
+    /** The driver asked to see the rider's camera. The rider's phone asks for consent. */
+    CAMERA_REQUESTED(NarrationTier.QUEUED),
+
+    /** The rider said yes; the rider's phone starts streaming. */
+    CAMERA_STARTED(NarrationTier.EARCON_ONLY),
+
+    /** The rider said no, or did not answer in time. Payload: reason. */
+    CAMERA_DECLINED(NarrationTier.EARCON_ONLY),
+
+    /** The camera went off. Payload: reason (CODE_CONFIRMED, SEATED, TIME_LIMIT, …), by. */
+    CAMERA_STOPPED(NarrationTier.EARCON_ONLY),
+
+    /**
+     * One picture from the rider's camera, on its way to the driver. Handled by the socket
+     * itself and delivered on [com.cabeye.rider.net.RideSocket.frames] — it never reaches the
+     * ride-event stream, so a few pictures a second cannot crowd out an arrival.
+     */
+    CAMERA_FRAME(NarrationTier.EARCON_ONLY),
+
     // ---- Transport notices ----------------------------------------------------------
     // Facts about the socket, not about the ride. Handled by the socket layer and never
     // narrated from a ride handler, which is why they carry EARCON_ONLY and no sound: the

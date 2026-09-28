@@ -71,6 +71,38 @@ sealed interface RiderIntent {
     /** Debug-only: walk the full ride arc so all eleven states can be seen without a backend. */
     data object DemoRide : RiderIntent
 
+    /**
+     * "go back", "start over", "wrong place" — return to the previous question.
+     *
+     * During a clarification or the cancel window that means "ask me for the place again";
+     * nowhere does it mean "give up", which is what "cancel" is for.
+     */
+    data object Back : RiderIntent
+
+    /** "my places", "where do I usually go" — the rider's previously visited places. */
+    data object MyPlaces : RiderIntent
+
+    /** "forget my history" — erase the rider's memory, here and on the server. */
+    data object ForgetHistory : RiderIntent
+
+    /** "give feedback", "report a problem" — about the ride that just finished. */
+    data object GiveFeedback : RiderIntent
+
+    /** "schedule a ride", "book one for tomorrow" — the next journey, for later. */
+    data object ScheduleRide : RiderIntent
+
+    /** "my scheduled rides" — what is booked for later. */
+    data object ListScheduled : RiderIntent
+
+    /** "cancel my scheduled ride" — clears rides booked for later. Not a ride cancel. */
+    data object CancelScheduled : RiderIntent
+
+    /** "sign out" / "log out" — back to the sign-in screen. */
+    data object SignOut : RiderIntent
+
+    /** "sign in" — a guest choosing to sign in after all. */
+    data object SignIn : RiderIntent
+
     /** Nothing matched. Triggers the LLM escalation once that exists. */
     data object Unknown : RiderIntent
 }
@@ -125,7 +157,15 @@ object IntentParser {
         "ku poganum", "ku polam", "poganum", "polam"
     ).sortedByDescending { it.length }
 
-    val CANCEL = Regex("\\b(cancel|stop|abort|never mind|nevermind|forget it)\\b", RegexOption.IGNORE_CASE)
+    /**
+     * "cancel", "abort", "never mind", "forget it" anywhere — but "stop" only as the command
+     * itself, at the start of what was said. Otherwise "take me to Ukkadam bus stop" cancels the
+     * booking it is making, and "Perur bus stop" cancels the ride at the landmark question.
+     */
+    val CANCEL = Regex(
+        "\\b(cancel|abort|never mind|nevermind|forget it)\\b|^\\s*(please\\s+|just\\s+)?stop\\b",
+        RegexOption.IGNORE_CASE
+    )
     val STATUS = Regex("\\b(status|where is (my )?(driver|cab|auto|ride)|how (long|far)|eta)\\b", RegexOption.IGNORE_CASE)
     val REPEAT = Regex("\\b(repeat|say (that )?again|what did you say|pardon)\\b", RegexOption.IGNORE_CASE)
     val CALL_DRIVER = Regex("\\b(call (the )?driver|phone (the )?driver|ring (the )?driver)\\b", RegexOption.IGNORE_CASE)

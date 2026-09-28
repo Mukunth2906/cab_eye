@@ -22,7 +22,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  * End-to-end over HTTP: finished ride → order → checkout page → pay → ride CONFIRMED.
  * Exactly the path the rider's app, the QR code and the sandbox page take on a real device.
  */
-@SpringBootTest
+@SpringBootTest(properties = "cabeye.data.dir=build/test-data/gateway-${random.uuid}")
 @AutoConfigureMockMvc
 class PaymentGatewayEndpointTest {
 
@@ -32,6 +32,7 @@ class PaymentGatewayEndpointTest {
     private String completedRide(int fare) {
         String id = rides.create("rider-it", "Gandhipuram", "AUTO").rideId();
         rides.assign(id, "driver-it", "Karthik", "Auto", "TN 37 BX 4412", "+910000000000", 5);
+        rides.confirmCode(id, "rider", true);
         rides.passengerSeated(id, "driver-it");
         rides.startTrip(id, "driver-it", 12);
         rides.complete(id, "driver-it", fare, 12);

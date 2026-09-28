@@ -44,6 +44,9 @@ interface TtsEngine {
     /** Stops immediately and clears the queue. Pending `onDone` callbacks still fire. */
     fun stop()
 
+    /** Speech speed, 1.0 = normal. Applied now if ready, and at initialisation otherwise. */
+    fun setSpeechRate(rate: Float) {}
+
     /** True while audio is being produced. The microphone must stay closed whenever this is true. */
     val isSpeaking: Boolean
 
@@ -68,6 +71,14 @@ class AndroidTtsEngine(private val context: Context) : TtsEngine {
 
     private var tts: TextToSpeech? = null
     private var ready = false
+
+    /**
+     * Normal speed by default. It was 1.15 on the reasoning that practised listeners like it
+     * fast; in the demo the narrator was hard to follow, especially reading numbers, so the
+     * default is now normal and each rider can say "speak faster" if they want it.
+     */
+    @Volatile
+    private var speechRate = 1.0f
     private var utteranceCounter = 0L
 
     /** utteranceId -> callbacks. Concurrent because TTS callbacks arrive on a binder thread. */
@@ -102,10 +113,16 @@ class AndroidTtsEngine(private val context: Context) : TtsEngine {
                 }
             }
 
-            // Slightly faster than default. Blind users are typically practised listeners
-            // and this is a direct saving on every sentence — speech time is task time.
-            engine.setSpeechRate(1.15f)
+            engine.setSpeechRate(speechRate)
             engine.setPitch(1.0f)
+            // Tagged as speech for accessibility, so Android treats it as the spoken interface
+            // it is (ducking other audio, routing like a screen reader) rather than as music.
+            engine.setAudioAttributes(
+                android.media.AudioAttributes.Builder()
+                    .setUsage(android.media.AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
+                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
 
             engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String?) {
@@ -165,6 +182,11 @@ class AndroidTtsEngine(private val context: Context) : TtsEngine {
             Log.w(TAG, "speak() rejected for \"$text\"")
             pending.remove(id)?.second?.invoke()
         }
+    }
+
+    override fun setSpeechRate(rate: Float) {
+        speechRate = rate.coerceIn(0.5f, 2.0f)
+        if (ready) tts?.setSpeechRate(speechRate)
     }
 
     override fun stop() {

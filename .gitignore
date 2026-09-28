@@ -20,6 +20,11 @@ build/
 !**/gradle/wrapper/gradle-wrapper.jar
 local.properties
 
+# --- Backend data (accounts, sessions, rider memory) ----------------------------------
+# Real people's phone numbers and trip history. Never commit it.
+backend/data/
+data/
+
 # --- Signing keys --------------------------------------------------------------------
 # A keystore signs your app as YOU. If one leaks, someone else can publish updates that
 # phones will accept as genuine. Never commit these, even for a hobby project.
@@ -54,3 +59,33 @@ ngrok.yml
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# --- Database (H2 on the laptop) ------------------------------------------------------
+# backend/data/ is already ignored above; these catch a database file anywhere else, e.g.
+# if the backend is ever started from a different folder.
+*.mv.db
+*.trace.db
+*.lock.db
+*.json.imported
+
+# --- Admin / alert secrets -----------------------------------------------------------
+# Admin password, Telegram bot token, Gmail app password. The .example file (no real
+# values) IS committed so others know what to fill in.
+cabeye-secrets.properties
+cabeye-secrets*.properties
+!cabeye-secrets.example.properties
+
+# --- Identity documents used for testing ---------------------------------------------
+# Driving licences / RC books (DigiLocker PDFs, screenshots) are other people's personal
+# data. Keep them in a folder named private/ or test-documents/ — never committed.
+private/
+test-documents/
+*DrivingLicen*
+*digilocker*
+*DigiLocker*
+
+# --- Android Studio extras -----------------------------------------------------------
+captures/
+.externalNativeBuild/
+.cxx/
+*.hprof

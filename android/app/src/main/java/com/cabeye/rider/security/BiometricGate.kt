@@ -39,7 +39,37 @@ object BiometricGate {
     private const val TAG = "CabEye.Biometric"
     private const val AUTHENTICATORS = BIOMETRIC_WEAK or DEVICE_CREDENTIAL
 
-    fun authenticate(activity: FragmentActivity, amountRupees: Int, onResult: (Result) -> Unit) {
+    fun authenticate(activity: FragmentActivity, amountRupees: Int, onResult: (Result) -> Unit) =
+        prompt(
+            activity,
+            title = "Confirm payment of ₹$amountRupees",
+            subtitle = "Cab Eye · test mode",
+            description = "Use your fingerprint, face or screen lock to pay $amountRupees rupees.",
+            onResult = onResult
+        )
+
+    /**
+     * Unlocks a stored sign-in when the app opens.
+     *
+     * This is what makes every sign-in after the first zero-step for a blind rider: no number,
+     * no code, no typing — one touch of the sensor they already use to unlock the phone.
+     */
+    fun unlock(activity: FragmentActivity, name: String, onResult: (Result) -> Unit) =
+        prompt(
+            activity,
+            title = if (name.isBlank()) "Unlock Cab Eye" else "Welcome back, $name",
+            subtitle = "Cab Eye",
+            description = "Use your fingerprint, face or screen lock to open your account.",
+            onResult = onResult
+        )
+
+    private fun prompt(
+        activity: FragmentActivity,
+        title: String,
+        subtitle: String,
+        description: String,
+        onResult: (Result) -> Unit
+    ) {
         val can = BiometricManager.from(activity).canAuthenticate(AUTHENTICATORS)
         if (can != BiometricManager.BIOMETRIC_SUCCESS) {
             Log.i(TAG, "BIOMETRIC unavailable code=$can")
@@ -88,9 +118,9 @@ object BiometricGate {
         )
 
         val info = BiometricPrompt.PromptInfo.Builder()
-            .setTitle("Confirm payment of ₹$amountRupees")
-            .setSubtitle("Cab Eye · test mode")
-            .setDescription("Use your fingerprint, face or screen lock to pay $amountRupees rupees.")
+            .setTitle(title)
+            .setSubtitle(subtitle)
+            .setDescription(description)
             // No negative button: it is not allowed together with DEVICE_CREDENTIAL, and the
             // system prompt already offers "Use PIN" and can be dismissed with Back.
             .setAllowedAuthenticators(AUTHENTICATORS)

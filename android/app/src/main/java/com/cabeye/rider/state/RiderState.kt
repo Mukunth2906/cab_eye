@@ -171,6 +171,39 @@ sealed interface RiderState {
         val durationMinutes: Int
     ) : RiderState
 
+    /**
+     * After payment: optional spoken feedback. Never required — "skip", or simply saying
+     * nothing, moves on — but a rider who has something to report can say it in their own
+     * words, and a safety report is flagged as urgent.
+     *
+     * @param step which question is on the table
+     * @param rating the rating given so far, if any
+     * @param category the report category the app understood, read back for confirmation
+     * @param report the rider's words, as heard
+     */
+    data class Feedback(
+        val driverName: String,
+        val step: FeedbackStep = FeedbackStep.RATING,
+        val rating: Int? = null,
+        val category: String = "",
+        val report: String = ""
+    ) : RiderState
+
+    /**
+     * The end of one journey is the start of the next: book another now, schedule one for a
+     * specific time, or finish.
+     *
+     * @param suggestion a remembered place worth offering first ("home, like most evenings"),
+     *   or null
+     * @param scheduledAt / scheduledTo the ride being scheduled, once the rider has said them
+     */
+    data class NextJourney(
+        val step: NextStep = NextStep.CHOOSE,
+        val suggestion: String? = null,
+        val scheduledAtText: String = "",
+        val scheduledTo: String = ""
+    ) : RiderState
+
     companion object {
         /**
          * Score gap below which two candidates count as tied.
@@ -187,6 +220,37 @@ sealed interface RiderState {
         /** Real, honoured cancellation window for optimistic booking. */
         const val CANCEL_WINDOW_MS = 5_000L
     }
+}
+
+/** The feedback questions, in order. */
+enum class FeedbackStep {
+    /** "How was your ride? Say a number from 1 to 5, report a problem, or skip." */
+    RATING,
+    /**
+     * "One out of five. Is that right?" A low rating counts against the driver, so it is read
+     * back before anything is sent — found in the demo, where a misheard answer filed a 1.
+     */
+    RATING_CHECK,
+    /** "What went wrong?" */
+    REPORT,
+    /** "I'll report this as a safety issue: … Is that right?" */
+    CONFIRM,
+    /** Sent. A moment of thanks before the next-journey question. */
+    SENT
+}
+
+/** The next-journey questions, in order. */
+enum class NextStep {
+    /** "Book another ride now, schedule one for later, or are you done?" */
+    CHOOSE,
+    /** "When should I book it?" */
+    WHEN,
+    /** "Where should it go?" */
+    WHERE,
+    /** "Tomorrow at 8 30 AM, to PSG College. Shall I schedule it?" */
+    CONFIRM,
+    /** Saved. */
+    SCHEDULED
 }
 
 /**
@@ -226,8 +290,23 @@ data class RiderUiState(
      * Orthogonal to [ride] for the same reason [sosActive] is: paying does not change where
      * the ride is, and a Done ride must stay Done whatever happens to the payment.
      */
-    val payment: PaymentUi? = null
+    val payment: PaymentUi? = null,
+    /**
+     * The live camera that helps the driver find the rider. Orthogonal to [ride] like
+     * [sosActive]: the camera never changes where the ride is, and the ride screen underneath
+     * stays exactly what it was.
+     */
+    val camera: CameraShare = CameraShare.OFF
 )
+
+/** Where the "help my driver find me" camera stands. */
+enum class CameraShare {
+    OFF,
+    /** The driver asked; the rider is being asked for consent. */
+    ASKING,
+    /** The rider's back camera is being shown to the driver. */
+    LIVE
+}
 
 /**
  * Where the fare payment stands, as the rider's screen shows it.

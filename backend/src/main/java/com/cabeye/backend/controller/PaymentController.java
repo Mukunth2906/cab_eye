@@ -83,7 +83,7 @@ public class PaymentController {
     //  Sandbox checkout page
     // ===================================================================================
 
-    @GetMapping(value = "/pay/{orderId}", produces = MediaType.TEXT_HTML_VALUE)
+    @GetMapping(value = "/pay/{orderId}", produces = "text/html;charset=UTF-8")
     public ResponseEntity<String> checkoutPage(@PathVariable String orderId) {
         try {
             return html(200, CheckoutPage.checkout(gateway.open(orderId)));
@@ -92,7 +92,7 @@ public class PaymentController {
         }
     }
 
-    @PostMapping(value = "/pay/{orderId}", produces = MediaType.TEXT_HTML_VALUE)
+    @PostMapping(value = "/pay/{orderId}", produces = "text/html;charset=UTF-8")
     public ResponseEntity<String> submitCheckout(@PathVariable String orderId,
                                                  @RequestParam(defaultValue = "pay") String action,
                                                  @RequestParam(defaultValue = "UPI") String method) {
@@ -127,7 +127,10 @@ public class PaymentController {
     }
 
     private static ResponseEntity<String> html(int status, String body) {
-        return ResponseEntity.status(status).contentType(MediaType.TEXT_HTML).body(body);
+        // Explicit UTF-8: without it Spring writes Latin-1 and the rupee sign reaches the page as "?".
+        return ResponseEntity.status(status)
+                .contentType(new MediaType(MediaType.TEXT_HTML, java.nio.charset.StandardCharsets.UTF_8))
+                .body(body);
     }
 
     /**

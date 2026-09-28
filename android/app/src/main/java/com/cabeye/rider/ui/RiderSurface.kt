@@ -72,6 +72,9 @@ import com.cabeye.rider.state.RiderState
 import com.cabeye.rider.state.RiderUiState
 import com.cabeye.rider.state.PaymentPhase
 import com.cabeye.rider.state.PaymentUi
+import com.cabeye.rider.state.FeedbackStep
+import com.cabeye.rider.state.NextStep
+import com.cabeye.rider.state.CameraShare
 import com.cabeye.rider.places.Gazetteer
 import com.cabeye.rider.ui.theme.FocusIndicatorWidth
 import com.cabeye.rider.ui.theme.LocalPalette
@@ -139,6 +142,9 @@ fun RiderSurface(
     onPaymentMethod: (String) -> Unit,
     onDeclinePayment: () -> Unit,
     onOpenSettings: () -> Unit,
+    onPostRideAction: (String) -> Unit = {},
+    onCameraAnswer: (Boolean) -> Unit = {},
+    onStopCamera: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val palette = LocalPalette.current
@@ -195,13 +201,16 @@ fun RiderSurface(
             //  traversal list of labels. Traversing a list is exactly the navigation
             //  this product is built to remove.
             //
-            //  liveRegion = Assertive makes TalkBack announce contentDescription
-            //  whenever it changes, without the user moving focus — so a ride-driven
-            //  change reaches the rider even though they never touched anything.
+            //  Deliberately no live region: the narrator already speaks every change,
+            //  and a live region made TalkBack say it again over the top.
             // ------------------------------------------------------------------
             .semantics(mergeDescendants = true) {
                 contentDescription = announcement
-                liveRegion = LiveRegionMode.Assertive
+                // No live region. It made TalkBack announce every change while the app's own
+                // narrator was already saying the same thing, so with TalkBack on the two
+                // voices talked over each other (found in the demo: "no proper hearing of the
+                // narrator"). The narrator speaks every change; TalkBack still reads this
+                // description whenever the rider touches the screen.
 
                 // With descendants merged, child buttons stop being individually
                 // focusable. These custom actions put those affordances back for a
@@ -210,7 +219,11 @@ fun RiderSurface(
                     uiState, onCancel, onClarifyChoice, onNearMissAnswer, onSos,
                     onPay = onPay,
                     onPaymentMethod = onPaymentMethod,
-                    onDeclinePayment = onDeclinePayment
+                    onDeclinePayment = onDeclinePayment,
+                    onPostRideAction = onPostRideAction,
+                    onCameraAnswer = onCameraAnswer,
+                    onStopCamera = onStopCamera,
+                    onCodeConfirmed = onCodeConfirmed
                 )
             }
     ) {
@@ -349,6 +362,108 @@ fun RiderSurface(
                     } else null
                 )
             }
+
+            // Optional feedback. Skip is always the big button: feedback must never be the
+            // thing standing between a rider and getting on with their day.
+            is RiderState.Feedback -> when (ride.step) {
+                FeedbackStep.RATING -> StateScaffold(
+                    icon = "☆",
+                    word = "Feedback",
+                    headline = "How was\nyour ride?",
+                    support = "Say 1 to 5  ·  “report a problem”  ·  “skip”",
+                    accent = palette.clarify,
+                    micOpen = uiState.micOpen,
+                    primary = ButtonSpec("SKIP", palette.onBackground) { onPostRideAction("skip") },
+                    secondary = ButtonSpec("REPORT A PROBLEM", palette.danger) { onPostRideAction("report") }
+                )
+                FeedbackStep.RATING_CHECK -> StateScaffold(
+                    icon = "?",
+                    word = "Check rating",
+                    headline = "${ride.rating ?: "?"} out of 5?",
+                    support = "Say yes, no, or the right number",
+                    accent = palette.clarify,
+                    micOpen = uiState.micOpen,
+                    primary = ButtonSpec("YES", palette.confirm) { onPostRideAction("rating-yes") },
+                    secondary = ButtonSpec("NO", palette.onBackground) { onPostRideAction("rating-no") }
+                )
+                FeedbackStep.REPORT -> StateScaffold(
+                    icon = "!",
+                    word = "Report",
+                    headline = "What went\nwrong?",
+                    support = ride.rating?.let { "Rating $it of 5  ·  say it, or “skip”" } ?: "Say it, or “skip”",
+                    accent = palette.clarify,
+                    micOpen = uiState.micOpen,
+                    primary = ButtonSpec("SKIP", palette.onBackground) { onPostRideAction("skip") }
+                )
+                FeedbackStep.CONFIRM -> StateScaffold(
+                    icon = "?",
+                    word = "Send report?",
+                    headline = "“${ride.report}”",
+                    support = ride.category.lowercase().replaceFirstChar { it.uppercase() },
+                    accent = if (ride.category == "SAFETY") palette.danger else palette.clarify,
+                    micOpen = uiState.micOpen,
+                    primary = ButtonSpec("SEND", palette.confirm) { onPostRideAction("send") },
+                    secondary = ButtonSpec("SKIP", palette.onBackground) { onPostRideAction("skip") }
+                )
+                FeedbackStep.SENT -> StateScaffold(
+                    icon = "✓",
+                    word = "Thank you",
+                    headline = "Thank you",
+                    support = null,
+                    accent = palette.confirm,
+                    micOpen = uiState.micOpen
+                )
+            }
+
+            // The end of one journey is the start of the next.
+            is RiderState.NextJourney -> when (ride.step) {
+                NextStep.CHOOSE -> StateScaffold(
+                    icon = "↻",
+                    word = "Next journey",
+                    headline = "Another\nride?",
+                    support = "“book now”  ·  “schedule for later”  ·  “done”",
+                    accent = palette.onBackground,
+                    micOpen = uiState.micOpen,
+                    primary = ButtonSpec("BOOK ANOTHER RIDE", palette.confirm) { onPostRideAction("now") },
+                    secondary = ButtonSpec("I'M DONE", palette.onBackground) { onPostRideAction("done") }
+                )
+                NextStep.WHEN -> StateScaffold(
+                    icon = "◷",
+                    word = "Schedule",
+                    headline = "When?",
+                    support = "“tomorrow at 8 30”  ·  “in two hours”",
+                    accent = palette.listening,
+                    micOpen = uiState.micOpen,
+                    secondary = ButtonSpec("CANCEL", palette.onBackground) { onPostRideAction("done") }
+                )
+                NextStep.WHERE -> StateScaffold(
+                    icon = "◷",
+                    word = "Schedule",
+                    headline = "Where to?",
+                    support = ride.scheduledAtText,
+                    accent = palette.listening,
+                    micOpen = uiState.micOpen,
+                    secondary = ButtonSpec("CANCEL", palette.onBackground) { onPostRideAction("done") }
+                )
+                NextStep.CONFIRM -> StateScaffold(
+                    icon = "?",
+                    word = "Schedule",
+                    headline = ride.scheduledTo,
+                    support = ride.scheduledAtText,
+                    accent = palette.clarify,
+                    micOpen = uiState.micOpen,
+                    primary = ButtonSpec("SCHEDULE IT", palette.confirm) { onPostRideAction("confirm") },
+                    secondary = ButtonSpec("CANCEL", palette.onBackground) { onPostRideAction("done") }
+                )
+                NextStep.SCHEDULED -> StateScaffold(
+                    icon = "✓",
+                    word = "Scheduled",
+                    headline = ride.scheduledTo,
+                    support = ride.scheduledAtText,
+                    accent = palette.confirm,
+                    micOpen = uiState.micOpen
+                )
+            }
         }
 
         // Connection state, and the hidden way into settings.
@@ -364,6 +479,14 @@ fun RiderSurface(
         )
 
         SosButton(onSos = onSos, modifier = Modifier.align(Alignment.BottomEnd))
+
+        // The live camera, in a corner: the ride screen underneath is left exactly as it was.
+        CameraPanel(
+            camera = uiState.camera,
+            onAnswer = onCameraAnswer,
+            onStop = onStopCamera,
+            modifier = Modifier.align(Alignment.TopStart)
+        )
 
         if (uiState.sosActive) {
             SosOverlay(onDismiss = onDismissSos)
@@ -721,6 +844,60 @@ private fun DestinationMapPreview(place: PlaceOption) {
             .height(150.dp)
             .border(1.dp, LocalPalette.current.outline, RoundedCornerShape(16.dp))
     )
+}
+
+// =====================================================================================
+//  Live camera
+// =====================================================================================
+
+/**
+ * The corner panel for the "help my driver find me" camera.
+ *
+ * For the sighted helper and the low-vision rider. The blind rider hears the question and
+ * answers by voice; this panel and the TalkBack actions are the same controls by touch. It
+ * never covers the ride screen, and it shows no picture: the rider's phone has nothing to see.
+ */
+@Composable
+private fun CameraPanel(
+    camera: CameraShare,
+    onAnswer: (Boolean) -> Unit,
+    onStop: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    if (camera == CameraShare.OFF) return
+    val palette = LocalPalette.current
+    val live = camera == CameraShare.LIVE
+
+    Column(
+        modifier = modifier
+            .padding(12.dp)
+            .width(230.dp)
+            .background(palette.background, RoundedCornerShape(18.dp))
+            .border(FocusIndicatorWidth, if (live) palette.danger else palette.clarify, RoundedCornerShape(18.dp))
+            .padding(12.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            text = if (live) "● CAMERA ON" else "Driver asks to see your camera",
+            style = MaterialTheme.typography.labelLarge,
+            color = if (live) palette.danger else palette.clarify,
+            textAlign = TextAlign.Center
+        )
+        Text(
+            text = if (live) "Shown to your driver only. Not recorded." else "Say yes or no",
+            style = MaterialTheme.typography.bodyMedium,
+            color = palette.muted,
+            textAlign = TextAlign.Center
+        )
+        Spacer(Modifier.height(8.dp))
+        if (live) {
+            ChoiceButton("STOP CAMERA", palette.danger, Modifier.fillMaxWidth(), onStop)
+        } else {
+            ChoiceButton("SHARE", palette.confirm, Modifier.fillMaxWidth()) { onAnswer(true) }
+            Spacer(Modifier.height(8.dp))
+            ChoiceButton("NO", palette.onBackground, Modifier.fillMaxWidth()) { onAnswer(false) }
+        }
+    }
 }
 
 // =====================================================================================
@@ -1130,6 +1307,22 @@ private fun announcementFor(uiState: RiderUiState): String {
             else ->
                 "You have arrived at ${ride.destination}. Fare ${ride.fareRupees} rupees. Action: pay."
         }
+
+        is RiderState.Feedback -> when (ride.step) {
+            FeedbackStep.RATING -> "How was your ride with ${ride.driverName}? Say a number from one to five, report a problem, or skip."
+            FeedbackStep.RATING_CHECK -> "${ride.rating} out of 5. Is that right? Say yes or no."
+            FeedbackStep.REPORT -> "What went wrong? Say it, or skip."
+            FeedbackStep.CONFIRM -> "Send this report: ${ride.report}? Say yes or no."
+            FeedbackStep.SENT -> "Thank you."
+        }
+
+        is RiderState.NextJourney -> when (ride.step) {
+            NextStep.CHOOSE -> "Book another ride now, schedule one for later, or done?"
+            NextStep.WHEN -> "When should I book it?"
+            NextStep.WHERE -> "${ride.scheduledAtText}. Where should the ride go?"
+            NextStep.CONFIRM -> "A ride to ${ride.scheduledTo}, ${ride.scheduledAtText}. Schedule it?"
+            NextStep.SCHEDULED -> "Scheduled: ${ride.scheduledTo}, ${ride.scheduledAtText}."
+        }
     }
 }
 
@@ -1150,6 +1343,8 @@ private fun hapticFor(uiState: RiderUiState): HapticPattern {
         is RiderState.Arrived -> HapticPattern.ARRIVED
         is RiderState.InTrip -> HapticPattern.CONFIRMED
         is RiderState.Done -> HapticPattern.CONFIRMED
+        is RiderState.Feedback -> HapticPattern.CLARIFY
+        is RiderState.NextJourney -> HapticPattern.CLARIFY
     }
 }
 
@@ -1169,9 +1364,24 @@ private fun buildCustomActions(
     onSos: () -> Unit,
     onPay: () -> Unit = {},
     onPaymentMethod: (String) -> Unit = {},
-    onDeclinePayment: () -> Unit = {}
+    onDeclinePayment: () -> Unit = {},
+    onPostRideAction: (String) -> Unit = {},
+    onCameraAnswer: (Boolean) -> Unit = {},
+    onStopCamera: () -> Unit = {},
+    onCodeConfirmed: () -> Unit = {}
 ): List<CustomAccessibilityAction> {
     val actions = mutableListOf<CustomAccessibilityAction>()
+
+    // First in the list: while the camera question is open or the camera is on, controlling
+    // it is the most time-sensitive thing a TalkBack user can do on this screen.
+    when (uiState.camera) {
+        CameraShare.ASKING -> {
+            actions += CustomAccessibilityAction("Share camera with driver") { onCameraAnswer(true); true }
+            actions += CustomAccessibilityAction("Don't share camera") { onCameraAnswer(false); true }
+        }
+        CameraShare.LIVE -> actions += CustomAccessibilityAction("Stop camera") { onStopCamera(); true }
+        CameraShare.OFF -> Unit
+    }
 
     when (val ride = uiState.ride) {
         is RiderState.Clarify -> {
@@ -1195,6 +1405,11 @@ private fun buildCustomActions(
         is RiderState.Assigned, is RiderState.Approaching -> {
             actions += CustomAccessibilityAction("Cancel ride") { onCancel(); true }
         }
+        // The same two buttons the Arrived screen shows, for a TalkBack user.
+        is RiderState.Arrived -> {
+            actions += CustomAccessibilityAction("Code is right") { onCodeConfirmed(); true }
+            actions += CustomAccessibilityAction("Not my driver") { onSos(); true }
+        }
         is RiderState.Done -> {
             val payment = uiState.payment
             when (payment?.phase) {
@@ -1217,6 +1432,27 @@ private fun buildCustomActions(
                 null, PaymentPhase.ERROR ->
                     actions += CustomAccessibilityAction("Pay ${ride.fareRupees} rupees") { onPay(); true }
             }
+        }
+        is RiderState.Feedback -> {
+            if (ride.step == FeedbackStep.CONFIRM) {
+                actions += CustomAccessibilityAction("Send report") { onPostRideAction("send"); true }
+            } else if (ride.step == FeedbackStep.RATING_CHECK) {
+                actions += CustomAccessibilityAction("Rating is right") { onPostRideAction("rating-yes"); true }
+                actions += CustomAccessibilityAction("Rating is wrong") { onPostRideAction("rating-no"); true }
+            } else if (ride.step == FeedbackStep.RATING) {
+                actions += CustomAccessibilityAction("Report a problem") { onPostRideAction("report"); true }
+            }
+            actions += CustomAccessibilityAction("Skip feedback") { onPostRideAction("skip"); true }
+        }
+        is RiderState.NextJourney -> {
+            if (ride.step == NextStep.CHOOSE) {
+                actions += CustomAccessibilityAction("Book another ride now") { onPostRideAction("now"); true }
+                actions += CustomAccessibilityAction("Schedule a ride for later") { onPostRideAction("schedule"); true }
+            }
+            if (ride.step == NextStep.CONFIRM) {
+                actions += CustomAccessibilityAction("Schedule it") { onPostRideAction("confirm"); true }
+            }
+            actions += CustomAccessibilityAction("Done") { onPostRideAction("done"); true }
         }
         else -> Unit
     }

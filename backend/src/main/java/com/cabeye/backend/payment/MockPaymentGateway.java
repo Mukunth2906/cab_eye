@@ -55,6 +55,40 @@ public class MockPaymentGateway {
     private final Map<String, PaymentOrder> orders = new ConcurrentHashMap<>();
     private final Map<String, String> latestOrderByRide = new ConcurrentHashMap<>();
 
+    /** Where orders are saved; null in plain unit tests, which run without a database. */
+    private volatile com.cabeye.backend.store.Table<PaymentOrderRecord> store;
+
+    /**
+     * Saves every order to [table] from now on, after loading the ones already there — so an
+     * open checkout, or a paid receipt, survives a backend restart.
+     */
+    public synchronized void persistTo(com.cabeye.backend.store.Table<PaymentOrderRecord> table) {
+        for (PaymentOrderRecord r : table.all()) {
+            try {
+                PaymentOrder order = PaymentOrder.fromRecord(r);
+                orders.put(order.orderId(), order);
+                String latest = latestOrderByRide.get(order.rideId());
+                if (latest == null || orders.get(latest).createdAt().isBefore(order.createdAt())) {
+                    latestOrderByRide.put(order.rideId(), order.orderId());
+                }
+            } catch (RuntimeException e) {
+                log.warn("PAYMENT_ORDER_RESTORE_FAILED order={} : {}", r.orderId, e.toString());
+            }
+        }
+        this.store = table;
+        log.info("PAYMENT orders restored {} from the database", orders.size());
+    }
+
+    private void save(PaymentOrder order) {
+        var table = store;
+        if (table == null) return;
+        try {
+            table.put(order.orderId(), order.toRecord());
+        } catch (RuntimeException e) {
+            log.warn("PAYMENT_ORDER_SAVE_FAILED order={} : {}", order.orderId(), e.toString());
+        }
+    }
+
     @Autowired
     public MockPaymentGateway(RideService rides) {
         this(rides, Clock.systemUTC());
@@ -119,6 +153,7 @@ public class MockPaymentGateway {
                 "Cab Eye ride to " + ride.destination(), now, now.plus(ORDER_TTL));
         orders.put(order.orderId(), order);
         latestOrderByRide.put(rideId, order.orderId());
+        save(order);
 
         log.info("PAYMENT_ORDER_CREATED order={} ride={} amount=₹{}",
                 order.orderId(), rideId, order.amountRupees());
@@ -147,6 +182,7 @@ public class MockPaymentGateway {
         PaymentOrder order = require(orderId);
         if (order.markOpened()) {
             log.info("PAYMENT_CHECKOUT_OPENED order={}", orderId);
+            save(order);
         }
         return order;
     }
@@ -171,6 +207,7 @@ public class MockPaymentGateway {
             throw new PaymentException(PaymentException.Kind.CONFLICT, conflictFor(order));
         }
 
+        save(order);
         rides.confirmPayment(order.rideId(), bankRef);
         log.info("PAYMENT_PAID order={} ride={} amount=₹{} method={} utr={}",
                 orderId, order.rideId(), order.amountRupees(), how, bankRef);
@@ -186,6 +223,7 @@ public class MockPaymentGateway {
             throw new PaymentException(PaymentException.Kind.CONFLICT, conflictFor(order));
         }
 
+        save(order);
         rides.failPayment(order.rideId(), order.failureReason());
         log.info("PAYMENT_FAILED order={} ride={} reason=\"{}\"",
                 orderId, order.rideId(), order.failureReason());
@@ -231,11 +269,12 @@ public class MockPaymentGateway {
     private void refresh(PaymentOrder order) {
         if (order.expireIfDue(clock.instant())) {
             log.info("PAYMENT_EXPIRED order={} ride={}", order.orderId(), order.rideId());
+            save(order);
         }
         rides.find(order.rideId()).ifPresent(ride -> {
             if (ride.paymentStatus() == Ride.PaymentStatus.CONFIRMED
                     && order.status() != PaymentOrder.Status.PAID) {
-                order.markPaid("EXTERNAL", "", ride.paymentRef(), clock.instant());
+                if (order.markPaid("EXTERNAL", "", ride.paymentRef(), clock.instant())) save(order);
             }
         });
     }

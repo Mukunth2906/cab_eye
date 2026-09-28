@@ -90,6 +90,40 @@ public class PaymentOrder {
         return true;
     }
 
+    /** Everything needed to rebuild this order after a restart. */
+    public synchronized PaymentOrderRecord toRecord() {
+        PaymentOrderRecord r = new PaymentOrderRecord();
+        r.orderId = orderId;
+        r.rideId = rideId;
+        r.amountRupees = amountRupees;
+        r.payeeVpa = payeeVpa;
+        r.payeeName = payeeName;
+        r.note = note;
+        r.createdAt = createdAt;
+        r.expiresAt = expiresAt;
+        r.status = status.name();
+        r.method = method;
+        r.gatewayTxnId = gatewayTxnId;
+        r.bankRef = bankRef;
+        r.failureReason = failureReason;
+        r.paidAt = paidAt;
+        return r;
+    }
+
+    static PaymentOrder fromRecord(PaymentOrderRecord r) {
+        PaymentOrder o = new PaymentOrder(r.orderId, r.rideId, r.amountRupees, r.payeeVpa,
+                r.payeeName, r.note, r.createdAt, r.expiresAt);
+        synchronized (o) {
+            o.status = r.status == null ? Status.CREATED : Status.valueOf(r.status);
+            o.method = r.method == null ? "" : r.method;
+            o.gatewayTxnId = r.gatewayTxnId == null ? "" : r.gatewayTxnId;
+            o.bankRef = r.bankRef == null ? "" : r.bankRef;
+            o.failureReason = r.failureReason == null ? "" : r.failureReason;
+            o.paidAt = r.paidAt;
+        }
+        return o;
+    }
+
     /** @return true when this call moved the order to EXPIRED */
     synchronized boolean expireIfDue(Instant now) {
         if (status.isFinal() || now.isBefore(expiresAt)) return false;

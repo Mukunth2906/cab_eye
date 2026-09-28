@@ -79,6 +79,13 @@ public class Ride {
      * rider who cannot see the screen has no way to notice that "paid" was wrong, and would
      * walk away from an unpaid fare believing it settled.
      */
+    /**
+     * What the rider actually said for the destination ("piece g"), as opposed to the resolved
+     * place name ("PSG College of Technology"). Carried to the rider's memory on completion so
+     * the same words resolve straight away next time.
+     */
+    private volatile String spokenAs = "";
+
     private volatile PaymentStatus paymentStatus = PaymentStatus.NONE;
 
     /** Transaction reference the UPI app returned, for reconciliation. Never a credential. */
@@ -86,7 +93,7 @@ public class Ride {
 
     private final String rideType;
     private final String boardingCode;
-    private final Instant createdAt;
+    private Instant createdAt;
 
     private final AtomicLong sequence = new AtomicLong(0);
     private final List<RideEvent> log = new ArrayList<>();
@@ -133,6 +140,83 @@ public class Ride {
         this.rideType = rideType;
         this.boardingCode = boardingCode;
         this.createdAt = Instant.now();
+    }
+
+    // -----------------------------------------------------------------------------------
+    //  Saving and restoring (database)
+    // -----------------------------------------------------------------------------------
+
+    /** Everything needed to rebuild this ride after a restart. */
+    public synchronized RideRecord toRecord() {
+        RideRecord r = new RideRecord();
+        r.rideId = rideId;
+        r.riderId = riderId;
+        r.destination = destination;
+        r.destinationAddress = destinationAddress;
+        r.destinationLatitude = destinationLatitude;
+        r.destinationLongitude = destinationLongitude;
+        r.destinationPlaceId = destinationPlaceId;
+        r.pickupLatitude = pickupLatitude;
+        r.pickupLongitude = pickupLongitude;
+        r.contactName = contactName;
+        r.contactPhone = contactPhone;
+        r.dropNote = dropNote;
+        r.rideType = rideType;
+        r.boardingCode = boardingCode;
+        r.createdAt = createdAt;
+        r.spokenAs = spokenAs;
+        r.phase = phase.name();
+        r.driverId = driverId;
+        r.driverName = driverName;
+        r.vehicleModel = vehicleModel;
+        r.vehiclePlate = vehiclePlate;
+        r.driverPhone = driverPhone;
+        r.etaMinutes = etaMinutes;
+        r.distanceMeters = distanceMeters;
+        r.bearingDeg = bearingDeg;
+        r.codeConfirmed = codeConfirmed;
+        r.fareRupees = fareRupees;
+        r.durationMinutes = durationMinutes;
+        r.paymentStatus = paymentStatus.name();
+        r.paymentRef = paymentRef;
+        r.lastSeq = sequence.get();
+        r.events = new ArrayList<>(log);
+        return r;
+    }
+
+    /** Rebuilds a saved ride exactly as it was, event log and sequence numbers included. */
+    public static Ride fromRecord(RideRecord r) {
+        Ride ride = new Ride(r.rideId, r.riderId, r.destination, r.destinationAddress,
+                r.destinationLatitude, r.destinationLongitude, r.destinationPlaceId,
+                r.pickupLatitude, r.pickupLongitude, r.contactName, r.contactPhone, r.dropNote,
+                r.rideType, r.boardingCode);
+        synchronized (ride) {
+            if (r.createdAt != null) ride.createdAt = r.createdAt;
+            ride.spokenAs = r.spokenAs == null ? "" : r.spokenAs;
+            ride.phase = r.phase == null ? RidePhase.REQUESTED : RidePhase.valueOf(r.phase);
+            ride.driverId = r.driverId;
+            ride.driverName = r.driverName;
+            ride.vehicleModel = r.vehicleModel;
+            ride.vehiclePlate = r.vehiclePlate;
+            ride.driverPhone = r.driverPhone;
+            ride.etaMinutes = r.etaMinutes;
+            ride.distanceMeters = r.distanceMeters;
+            ride.bearingDeg = r.bearingDeg;
+            ride.codeConfirmed = r.codeConfirmed;
+            ride.fareRupees = r.fareRupees;
+            ride.durationMinutes = r.durationMinutes;
+            ride.paymentStatus = r.paymentStatus == null ? PaymentStatus.NONE : PaymentStatus.valueOf(r.paymentStatus);
+            ride.paymentRef = r.paymentRef == null ? "" : r.paymentRef;
+            long maxSeq = r.lastSeq;
+            if (r.events != null) {
+                for (RideEvent e : r.events) {
+                    ride.log.add(e);
+                    maxSeq = Math.max(maxSeq, e.seq());
+                }
+            }
+            ride.sequence.set(maxSeq);
+        }
+        return ride;
     }
 
     /** Kept for callers that predate the meeting contact. */
@@ -273,6 +357,10 @@ public class Ride {
     public String paymentRef() { return paymentRef; }
     public void paymentRef(String ref) { this.paymentRef = ref == null ? "" : ref; }
     public String dropNote()     { return dropNote; }
+    public String spokenAs()     { return spokenAs; }
+    public void spokenAs(String words) { this.spokenAs = words == null ? "" : words.trim(); }
+    public java.time.Instant createdAt() { return createdAt; }
+    public int durationMinutes() { return durationMinutes; }
     public String rideType()     { return rideType; }
     public String boardingCode() { return boardingCode; }
     public RidePhase phase()     { return phase; }

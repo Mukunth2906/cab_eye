@@ -1,5 +1,6 @@
 package com.cabeye.backend.websocket;
 
+import com.cabeye.backend.camera.RideCameraService;
 import com.cabeye.backend.model.RideEvent;
 import com.cabeye.backend.service.RideService;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -53,6 +54,7 @@ public class RideWebSocketHandler extends TextWebSocketHandler {
     private final RideSessionManager sessions;
     private final ObjectMapper objectMapper;
     private final RideService rideService;
+    private final RideCameraService camera;
 
     /**
      * @param rideService {@code @Lazy} to break the construction cycle: {@code RideService}
@@ -61,10 +63,12 @@ public class RideWebSocketHandler extends TextWebSocketHandler {
      */
     public RideWebSocketHandler(RideSessionManager sessions,
                                 ObjectMapper objectMapper,
-                                @Lazy RideService rideService) {
+                                @Lazy RideService rideService,
+                                @Lazy RideCameraService camera) {
         this.sessions = sessions;
         this.objectMapper = objectMapper;
         this.rideService = rideService;
+        this.camera = camera;
     }
 
     // -------------------------------------------------------------------------------
@@ -132,6 +136,19 @@ public class RideWebSocketHandler extends TextWebSocketHandler {
         // spoken for two minutes.
         if ("PING".equals(incoming.type())) {
             sessions.sendTo(session, RideEvent.system("PONG", rideId, Map.of()));
+            return;
+        }
+
+        // The live camera. Frames go only to the driver, only while the rider has said yes,
+        // and are never logged or echoed back — see RideCameraService. Anything else a client
+        // sends under a CAMERA_ name is refused: starting and stopping the camera happens over
+        // REST, where the server can say no.
+        if ("CAMERA_FRAME".equals(incoming.type())) {
+            camera.relayFrame(rideId, userId, role, incoming.payload());
+            return;
+        }
+        if (incoming.type().startsWith("CAMERA_")) {
+            sessions.sendTo(session, RideEvent.system("ERROR", rideId, Map.of("reason", "camera_control_is_rest_only")));
             return;
         }
 

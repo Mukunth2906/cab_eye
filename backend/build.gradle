@@ -7,9 +7,9 @@
 //    Spring dependency-management ... 1.1.6
 //    Java source/target ............. 17       (compiled and run by Android Studio's JBR 21)
 //
-//  Only two starters are declared, exactly as the brief specifies: `web` and `websocket`.
-//  No Postgres, no Redis, no Kafka, no Spring Security — state lives in a
-//  ConcurrentHashMap inside RideSessionManager.
+//  Starters: `web`, `websocket` and `jdbc`. Durable data (accounts, memory, feedback, rides,
+//  payment orders) is in a database — H2 inside the backend on the laptop, PostgreSQL when
+//  deployed. Live connections are still a ConcurrentHashMap inside RideSessionManager.
 // =====================================================================================
 
 plugins {
@@ -39,6 +39,17 @@ dependencies {
     implementation 'org.springframework.boot:spring-boot-starter-web'
     implementation 'org.springframework.boot:spring-boot-starter-websocket'
 
+    // --- Database ---------------------------------------------------------------------
+    // Plain JDBC (JdbcTemplate + HikariCP). On the laptop the database is H2: it runs inside
+    // this backend and keeps everything in backend/data/cabeye.mv.db — nothing to install.
+    // When deployed, the same code talks to PostgreSQL (set CABEYE_DB_URL). Versions come from
+    // Spring Boot's managed dependency set.
+    implementation 'org.springframework.boot:spring-boot-starter-jdbc'
+    // Admin alert emails through Gmail (free, app password). Idle unless spring.mail.host is set.
+    implementation 'org.springframework.boot:spring-boot-starter-mail'
+    runtimeOnly 'com.h2database:h2'
+    runtimeOnly 'org.postgresql:postgresql'
+
     // --- Test (harmless; lets `gradlew test` succeed rather than error on no config) ---
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
     testRuntimeOnly   'org.junit.platform:junit-platform-launcher'
@@ -46,6 +57,11 @@ dependencies {
 
 tasks.named('test') {
     useJUnitPlatform()
+    // Tests never touch the real database in backend\data: any test that does not pick its own
+    // folder gets a throwaway one under build\.
+    systemProperty 'cabeye.data.dir', layout.buildDirectory.dir('test-data/default').get().asFile.path
+    // ...and never read your real secrets: a test must not log in as you or message your Telegram.
+    systemProperty 'cabeye.secrets.file', layout.buildDirectory.file('no-secrets.properties').get().asFile.path
 }
 
 // Make the console output UTF-8 on Windows so log arrows/box characters don't mojibake.

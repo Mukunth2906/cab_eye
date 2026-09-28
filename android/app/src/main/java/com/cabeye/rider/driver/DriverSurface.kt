@@ -5,6 +5,8 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.util.Log
+import android.graphics.Bitmap
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
@@ -35,6 +37,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -79,6 +84,11 @@ fun DriverSurface(
     onCancel: () -> Unit,
     onMessage: (String) -> Unit,
     onSettings: () -> Unit,
+    driverName: String = "",
+    onProfile: () -> Unit = {},
+    cameraFrame: Bitmap? = null,
+    onRequestCamera: () -> Unit = {},
+    onStopCamera: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val palette = LocalPalette.current
@@ -95,7 +105,7 @@ fun DriverSurface(
                 .padding(horizontal = 20.dp, vertical = 28.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            DriverHeader(uiState.connected, onSettings)
+            DriverHeader(uiState.connected, driverName, onProfile, onSettings)
 
             Spacer(Modifier.height(16.dp))
 
@@ -104,9 +114,14 @@ fun DriverSurface(
                 is DriverState.Online -> OnlineScreen(state, onGoOffline)
                 is DriverState.Request -> RequestScreen(state, onAccept, onDecline)
                 is DriverState.Navigating -> NavigatingScreen(
-                    state, uiState.lastPresetSent, onPreset, onBeacon, onLocation, onArrived, onCancel, onMessage
+                    state, uiState.lastPresetSent, onPreset, onBeacon, onLocation, onArrived, onCancel, onMessage,
+                    camera = { RiderViewPanel(uiState.camera, cameraFrame, onRequestCamera, onStopCamera) }
                 )
-                is DriverState.Arrived -> ArrivedScreen(state, onConfirmSeated, onCancel)
+                is DriverState.Arrived -> ArrivedScreen(
+                    state, onConfirmSeated, onCancel,
+                    camera = { RiderViewPanel(uiState.camera, cameraFrame, onRequestCamera, onStopCamera) },
+                    onMessage = onMessage
+                )
                 is DriverState.Seated -> SeatedScreen(onStartTrip)
                 is DriverState.InTrip -> InTripScreen(state, onComplete, onMessage)
                 is DriverState.Complete -> CompleteScreen(state, onFinish)
@@ -130,7 +145,7 @@ fun DriverSurface(
 // =====================================================================================
 
 @Composable
-private fun DriverHeader(connected: Boolean, onSettings: () -> Unit) {
+private fun DriverHeader(connected: Boolean, driverName: String, onProfile: () -> Unit, onSettings: () -> Unit) {
     val palette = LocalPalette.current
 
     Row(
@@ -138,11 +153,21 @@ private fun DriverHeader(connected: Boolean, onSettings: () -> Unit) {
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween
     ) {
-        Text(
-            text = "DRIVER",
-            style = MaterialTheme.typography.labelLarge,
-            color = palette.muted
-        )
+        // The signed-in driver's name doubles as the way into their profile.
+        Button(
+            onClick = onProfile,
+            shape = RoundedCornerShape(14.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = palette.background,
+                contentColor = palette.muted
+            ),
+            modifier = Modifier.border(2.dp, palette.outline, RoundedCornerShape(14.dp))
+        ) {
+            Text(
+                text = if (driverName.isBlank()) "DRIVER" else "● $driverName",
+                style = MaterialTheme.typography.bodyMedium
+            )
+        }
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
                 // The driver can see this, so unlike the rider's side it is shown and never
@@ -255,13 +280,17 @@ private fun NavigatingScreen(
     onLocation: (Int, Float) -> Unit,
     onArrived: () -> Unit,
     onCancel: () -> Unit,
-    onMessage: (String) -> Unit
+    onMessage: (String) -> Unit,
+    camera: @Composable () -> Unit = {}
 ) {
     val palette = LocalPalette.current
 
     // Still showing. The badge is on the request screen AND this one, because this is where
     // the driver is deciding how to approach the kerb and who they are looking for.
     if (state.visuallyImpaired) ImpairedBadge()
+
+    // Can't spot them? Ask to see what their phone's camera sees.
+    camera()
 
     Spacer(Modifier.height(20.dp))
     Text("Navigate to pickup", style = MaterialTheme.typography.headlineMedium, color = palette.onBackground)
@@ -398,7 +427,9 @@ private const val TAG = "CabEye.Driver"
 private fun ArrivedScreen(
     state: DriverState.Arrived,
     onConfirmSeated: () -> Unit,
-    onCancel: () -> Unit
+    onCancel: () -> Unit,
+    camera: @Composable () -> Unit = {},
+    onMessage: (String) -> Unit = {}
 ) {
     val palette = LocalPalette.current
 
@@ -447,15 +478,125 @@ private fun ArrivedScreen(
             color = palette.confirm,
             textAlign = TextAlign.Center
         )
+    } else {
+        // Still looking for them at the kerb: the camera and a message stay one tap away.
+        camera()
+        Spacer(Modifier.height(16.dp))
+        MessageComposer(onMessage)
     }
 
     Spacer(Modifier.height(32.dp))
 
     // The gate. Not "start trip" — this screen cannot start a trip, and neither can the server
-    // until this has happened.
-    DriverButton("PASSENGER IS SEATED", palette.confirm, onClick = onConfirmSeated)
+    // until this has happened. And this cannot happen until the passenger's phone has
+    // confirmed the code: the server refuses it, so the screen says so up front.
+    if (!state.codeConfirmed) {
+        Text(
+            "Waiting for your passenger's phone to confirm the code. Say it clearly, close to their phone.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = palette.clarify,
+            textAlign = TextAlign.Center
+        )
+        Spacer(Modifier.height(12.dp))
+    }
+    DriverButton("PASSENGER IS SEATED", if (state.codeConfirmed) palette.confirm else palette.muted, onClick = onConfirmSeated)
     Spacer(Modifier.height(12.dp))
     DriverButton("Cancel ride", palette.danger, onClick = onCancel)
+}
+
+// =====================================================================================
+//  The passenger's camera
+// =====================================================================================
+
+/**
+ * "See your passenger's view": the passenger's back camera, shown live, to find them.
+ *
+ * Only a request button until the passenger says yes on their own phone — this screen can
+ * ask, never switch it on. It goes off by itself when the code is confirmed, the passenger is
+ * seated, after three minutes, or when either side stops it.
+ */
+@Composable
+private fun RiderViewPanel(
+    camera: DriverCamera,
+    frame: Bitmap?,
+    onRequest: () -> Unit,
+    onStop: () -> Unit
+) {
+    val palette = LocalPalette.current
+    Spacer(Modifier.height(20.dp))
+
+    when (camera) {
+        DriverCamera.OFF, DriverCamera.DECLINED -> {
+            DriverButton("SEE PASSENGER'S VIEW", palette.listening, onClick = onRequest)
+            Spacer(Modifier.height(6.dp))
+            Text(
+                if (camera == DriverCamera.DECLINED) "They didn't share it. You can ask again, or send a message."
+                else "Can't spot them? Ask to see what their phone's camera sees.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = palette.muted,
+                textAlign = TextAlign.Center
+            )
+        }
+
+        DriverCamera.ASKING -> {
+            Text(
+                "Asking your passenger…",
+                style = MaterialTheme.typography.bodyLarge,
+                color = palette.clarify,
+                textAlign = TextAlign.Center
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "Their phone is asking them by voice. Nothing is shown until they say yes.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = palette.muted,
+                textAlign = TextAlign.Center
+            )
+        }
+
+        DriverCamera.LIVE -> {
+            Text(
+                "● LIVE — your passenger's view",
+                style = MaterialTheme.typography.labelLarge,
+                color = palette.danger,
+                textAlign = TextAlign.Center
+            )
+            Spacer(Modifier.height(8.dp))
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(3f / 4f)
+                    .border(3.dp, palette.danger, RoundedCornerShape(18.dp))
+                    .padding(3.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                if (frame != null) {
+                    Image(
+                        bitmap = frame.asImageBitmap(),
+                        contentDescription = "Live view from your passenger's camera",
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                } else {
+                    Text(
+                        "Waiting for the first picture…",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = palette.muted,
+                        textAlign = TextAlign.Center
+                    )
+                }
+            }
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "Not recorded. Turns off when the code is confirmed.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = palette.muted,
+                textAlign = TextAlign.Center
+            )
+            Spacer(Modifier.height(10.dp))
+            DriverButton("STOP CAMERA", palette.danger, onClick = onStop)
+        }
+    }
 }
 
 // =====================================================================================

@@ -22,7 +22,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  * {@code Status=SUCCESS} — exactly what a UPI app returns — must NOT produce CONFIRMED. If that
  * test ever goes green with "CONFIRMED", the app has started trusting the client about money.
  */
-@SpringBootTest
+@SpringBootTest(properties = "cabeye.data.dir=build/test-data/payment-${random.uuid}")
 @AutoConfigureMockMvc
 class PaymentEndpointTest {
 

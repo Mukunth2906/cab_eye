@@ -170,6 +170,40 @@ public class RideSessionManager {
     }
 
     /**
+     * Sends an event only to the sessions on a ride that connected with the given role.
+     *
+     * <p>Used for the live camera: the rider's frames go to the driver and nowhere else — not
+     * back to the rider, and never into the ride's event log.
+     *
+     * @return number of sessions the event was written to
+     */
+    public int sendToRole(String rideId, String role, RideEvent event) {
+        Set<WebSocketSession> room = rooms.get(rideId);
+        if (room == null || room.isEmpty()) return 0;
+        final String json;
+        try {
+            json = objectMapper.writeValueAsString(event);
+        } catch (IOException e) {
+            log.error("Could not serialise event type={} for ride={}", event.type(), rideId, e);
+            return 0;
+        }
+        int delivered = 0;
+        for (WebSocketSession session : room) {
+            if (!session.isOpen() || !role.equals(session.getAttributes().get(ATTR_ROLE))) continue;
+            try {
+                synchronized (session) {
+                    session.sendMessage(new TextMessage(json));
+                }
+                delivered++;
+            } catch (IOException e) {
+                log.warn("Send failed on ride={} session={}, dropping it", rideId, session.getId(), e);
+                room.remove(session);
+            }
+        }
+        return delivered;
+    }
+
+    /**
      * Sends an event to a single session (a direct reply rather than a broadcast).
      *
      * @param session target session
