@@ -3,6 +3,7 @@ package com.cabeye.backend.controller;
 import com.cabeye.backend.payment.MockPaymentGateway;
 import com.cabeye.backend.payment.MockPaymentGateway.PaymentException;
 import com.cabeye.backend.payment.CheckoutPage;
+import com.cabeye.backend.payment.RazorpayCheckoutPage;
 import com.cabeye.backend.payment.PaymentOrder;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.MediaType;
@@ -31,6 +32,10 @@ import java.util.function.Supplier;
  * </pre>
  *
  * The older {@code /rides/{id}/payment} endpoints in {@link RideController} are unchanged.
+ *
+ * <p>When Razorpay keys are configured, the checkout page loads Razorpay Standard Checkout
+ * instead of the sandbox form. The simulate endpoint still works for testing, and the
+ * Razorpay callback endpoint verifies the signature before marking PAID.
  */
 @RestController
 @CrossOrigin(originPatterns = "*")
@@ -84,11 +89,24 @@ public class PaymentController {
     // ===================================================================================
 
     @GetMapping(value = "/pay/{orderId}", produces = "text/html;charset=UTF-8")
-    public ResponseEntity<String> checkoutPage(@PathVariable String orderId) {
+    public ResponseEntity<String> checkoutPage(@PathVariable String orderId,
+                                                HttpServletRequest request) {
         try {
-            return html(200, CheckoutPage.checkout(gateway.open(orderId)));
+            PaymentOrder order = gateway.open(orderId);
+            if (gateway.isRazorpayEnabled() && !order.razorpayOrderId().isEmpty()) {
+                return html(200, RazorpayCheckoutPage.checkout(
+                        order,
+                        order.razorpayOrderId(),
+                        gateway.razorpay().keyId(),
+                        baseUrl(request),
+                        gateway.razorpay().isTestMode()));
+            }
+            return html(200, CheckoutPage.checkout(order));
         } catch (PaymentException e) {
-            return html(404, CheckoutPage.notFound(e.getMessage()));
+            boolean rzp = gateway.isRazorpayEnabled();
+            return html(404, rzp
+                    ? RazorpayCheckoutPage.notFound(e.getMessage(), gateway.razorpay().isTestMode())
+                    : CheckoutPage.notFound(e.getMessage()));
         }
     }
 
@@ -108,6 +126,57 @@ public class PaymentController {
                     .map(o -> html(409, CheckoutPage.result(o)))
                     .orElseGet(() -> html(404, CheckoutPage.notFound(e.getMessage())));
         }
+    }
+
+    // ===================================================================================
+    //  Razorpay callback (after the Razorpay checkout modal completes)
+    // ===================================================================================
+
+    /**
+     * Razorpay Standard Checkout posts here after a successful payment. The checkout page's
+     * {@code handler} function builds a form with the three Razorpay fields and submits it.
+     *
+     * <p>This endpoint verifies the signature, marks the order PAID, and renders a receipt.
+     * If verification fails, it shows an error and tells the rider to try again.
+     */
+    @PostMapping(value = "/pay/{orderId}/razorpay-callback", produces = "text/html;charset=UTF-8")
+    public ResponseEntity<String> razorpayCallback(
+            @PathVariable String orderId,
+            @RequestParam(name = "razorpay_payment_id", defaultValue = "") String paymentId,
+            @RequestParam(name = "razorpay_order_id", defaultValue = "") String rzpOrderId,
+            @RequestParam(name = "razorpay_signature", defaultValue = "") String signature) {
+        boolean testMode = gateway.isRazorpayEnabled() && gateway.razorpay().isTestMode();
+        try {
+            PaymentOrder order = gateway.verifyAndPay(orderId, paymentId, rzpOrderId, signature);
+            return html(200, RazorpayCheckoutPage.paid(order, testMode));
+        } catch (PaymentException e) {
+            return gateway.find(orderId)
+                    .map(o -> {
+                        if (o.status() == PaymentOrder.Status.PAID) {
+                            return html(200, RazorpayCheckoutPage.paid(o, testMode));
+                        }
+                        return html(409, RazorpayCheckoutPage.failed(o, e.getMessage(), testMode));
+                    })
+                    .orElseGet(() -> html(404, RazorpayCheckoutPage.notFound(e.getMessage(), testMode)));
+        }
+    }
+
+    /**
+     * JSON endpoint for the Razorpay callback (used by the Android app's in-app flow).
+     * The app posts the three Razorpay fields after biometric auth + Razorpay checkout.
+     */
+    @PostMapping("/payments/{orderId}/razorpay-verify")
+    public ResponseEntity<?> razorpayVerify(
+            @PathVariable String orderId,
+            @RequestBody(required = false) Map<String, Object> body,
+            HttpServletRequest request) {
+        Map<String, Object> b = body == null ? Map.of() : body;
+        String paymentId = String.valueOf(b.getOrDefault("razorpay_payment_id", ""));
+        String rzpOrderId = String.valueOf(b.getOrDefault("razorpay_order_id", ""));
+        String signature = String.valueOf(b.getOrDefault("razorpay_signature", ""));
+        return json(() -> gateway.view(
+                gateway.verifyAndPay(orderId, paymentId, rzpOrderId, signature),
+                baseUrl(request)));
     }
 
     // ===================================================================================

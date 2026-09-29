@@ -1488,8 +1488,12 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                             phase = PaymentPhase.AWAITING,
                             amountRupees = order.amountRupees,
                             orderId = order.orderId,
+                            checkoutUrl = order.checkoutUrl,
                             method = "UPI",
-                            message = "Tap Pay or say \"pay\""
+                            message = if (order.isRazorpay)
+                                "Tap Pay to open Razorpay checkout"
+                            else
+                                "Tap Pay or say \"pay\""
                         )
                     )
                     val fare = if (announceFare) "Your fare is ${order.amountRupees} rupees. " else ""
@@ -1579,6 +1583,35 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     /** Sends the payment to the gateway and speaks what the gateway decided. */
     private fun confirmPayment() {
         val current = uiState.payment ?: return
+
+        // Razorpay flow: open the checkout URL in the browser. The Razorpay checkout
+        // page handles the actual payment (UPI, card, netbanking). The order watcher
+        // detects the result.
+        if (current.checkoutUrl.isNotBlank() && current.checkoutUrl.contains("/pay/")) {
+            setPayment(current.copy(
+                phase = PaymentPhase.PROCESSING,
+                message = "Opening Razorpay checkout…"
+            ))
+            speak("Opening payment page. Complete the payment there.", NarrationTier.INTERRUPT)
+            try {
+                val intent = android.content.Intent(
+                    android.content.Intent.ACTION_VIEW,
+                    android.net.Uri.parse(current.checkoutUrl)
+                )
+                intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                getApplication<android.app.Application>().startActivity(intent)
+            } catch (e: Exception) {
+                Log.w(TAG, "PAYMENT could not open checkout URL", e)
+                setPayment(current.copy(message = "Could not open payment page"))
+                speak("Could not open the payment page. Try again.", NarrationTier.INTERRUPT)
+                return
+            }
+            // Keep watching — the watcher will detect when Razorpay settles the order.
+            watchOrder(current.orderId)
+            return
+        }
+
+        // Sandbox mock flow: call the simulate endpoint directly.
         setPayment(current.copy(phase = PaymentPhase.PROCESSING, message = "Processing payment…"))
         speak("Processing.", NarrationTier.INTERRUPT)
 

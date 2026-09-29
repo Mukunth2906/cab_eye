@@ -233,7 +233,7 @@ class RideApi(private val settings: AppSettings, private val auth: AuthStore) {
             .post(body.toString().toRequestBody(JSON))
             .build()
         return orderResult(call(request))
-    }
+    }\r\n\r\n    /**\r\n     * Verifies a Razorpay payment after the Razorpay checkout completes.\r\n     * Posts the three Razorpay fields to the server for HMAC signature verification.\r\n     * Only used when the server has Razorpay enabled; falls back to [simulatePayment] otherwise.\r\n     */\r\n    suspend fun razorpayVerify(\r\n        orderId: String,\r\n        razorpayPaymentId: String,\r\n        razorpayOrderId: String,\r\n        razorpaySignature: String\r\n    ): ApiResult<PaymentOrder> {\r\n        val body = JSONObject()\r\n            .put("razorpay_payment_id", razorpayPaymentId)\r\n            .put("razorpay_order_id", razorpayOrderId)\r\n            .put("razorpay_signature", razorpaySignature)\r\n        val request = Request.Builder()\r\n            .url("${base()}/payments/$orderId/razorpay-verify")\r\n            .post(body.toString().toRequestBody(JSON))\r\n            .build()\r\n        return orderResult(call(request))\r\n    }
 
     /**
      * Maps a gateway reply. On a refusal the server sends `{"error": "..."}` already phrased

@@ -50,6 +50,12 @@ dependencies {
     runtimeOnly 'com.h2database:h2'
     runtimeOnly 'org.postgresql:postgresql'
 
+    // --- Razorpay (real payment gateway) -----------------------------------------------
+    // Used when cabeye.razorpay.key-id/key-secret are set. Falls back to the sandbox mock
+    // when they are blank. The SDK handles order creation, signature verification and the
+    // REST calls so we don't hand-roll auth headers.
+    implementation 'com.razorpay:razorpay-java:1.4.10'
+
     // --- Test (harmless; lets `gradlew test` succeed rather than error on no config) ---
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
     testRuntimeOnly   'org.junit.platform:junit-platform-launcher'

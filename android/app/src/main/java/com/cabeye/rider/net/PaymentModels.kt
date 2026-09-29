@@ -25,8 +25,13 @@ data class PaymentOrder(
     val failureReason: String,
     val upiUri: String,
     val checkoutUrl: String,
-    val testMode: Boolean
+    val testMode: Boolean,
+    /** Razorpay order ID, present when the server uses Razorpay. Empty for sandbox mock. */
+    val razorpayOrderId: String = ""
 ) {
+    /** True when the server is using the real Razorpay gateway for this order. */
+    val isRazorpay: Boolean get() = razorpayOrderId.isNotBlank()
+
     companion object {
         fun parse(json: String): PaymentOrder? = runCatching {
             val o = JSONObject(json)
@@ -43,7 +48,8 @@ data class PaymentOrder(
                 failureReason = o.optString("failureReason"),
                 upiUri = o.optString("upiUri"),
                 checkoutUrl = o.optString("checkoutUrl"),
-                testMode = o.optBoolean("testMode", true)
+                testMode = o.optBoolean("testMode", true),
+                razorpayOrderId = o.optString("razorpayOrderId", "")
             )
         }.getOrNull()
 
