@@ -14,17 +14,15 @@ import java.util.Locale
 /**
  * The default speech path: Android's on-device [SpeechRecognizer] with streaming partials.
  *
- * ## Offline preference, not offline requirement
- * `EXTRA_PREFER_OFFLINE` asks the recogniser to use its on-device model. It is a
- * *preference* — if the language pack has not been downloaded, the system falls back to the
- * network rather than failing.
+ * ## Online first, on-device as the fallback
+ * Android's recogniser service is asked for online recognition by default: in the demo the
+ * on-device model misheard phone numbers, codes and ratings far too often for Indian English.
+ * Audio goes to the phone's own recognition service (Google), never to the Cab Eye backend.
+ * If the network fails, the session is retried silently with `EXTRA_PREFER_OFFLINE`, and the
+ * rest of the process stays on-device.
  *
- * That is the correct trade for this app. API 31+ also offers
- * `createOnDeviceSpeechRecognizer`, which refuses to fall back, but it returns
- * `ERROR_LANGUAGE_UNAVAILABLE` on any phone where the user has never downloaded offline
- * speech — and an app that cannot hear at all is far worse for a blind rider than one that
- * occasionally takes a network round trip. The strict recogniser is available via
- * [strictOnDevice] for measurement, and is not the default.
+ * API 31+ also offers `createOnDeviceSpeechRecognizer`, which never goes online. It is
+ * available via [strictOnDevice] for measurement, and is not the default.
  *
  * ## Threading
  * [SpeechRecognizer] must be created and driven from the main thread. Every entry point
@@ -92,6 +90,17 @@ class OnDeviceSpeechInput(
      */
     private var offlinePreferenceFailed = false
 
+    /**
+     * Online recognition first. Google's server recogniser is markedly better than the
+     * on-device model at Indian-English digits and place names — found in the demo, where
+     * phone numbers and ratings were misheard offline. The on-device model is the fallback
+     * when the network fails, not the default.
+     */
+    private var preferOffline = false
+
+    /** One silent switch to the on-device model per session when the network fails. */
+    private var networkFallbackUsed = false
+
     /** Language currently being asked for. Degrades from en-IN to the device default. */
     private var activeLanguage: String = PREFERRED_LANGUAGE
 
@@ -117,6 +126,7 @@ class OnDeviceSpeechInput(
         // Reset here rather than in startOnMain, which the internal retries also call —
         // otherwise a retry would refresh its own budget and could loop.
         transientRetryUsed = false
+        networkFallbackUsed = false
         main.post { startOnMain(listener) }
     }
 
@@ -159,11 +169,12 @@ class OnDeviceSpeechInput(
             // Streaming partials are what make the interaction feel immediate rather than
             // batch — the surface updates while the rider is still talking.
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-            // Only asked for while it is still plausible. See [offlinePreferenceFailed].
-            if (!offlinePreferenceFailed) {
+            // Online first; on-device only after a network failure. See [preferOffline].
+            if (preferOffline && !offlinePreferenceFailed) {
                 putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
             }
-            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+            // Five guesses, not one: the listener picks the first that fits its question.
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
             putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, appContext.packageName)
 
             // Press-and-hold means the rider decides when they have finished, so the
@@ -241,7 +252,7 @@ class OnDeviceSpeechInput(
                 Log.w(TAG, "No model for $activeLanguage; falling back to device locale $deviceLanguage")
                 activeLanguage = deviceLanguage
             }
-            !offlinePreferenceFailed -> {
+            preferOffline && !offlinePreferenceFailed -> {
                 offlinePreferenceFailed = true
                 Log.w(TAG, "No offline model for $activeLanguage; retrying over the network")
             }
@@ -299,18 +310,19 @@ class OnDeviceSpeechInput(
 
         override fun onResults(results: Bundle?) {
             listening = false
-            val text = results
+            val alternatives = results
                 ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                ?.firstOrNull()
-                ?.trim()
                 .orEmpty()
+                .map { it.trim() }
+                .filter { it.isNotBlank() }
+                .distinct()
 
             settle {
-                if (text.isBlank()) {
+                if (alternatives.isEmpty()) {
                     listener?.onError(SpeechError.NO_MATCH)
                 } else {
-                    Log.d(TAG, "final=\"$text\"")
-                    listener?.onFinal(text)
+                    Log.i(TAG, "final=${alternatives.joinToString(" | ") { "\"$it\"" }}")
+                    listener?.onFinalAlternatives(alternatives)
                 }
             }
         }
@@ -323,6 +335,24 @@ class OnDeviceSpeechInput(
             // not a fact they can act on mid-sentence.
             if (error == ERROR_LANGUAGE_UNAVAILABLE || error == ERROR_LANGUAGE_NOT_SUPPORTED) {
                 if (tryFallback()) return
+            }
+
+            // No network: switch to the on-device model and retry once, silently. From then on
+            // this process prefers on-device, until the app restarts.
+            if ((error == SpeechRecognizer.ERROR_NETWORK || error == SpeechRecognizer.ERROR_NETWORK_TIMEOUT) &&
+                !preferOffline && !networkFallbackUsed
+            ) {
+                val current = listener
+                if (current != null) {
+                    networkFallbackUsed = true
+                    preferOffline = true
+                    Log.w(TAG, "Network recognition failed; retrying on-device")
+                    main.postDelayed({
+                        sessionSettled = false
+                        startOnMain(current)
+                    }, FALLBACK_DELAY_MS)
+                    return
+                }
             }
 
             // Transient service disconnect — retry once, silently.

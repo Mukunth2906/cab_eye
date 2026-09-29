@@ -48,7 +48,26 @@ public class WebSocketConfig implements WebSocketConfigurer {
      */
     @org.springframework.context.annotation.Bean
     public ServletServerContainerFactoryBean createWebSocketContainer() {
-        ServletServerContainerFactoryBean container = new ServletServerContainerFactoryBean();
+        // Under MockMvc tests there is no real server, so the servlet context has no WebSocket
+        // container and the stock bean fails with "A ServletContext is required ...", taking
+        // the whole test context down. Apply the limits only when a real container exists.
+        ServletServerContainerFactoryBean container = new ServletServerContainerFactoryBean() {
+            private jakarta.servlet.ServletContext servletContext;
+
+            @Override
+            public void setServletContext(jakarta.servlet.ServletContext servletContext) {
+                this.servletContext = servletContext;
+                super.setServletContext(servletContext);
+            }
+
+            @Override
+            public void afterPropertiesSet() {
+                if (servletContext != null
+                        && servletContext.getAttribute(jakarta.websocket.server.ServerContainer.class.getName()) != null) {
+                    super.afterPropertiesSet();
+                }
+            }
+        };
         container.setMaxTextMessageBufferSize(64 * 1024);
         container.setMaxBinaryMessageBufferSize(64 * 1024);
         container.setMaxSessionIdleTimeout(10L * 60L * 1000L); // 10 minutes

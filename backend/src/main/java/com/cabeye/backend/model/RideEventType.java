@@ -75,7 +75,15 @@ public enum RideEventType {
     TRIP_COMPLETED,
 
     /** Ride cancelled by either party. Tier 0. */
-    RIDE_CANCELLED;
+    RIDE_CANCELLED,
+
+    /**
+     * The fare's payment status changed (REPORTED, CONFIRMED or FAILED). Deliberately after
+     * RIDE_CANCELLED: it is not a phase change, and a ride that is COMPLETED stays COMPLETED
+     * while its payment settles. Payload: {@code status}, {@code paymentRef},
+     * {@code fareRupees}, and {@code reason} on failure.
+     */
+    PAYMENT_UPDATED;
 
     /** @return true when {@code name} is a member of this enum, case-sensitively. */
     public static boolean isLifecycleType(String name) {

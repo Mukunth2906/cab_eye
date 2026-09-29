@@ -109,6 +109,9 @@ class RideSocket(
 
         /** Keepalive interval. OkHttp sends a real WebSocket ping frame. */
         const val PING_INTERVAL_SECONDS = 20L
+
+        /** Unsent bytes above which a camera frame is skipped rather than queued. */
+        const val MAX_FRAME_BACKLOG_BYTES = 120_000L
     }
 
     /**
@@ -141,6 +144,21 @@ class RideSocket(
 
     /** Every de-duplicated ride event, in arrival order. Collected by the view models. */
     val events: Flow<RideEvent> = _events.asSharedFlow()
+
+    /**
+     * Live-camera pictures arriving for the driver, as base64 JPEG.
+     *
+     * Kept off [events] entirely. Frames arrive several times a second; on the event stream
+     * they would fill its drop-oldest buffer and could push out an arrival, and their ids would
+     * evict real ones from [seenEventIds] and let a replay repeat something. Only the newest
+     * picture matters, so this keeps one and drops the rest.
+     */
+    private val _frames = MutableSharedFlow<String>(
+        replay = 0,
+        extraBufferCapacity = 1,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val frames: Flow<String> = _frames.asSharedFlow()
 
     private val _state = MutableStateFlow<ConnectionState>(ConnectionState.Idle)
     val state: StateFlow<ConnectionState> = _state.asStateFlow()
@@ -330,6 +348,13 @@ class RideSocket(
                 return
             }
 
+            // A camera picture: straight to [frames], never through de-duplication or seq.
+            if (event.type == RideEventType.CAMERA_FRAME) {
+                val jpeg = event.string("jpeg")
+                if (jpeg.isNotEmpty()) _frames.tryEmit(jpeg)
+                return
+            }
+
             // Sequence tracking happens for every event, including duplicates — a replayed
             // event still proves the server has at least that many, and losing the position
             // would make the next reconnect re-request material already handled.
@@ -423,6 +448,25 @@ class RideSocket(
      * and every command in this app that matters ([RideApi]) goes over REST precisely so it can
      * fail loudly instead.
      */
+    /**
+     * Sends one camera picture, or skips it when the connection is backed up.
+     *
+     * A picture that cannot go now is worthless a second later, so this never queues: if more
+     * than [MAX_FRAME_BACKLOG_BYTES] is still waiting to leave the phone, the frame is dropped
+     * and the next, fresher one gets its chance. On a slow network the driver sees fewer
+     * pictures rather than an ever-growing delay.
+     *
+     * @return true when the frame was handed to the socket
+     */
+    fun sendFrame(jpegBase64: String, n: Int): Boolean {
+        val ws = socket ?: return false
+        if (ws.queueSize() > MAX_FRAME_BACKLOG_BYTES) return false
+        val json = org.json.JSONObject()
+            .put("type", RideEventType.CAMERA_FRAME.name)
+            .put("payload", org.json.JSONObject().put("jpeg", jpegBase64).put("n", n))
+        return runCatching { ws.send(json.toString()) }.getOrDefault(false)
+    }
+
     fun send(type: String, payload: Map<String, Any> = emptyMap()): Boolean {
         val ws = socket ?: return false
         val json = org.json.JSONObject()

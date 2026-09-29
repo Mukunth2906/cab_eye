@@ -1,8 +1,11 @@
 package com.cabeye.backend.controller;
 
+import com.cabeye.backend.account.Account;
+import com.cabeye.backend.auth.CurrentAccount;
 import com.cabeye.backend.model.Ride;
 import com.cabeye.backend.model.RideEvent;
 import com.cabeye.backend.service.RideService;
+import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.ResponseEntity;
@@ -36,8 +39,9 @@ import java.util.Map;
  *       "everything is fine".</li>
  * </ul>
  *
- * <p>{@code X-Role} and {@code X-User-Id} are read but not enforced. There is no auth in this
- * MVP, per the brief; the headers exist so the logs can tell the two apps apart.
+ * <p>Identity: when the request carries a valid sign-in token, the account behind it is the
+ * rider who books or the driver who accepts, and {@code X-User-Id} is ignored. Without a token
+ * the header is still honoured, so the browser test page and the older tests keep working.
  */
 @RestController
 @CrossOrigin(originPatterns = "*")
@@ -66,8 +70,11 @@ public class RideController {
      */
     @PostMapping
     public ResponseEntity<Ride.Snapshot> create(
-            @RequestHeader(value = "X-User-Id", required = false, defaultValue = "rider-1") String riderId,
-            @RequestBody Map<String, Object> body) {
+            @RequestHeader(value = "X-User-Id", required = false, defaultValue = "rider-1") String headerRiderId,
+            @RequestBody Map<String, Object> body,
+            HttpServletRequest request) {
+
+        String riderId = CurrentAccount.idOr(request, headerRiderId);
 
         String destination = str(body.get("destination"), "Unknown");
         String destinationAddress = str(body.get("destinationAddress"), "");
@@ -86,6 +93,8 @@ public class RideController {
         Ride ride = rides.create(riderId, destination, destinationAddress,
                 destinationLatitude, destinationLongitude, destinationPlaceId,
                 pickupLatitude, pickupLongitude, contactName, contactPhone, dropNote, rideType);
+        // What the rider said, for their memory. Optional; older clients never send it.
+        ride.spokenAs(str(body.get("spokenAs"), ""));
         return ResponseEntity.ok(ride.snapshot());
     }
 
@@ -129,6 +138,47 @@ public class RideController {
     }
 
     // ===================================================================================
+    //  Payment
+    // ===================================================================================
+
+    /**
+     * The rider's app relaying what its UPI app claimed.
+     *
+     * <p>Stored as REPORTED, never CONFIRMED — see {@link RideService#reportPayment}.
+     */
+    @PostMapping("/{rideId}/payment")
+    public ResponseEntity<Ride.Snapshot> reportPayment(
+            @PathVariable String rideId,
+            @RequestBody(required = false) Map<String, Object> body) {
+
+        Map<String, Object> b = body == null ? Map.of() : body;
+        return respond(rides.reportPayment(
+                rideId,
+                str(b.get("status"), "SUBMITTED"),
+                str(b.get("txnRef"), "")));
+    }
+
+    /** Polled by the rider's app until the payment status settles, so it can speak the result. */
+    @GetMapping("/{rideId}/payment")
+    public ResponseEntity<Ride.Snapshot> paymentStatus(@PathVariable String rideId) {
+        return rides.find(rideId)
+                .map(ride -> ResponseEntity.ok(ride.snapshot()))
+                .orElseGet(() -> ResponseEntity.notFound().build());
+    }
+
+    /**
+     * Stands in for the payment provider webhook that does not exist on the deep-link path.
+     *
+     * <p>Kept as an explicit endpoint so the CONFIRMED transition is demonstrable and so it is
+     * obvious in the code that nothing produces it automatically. A real integration replaces
+     * this with a signed webhook from the provider.
+     */
+    @PostMapping("/{rideId}/payment/confirm")
+    public ResponseEntity<Ride.Snapshot> confirmPayment(@PathVariable String rideId) {
+        return respond(rides.confirmPayment(rideId));
+    }
+
+    // ===================================================================================
     //  Driver
     // ===================================================================================
 
@@ -147,22 +197,47 @@ public class RideController {
      * @return 409 when another driver took it first — a real outcome, not an error
      */
     @PostMapping("/{rideId}/accept")
-    public ResponseEntity<Ride.Snapshot> accept(
+    public ResponseEntity<?> accept(
             @PathVariable String rideId,
-            @RequestHeader(value = "X-User-Id", required = false, defaultValue = "driver-1") String driverId,
-            @RequestBody(required = false) Map<String, Object> body) {
+            @RequestHeader(value = "X-User-Id", required = false, defaultValue = "driver-1") String headerDriverId,
+            @RequestBody(required = false) Map<String, Object> body,
+            HttpServletRequest request) {
 
         Map<String, Object> b = body == null ? Map.of() : body;
+        // A signed-in driver's profile is the source of truth for what the rider is told to
+        // look for. The body is only a fallback for the unauthenticated test page.
+        Account driver = CurrentAccount.of(request).orElse(null);
+        Account.DriverProfile profile = driver == null ? null : driver.driver;
+        String driverId = driver == null ? headerDriverId : driver.id;
+
+        if (profile != null && profile.suspended) {
+            log.warn("ACCEPT_REFUSED ride={} driver={} (suspended by admin)", rideId, driverId);
+            return ResponseEntity.status(403).body(Map.of("error",
+                    "Your account is paused by Cab Eye support, so you can't take rides right now. Please contact support."));
+        }
+
         return rides.assign(
                         rideId,
                         driverId,
-                        str(b.get("driverName"), "Driver"),
-                        str(b.get("vehicleModel"), "Auto"),
-                        str(b.get("vehiclePlate"), "TN 00 AA 0000"),
-                        str(b.get("driverPhone"), ""),
+                        firstNonBlank(driver == null ? null : driver.name, str(b.get("driverName"), "Driver")),
+                        firstNonBlank(vehicleDescription(profile), str(b.get("vehicleModel"), "Auto")),
+                        firstNonBlank(profile == null ? null : profile.vehiclePlate, str(b.get("vehiclePlate"), "TN 00 AA 0000")),
+                        firstNonBlank(driver == null ? null : driver.phone, str(b.get("driverPhone"), "")),
                         num(b.get("etaMinutes"), 4))
-                .map(ride -> ResponseEntity.ok(ride.snapshot()))
+                .<ResponseEntity<?>>map(ride -> ResponseEntity.ok(ride.snapshot()))
                 .orElseGet(() -> ResponseEntity.status(409).build());
+    }
+
+    /** "white Bajaj RE" — colour first, because that is what a helper on the street looks for. */
+    private static String vehicleDescription(Account.DriverProfile p) {
+        if (p == null || p.vehicleModel == null || p.vehicleModel.isBlank()) return null;
+        return (p.vehicleColour == null || p.vehicleColour.isBlank())
+                ? p.vehicleModel
+                : p.vehicleColour + " " + p.vehicleModel;
+    }
+
+    private static String firstNonBlank(String preferred, String fallback) {
+        return preferred == null || preferred.isBlank() ? fallback : preferred;
     }
 
     /** Driver started navigating to the pickup point. */
@@ -224,9 +299,15 @@ public class RideController {
 
     /** Driver confirms the passenger is physically in the vehicle. Gates {@link #start}. */
     @PostMapping("/{rideId}/seated")
-    public ResponseEntity<Ride.Snapshot> seated(
+    public ResponseEntity<?> seated(
             @PathVariable String rideId,
             @RequestHeader(value = "X-User-Id", required = false, defaultValue = "driver-1") String driverId) {
+        var ride = rides.find(rideId).orElse(null);
+        if (ride != null && !ride.phase().isTerminal() && !ride.codeConfirmed()) {
+            // 409 with the sentence the driver sees: say the code, near the passenger's phone.
+            return ResponseEntity.status(409).body(Map.of("error",
+                    "Your passenger's phone hasn't confirmed the code yet. Say the code clearly, close to their phone."));
+        }
         return respond(rides.passengerSeated(rideId, driverId));
     }
 

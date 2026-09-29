@@ -57,7 +57,24 @@ class RiderPreferences(context: Context) {
         get() = prefs.getBoolean(KEY_WELCOMED, false)
         set(value) = prefs.edit().putBoolean(KEY_WELCOMED, value).apply()
 
+    /**
+     * Whether the camera starts without asking when the driver requests it.
+     *
+     * Off by default: it is the rider's camera, and a blind rider cannot see what it shows.
+     * Turned on only by the rider saying "always" to the question, or by a helper in Settings.
+     */
+    var alwaysShareCamera: Boolean
+        get() = prefs.getBoolean(KEY_ALWAYS_CAMERA, false)
+        set(value) = prefs.edit().putBoolean(KEY_ALWAYS_CAMERA, value).apply()
+
+    /** The narrator's speed, 1.0 = normal. Changed by "speak slower" / "speak faster". */
+    var speechRate: Float
+        get() = prefs.getFloat(KEY_SPEECH_RATE, 1.0f)
+        set(value) = prefs.edit().putFloat(KEY_SPEECH_RATE, value).apply()
+
     private companion object {
+        const val KEY_SPEECH_RATE = "speech_rate"
+        const val KEY_ALWAYS_CAMERA = "always_share_camera"
         const val KEY_CITY = "active_city"
         const val KEY_THEME = "theme_choice"
         const val KEY_WELCOMED = "has_heard_welcome"

@@ -47,6 +47,12 @@ enum class HapticPattern(val timings: LongArray, val amplitudes: IntArray) {
     /** SOS raised. Three hard pulses. */
     SOS(longArrayOf(0, 120, 80, 120, 80, 120), intArrayOf(0, 255, 0, 255, 0, 255)),
 
+    /**
+     * The camera is still on. One very light tick every few seconds — felt, not heard, so it
+     * never reaches the microphone listening for the boarding code.
+     */
+    CAMERA_TICK(longArrayOf(0, 18), intArrayOf(0, 90)),
+
     /** Something went wrong. Short stutter, distinct from every success pattern. */
     ERROR(longArrayOf(0, 30, 40, 30, 40, 30), intArrayOf(0, 180, 0, 180, 0, 180))
 }

@@ -132,7 +132,16 @@ sealed interface DriverState {
     data class Complete(
         val rideId: String,
         val fareRupees: Int,
-        val durationMinutes: Int
+        val durationMinutes: Int,
+        /** NONE | REPORTED | CONFIRMED | FAILED, straight from the server. */
+        val paymentStatus: String = "NONE",
+        /** Bank reference once CONFIRMED. */
+        val paymentRef: String = "",
+        /**
+         * Sandbox checkout URL for the open payment order, shown as a QR code so a sighted
+         * companion can scan it and pay from their own phone. Blank until the order exists.
+         */
+        val checkoutUrl: String = ""
     ) : DriverState
 }
 
@@ -149,8 +158,26 @@ data class DriverUiState(
     val state: DriverState = DriverState.Offline,
     val connected: Boolean = false,
     val banner: String = "",
-    val lastPresetSent: String = ""
+    val lastPresetSent: String = "",
+    /** The passenger's live camera, for finding them at pickup. */
+    val camera: DriverCamera = DriverCamera.OFF
 )
+
+/**
+ * Where the "see the passenger's view" camera stands, from the driver's side.
+ *
+ * The driver can only ask. The passenger's phone asks them by voice, and nothing is shown
+ * here until they say yes.
+ */
+enum class DriverCamera {
+    OFF,
+    /** Asked; the passenger is being asked for consent. */
+    ASKING,
+    /** The passenger said yes; pictures are arriving. */
+    LIVE,
+    /** The passenger said no, or did not answer. The driver may ask again. */
+    DECLINED
+}
 
 /**
  * The canned position phrases.

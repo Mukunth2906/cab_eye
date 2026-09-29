@@ -10,6 +10,16 @@ import androidx.lifecycle.viewModelScope
 import com.cabeye.rider.audio.Earcon
 import com.cabeye.rider.audio.Headphones
 import com.cabeye.rider.audio.NarrationTier
+import com.cabeye.rider.camera.CameraStreamer
+import com.cabeye.rider.dialogue.CameraConsent
+import com.cabeye.rider.dialogue.ClarifyAnswer
+import com.cabeye.rider.dialogue.FeedbackParser
+import com.cabeye.rider.dialogue.NextJourneyChoice
+import com.cabeye.rider.dialogue.SpokenTime
+import com.cabeye.rider.schedule.ScheduledRide
+import com.cabeye.rider.state.FeedbackStep
+import com.cabeye.rider.state.NextStep
+import java.time.ZonedDateTime
 import com.cabeye.rider.dialogue.RecoveryLadder
 import com.cabeye.rider.intent.Classification
 import com.cabeye.rider.intent.Classifier
@@ -24,7 +34,12 @@ import com.cabeye.rider.net.RideEvent
 import com.cabeye.rider.net.RideEventType
 import com.cabeye.rider.net.RidePhase
 import com.cabeye.rider.net.RideSnapshot
+import com.cabeye.rider.net.PaymentOrder
+import com.cabeye.rider.net.PaymentOrderStatus
+import com.cabeye.rider.net.UpiResponse
+import com.cabeye.rider.net.lastFourSpoken
 import com.cabeye.rider.places.City
+import com.cabeye.rider.security.BiometricGate
 import com.cabeye.rider.places.ContactLookup
 import com.cabeye.rider.places.ContactMatch
 import com.cabeye.rider.places.Gazetteer
@@ -37,13 +52,23 @@ import com.cabeye.rider.state.PlaceOption
 import com.cabeye.rider.state.RideType
 import com.cabeye.rider.state.RiderState
 import com.cabeye.rider.state.RiderUiState
+import com.cabeye.rider.state.PaymentPhase
+import com.cabeye.rider.state.PaymentUi
 import com.cabeye.rider.state.ThemeChoice
+import com.cabeye.rider.state.CameraShare
+import com.cabeye.rider.ui.HapticPattern
+import com.cabeye.rider.ui.Haptics
 import com.cabeye.rider.telemetry.Telemetry
+import com.cabeye.rider.memory.PreferenceMemoryAgent
+import com.cabeye.rider.memory.SuggestionKind
+import com.cabeye.rider.memory.VisitedPlace
+import java.time.ZoneId
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.yield
 
 /**
  * Why the microphone is currently open.
@@ -102,7 +127,27 @@ private enum class MicPurpose {
     CONTACT_CONFIRM_ANSWER,
 
     /** "Which landmark or bus stop should the driver look for?" — the last rung. */
-    LANDMARK_ANSWER
+    LANDMARK_ANSWER,
+
+    /**
+     * Answering the memory agent: "Going to PSG College, like most weekday mornings?" or
+     * "Did you mean PSG College?". Yes books it (through the normal cancel window); no goes
+     * back one step to "where would you like to go?"; naming another place books that.
+     */
+    MEMORY_ANSWER,
+
+    /** Answering one of the feedback questions; which one is in [RiderState.Feedback.step]. */
+    FEEDBACK,
+
+    /** Answering a next-journey question; which one is in [RiderState.NextJourney.step]. */
+    NEXT_JOURNEY,
+
+    /**
+     * The live camera: answering "can your driver see your camera?", or — while it is on —
+     * "stop camera". Only camera words mean anything here. Nothing heard under this purpose
+     * can book, cancel or change the ride.
+     */
+    CAMERA
 }
 
 /**
@@ -152,6 +197,9 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     /** Set by the Activity once RECORD_AUDIO is granted. */
     var micPermissionGranted: Boolean = false
 
+    /** Set by the Activity: shows the system camera-permission dialog. */
+    var cameraPermissionRequest: (() -> Unit)? = null
+
     private var micPurpose = MicPurpose.BOOKING
 
     /** Wall-clock time the current recognition session actually started listening. */
@@ -164,6 +212,20 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
 
     /** The bounded "I didn't hear the code" listen. Cancelled the moment the code is settled. */
     private var codeListenJob: Job? = null
+
+    /**
+     * The ride just finished, kept after [endRide] clears [activeRideId].
+     *
+     * Payment happens on the Done screen, which is *after* the ride has ended — so without
+     * holding the id here there would be nothing to report the payment against.
+     */
+    private var lastCompletedRideId: String? = null
+
+    /** The in-flight "has it settled yet?" poll. */
+    private var paymentPollJob: Job? = null
+
+    /** The Done screen a press started from, so "pay" can return to it. See [handleTranscript]. */
+    private var doneBeforeListening: RiderState.Done? = null
 
     // ---------------------------------------------------------------------------------
     //  Meeting-contact ladder
@@ -180,6 +242,13 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
      * cannot be asked for must not strand a rider mid-booking.
      */
     var contactPermissionRequest: (() -> Unit)? = null
+
+    /**
+     * Set by the Activity: shows Android's fingerprint / face / screen-lock prompt for a
+     * payment and reports the outcome. Lives on the Activity because the system prompt needs
+     * one; null (for example in tests) means pay without the prompt.
+     */
+    var paymentAuthRequest: ((Int, (BiometricGate.Result) -> Unit) -> Unit)? = null
 
     /**
      * The rider answered the system contacts dialog.
@@ -234,11 +303,58 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     /** The candidate behind an outstanding "Did you mean ...?" question. */
     private var pendingNearMiss: PlaceOption? = null
 
+    /** Unclear answers to the current A-or-B question. One re-ask, then it is a new place. */
+    private var clarifyUnclear = 0
+
+    // ---------------------------------------------------------------------------------
+    //  Preference-memory agent
+    // ---------------------------------------------------------------------------------
+
+    /** The memory suggestion currently being asked about, if any. */
+    private var pendingMemory: PreferenceMemoryAgent.Suggestion? = null
+
+    /** What the rider had said when a REPAIR suggestion was made — learned as an alias on "yes". */
+    private var pendingMemoryHeard: String = ""
+
+    /** Places the rider said "no" to during this booking. Never offered again in it. */
+    private val rejectedMemoryKeys = mutableSetOf<String>()
+
+    /** The memory may step in once per booking when nothing was heard clearly; not in a loop. */
+    private var memoryRescueUsed = false
+
+    /** Last partial transcript of this listen: what the recogniser half-heard before failing. */
+    private var lastPartial: String = ""
+
+    // ---------------------------------------------------------------------------------
+    //  After the ride: feedback and the next journey
+    // ---------------------------------------------------------------------------------
+
+    /** Who drove the ride that just finished, for "How was your ride with Karthik?". */
+    private var lastDriverName: String = ""
+
+    /** Unanswered or unclear answers to the current post-ride question. */
+    private var postRideMisses = 0
+
+    /** The scheduled ride being put together: when, and where (words + remembered place). */
+    private var draftAt: ZonedDateTime? = null
+    private var draftPhrase: String = ""
+    private var draftPlace: VisitedPlace? = null
+
+    /** When the last unprompted suggestion was offered, and how many were turned down today. */
+    private var lastProactiveAt: Long = 0L
+    private var proactiveDeclines = 0
+
     /** A slot the rider already filled, held across the follow-up question so it is not re-asked. */
     private var heldRideType: RideType? = null
 
     /** Last thing said, so "repeat" has something to repeat. */
     private var lastSpoken: String = ""
+
+    /**
+     * What the rider actually said for the destination being booked ("piece g"), sent with the
+     * booking so their memory learns their words for the place. Cleared once sent.
+     */
+    private var pendingSpokenAs: String = ""
 
     /** Last booking, so "book again" has something to rebook. */
     private var lastBooking: Pair<String, RideType>? = null
@@ -276,6 +392,15 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
 
     private companion object {
         const val MAX_CONSECUTIVE_ERRORS = 2
+
+        /** Words that can follow "book" without naming anywhere. */
+        val NOT_A_PLACE = setOf("other", "another", "ride", "one", "cab", "auto", "again", "now", "new", "more", "trip")
+
+        /** At most one unprompted memory suggestion per this interval. */
+        const val PROACTIVE_COOLDOWN_MS = 20 * 60_000L
+
+        /** Two "no"s to unprompted suggestions and the agent stays quiet for the session. */
+        const val MAX_PROACTIVE_DECLINES = 2
         const val TAG = "CabEye.Dialogue"
 
         /** Longest one group of the place list may take before the reader gives up on it. */
@@ -283,6 +408,18 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
 
         /** How long to listen for the driver to say the boarding code before offering help. */
         const val CODE_LISTEN_MS = 15_000L
+
+        /** How long the rider has to answer the camera question. The server allows 45 s. */
+        const val CAMERA_ANSWER_MS = 40_000L
+
+        /** The camera never stays on longer than this. The server enforces the same limit. */
+        const val CAMERA_MAX_MS = 3 * 60_000L
+
+        /** A gentle tick while the camera is on, so the rider can feel that it still is. */
+        const val CAMERA_TICK_MS = 5_000L
+
+        /** No picture for this long means the camera has quietly stopped; say so. */
+        const val CAMERA_STALL_MS = 8_000L
 
         /**
          * The recogniser is configured with `EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS = 800`
@@ -316,6 +453,24 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
 
         /** A landmark further than this from the road is a different place with a similar name. */
         const val LANDMARK_MAX_KM = 3.0
+
+        /** How often to ask the server whether the payment has actually settled. */
+        const val PAYMENT_POLL_INTERVAL_MS = 2_000L
+
+        /**
+         * How long to keep watching an open order: the gateway's own ten-minute window plus a
+         * margin. A screen-reader user working through a checkout page is not fast, and giving
+         * up before the order itself expires would announce "unknown" for a payment that is
+         * still perfectly able to succeed.
+         */
+        const val PAYMENT_WATCH_TIMEOUT_MS = 11 * 60_000L
+
+        /** "pay", "payment", "paid", "receipt" as whole words — never "Paytm" or "Payyanur". */
+        val PAYMENT_WORDS = Regex("\\b(pay|payment|paid|receipt)\\b")
+        val DECLINE_WORDS = Regex("\\b(decline|don'?t pay|do not pay|cancel payment|not now)\\b")
+        val CARD_WORDS = Regex("\\b(card|debit|credit)\\b")
+        val NETBANKING_WORDS = Regex("\\b(net ?banking|bank)\\b")
+        val UPI_WORDS = Regex("\\b(upi|u p i)\\b")
     }
 
     init {
@@ -323,6 +478,51 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         uiState = uiState.copy(activeCityName = Gazetteer.activeCity.displayName)
         collectSocket()
         speakWelcomeIfFirstRun()
+        watchAccount()
+        watchSchedules()
+    }
+
+    /**
+     * When a rider signs in (or the app opens already signed in), refresh their memory and —
+     * if there is a habit for this moment — offer it once the greeting has finished.
+     */
+    private fun watchAccount() {
+        viewModelScope.launch {
+            var lastId: String? = null
+            app.riderAccount.collect { account ->
+                val id = account?.takeUnless { it.isGuest }?.id
+                if (id != null && id != lastId) {
+                    proactiveDeclines = 0
+                    lastProactiveAt = 0L
+                    app.memory.refresh { onMain { offerProactive("sign-in") } }
+                }
+                lastId = id
+            }
+        }
+    }
+
+    /** The app came back to the foreground. A good moment for "like usual?" — if idle. */
+    fun onForeground() {
+        appInForeground = true
+        // The driver asked while the phone was locked or in a pocket. Ask again now that the
+        // rider can actually answer and the camera can actually open.
+        if (uiState.camera == CameraShare.ASKING && cameraAskedInBackground) {
+            cameraAskedInBackground = false
+            askCameraQuestion()
+            return
+        }
+        offerProactive("foreground")
+    }
+
+    /**
+     * The app left the screen. Android does not let a backgrounded app keep the camera, so
+     * it is switched off here, deliberately and out loud, rather than left to fail silently.
+     */
+    fun onBackground() {
+        appInForeground = false
+        if (uiState.camera == CameraShare.LIVE) {
+            stopCamera("APP_IN_BACKGROUND", say = "Cab Eye left the screen, so the camera is off.")
+        }
     }
 
     // =================================================================================
@@ -575,6 +775,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             RideEventType.TRIP_STARTED -> {
+                stopCamera("TRIP_STARTED")
                 val destination = event.string("destination", lastBooking?.first ?: "your destination")
                 val eta = event.int("etaMinutes", 12)
                 val driver = currentDriver() ?: driverFrom(event)
@@ -597,10 +798,17 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                 val fare = event.int("fareRupees", 0)
                 val minutes = event.int("durationMinutes", 0)
                 engine.heartbeat(false)
+                lastDriverName = currentDriver()?.name.orEmpty()
                 transition(RiderState.Done(destination, fare, minutes), announce = false)
                 narrate(event, "You've arrived. $fare rupees.")
                 lastSpokenPhase = RidePhase.COMPLETED
                 endRide("completed")
+                // The server has just recorded this trip as a visit; pull the updated places so
+                // the very next booking can already use them.
+                app.memory.refresh()
+                // Open the payment panel straight away: the customer should not have to find
+                // a payment screen. The fare was just spoken, so it is not repeated.
+                if (fare > 0) startPayment(announceFare = false) else startFeedback()
             }
 
             RideEventType.RIDE_CANCELLED -> {
@@ -614,6 +822,14 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             RideEventType.CODE_CONFIRMED,
             RideEventType.RIDE_CREATED -> Unit
 
+            // The live camera — see "Live camera" below.
+            RideEventType.CAMERA_REQUESTED -> onCameraRequested(event)
+            RideEventType.CAMERA_DECLINED -> onCameraDeclinedByServer(event)
+            RideEventType.CAMERA_STOPPED -> onCameraStoppedByServer(event)
+            // STARTED is the echo of this phone's own yes; frames never arrive here.
+            RideEventType.CAMERA_STARTED,
+            RideEventType.CAMERA_FRAME -> Unit
+
             // Transport notices. Handled by the socket layer; narrating them here would mean
             // the rider hears about the connection twice, from two places that could disagree.
             RideEventType.CONNECTED,
@@ -623,6 +839,8 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             RideEventType.REQUEST_TAKEN,
             RideEventType.PONG,
             RideEventType.ERROR,
+            // The rider learns the payment outcome from the order it is watching.
+            RideEventType.PAYMENT_UPDATED,
             RideEventType.UNKNOWN -> Unit
         }
     }
@@ -699,6 +917,15 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         // uncancelled it fired 15 seconds after a *correct* code and asked for it all over
         // again, because the ride is still in Arrived at that point and the purpose is still
         // CODE_VERIFY — both of its old guards were satisfied by a ride that had gone right.
+        armCodeListenTimeout()
+    }
+
+    /**
+     * (Re)starts the bounded listen for the boarding code. Called at arrival, and again after
+     * anything else was said at the kerb (the camera question, "Camera on") — time the phone
+     * spent talking is time the driver could not be heard, so it must not count against them.
+     */
+    private fun armCodeListenTimeout() {
         codeListenJob?.cancel()
         codeListenJob = viewModelScope.launch {
             delay(CODE_LISTEN_MS)
@@ -706,7 +933,8 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                 stt?.cancel()
                 closeMic()
                 speak(
-                    "I didn't hear the code. Ask the driver to say it again, or press the screen.",
+                    "I didn't hear the code. Ask the driver to say it again, close to your phone. " +
+                        "If someone with you can see the driver's screen, they can press Code is right.",
                     NarrationTier.QUEUED
                 ) { openMic(MicPurpose.CODE_VERIFY) }
             }
@@ -790,9 +1018,776 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         codeVerified = true
         codeListenJob?.cancel()
         codeListenJob = null
+        // The right car is found; the camera's job is done. "Camera off." is queued behind
+        // whatever the caller says next, never over it.
+        stopCamera("CODE_CONFIRMED")
         if (micPurpose == MicPurpose.CODE_VERIFY) {
             stt?.cancel()
             closeMic()
+        }
+    }
+
+    // =================================================================================
+    //  Live camera — "help my driver find me"
+    // =================================================================================
+    //
+    //  Driver taps SEE RIDER'S VIEW  →  CAMERA_REQUESTED arrives here
+    //  →  "Karthik can't see you. Can they see your back camera to find you? Say yes or no."
+    //  →  yes: the back camera streams small pictures to the driver (no audio, no preview,
+    //     nothing recorded); no or silence: it stays off.
+    //
+    //  It never gets in the way of the boarding code. At the kerb the code listen itself
+    //  understands "yes", "no" and "stop camera", so the mic is never taken away from the
+    //  driver saying the code. Everything the camera says is queued, never interrupting, and
+    //  cuts any open microphone before it speaks so the phone never hears itself.
+    //
+    //  It turns itself off when the code is confirmed, the passenger is seated, the trip
+    //  starts, the ride ends, the rider says "stop camera", the driver stops it, three minutes
+    //  pass, the pictures stop coming, or the app leaves the screen — and always says so.
+
+    private val cameraStreamer by lazy { CameraStreamer(getApplication()) }
+    private val haptics by lazy { Haptics(getApplication()) }
+
+    private val cameraJobs = mutableListOf<Job>()
+    private var cameraAskJob: Job? = null
+    private var cameraReasked = false
+    private var awaitingCameraPermission = false
+    private var appInForeground = true
+    private var cameraAskedInBackground = false
+    private var cameraDriverName = "Your driver"
+
+    @Volatile
+    private var lastCameraFrameAt = 0L
+
+    private fun hasCameraPermission(): Boolean =
+        androidx.core.content.ContextCompat.checkSelfPermission(
+            getApplication(), android.Manifest.permission.CAMERA
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+
+    /** Before pickup, with the code not yet confirmed: the only time the camera makes sense. */
+    private fun cameraMakesSense(): Boolean =
+        activeRideId != null && !codeVerified &&
+            (uiState.ride is RiderState.Assigned || uiState.ride is RiderState.Approaching ||
+                uiState.ride is RiderState.Arrived)
+
+    private fun onCameraRequested(event: RideEvent) {
+        if (uiState.camera != CameraShare.OFF) return
+        val rideId = activeRideId ?: return
+        if (!cameraMakesSense()) {
+            viewModelScope.launch { api.cameraAnswer(rideId, accept = false, reason = "NOT_NOW") }
+            return
+        }
+        cameraDriverName = event.string("driverName").ifBlank { currentDriver()?.name.orEmpty() }
+            .ifBlank { "Your driver" }
+        cameraReasked = false
+        uiState = uiState.copy(camera = CameraShare.ASKING)
+        Log.i(TAG, "CAMERA requested by $cameraDriverName always=${prefs.alwaysShareCamera}")
+
+        cameraAskJob?.cancel()
+        cameraAskJob = viewModelScope.launch {
+            delay(CAMERA_ANSWER_MS)
+            if (uiState.camera == CameraShare.ASKING) declineCamera("NO_ANSWER")
+        }
+
+        if (prefs.alwaysShareCamera && hasCameraPermission() && appInForeground) {
+            acceptCamera(always = false, intro = "$cameraDriverName is looking for you, so I'm sharing your camera.")
+            return
+        }
+        if (!appInForeground) {
+            // The camera cannot open from the background, and the mic may not hear an answer.
+            // Say what is happening and ask properly once the app is back on screen.
+            cameraAskedInBackground = true
+            haptics.perform(HapticPattern.CLARIFY)
+            speakAroundMic(
+                "$cameraDriverName can't see you and would like to see your camera. " +
+                    "Open Cab Eye to answer."
+            ) { }
+            return
+        }
+        askCameraQuestion()
+    }
+
+    private fun askCameraQuestion() {
+        haptics.perform(HapticPattern.CLARIFY)
+        speakAroundMic(
+            "$cameraDriverName can't see you. Can they see your back camera to find you? Say yes or no."
+        )
+    }
+
+    private fun reaskCamera() {
+        if (uiState.camera != CameraShare.ASKING) return
+        if (cameraReasked) {
+            declineCamera("NO_ANSWER")
+            return
+        }
+        cameraReasked = true
+        speakAroundMic("Say yes to share your camera with your driver, or no.")
+    }
+
+    /**
+     * Camera words, wherever they are heard. Returns true when the transcript was about the
+     * camera and has been dealt with.
+     */
+    private fun handleCameraSpeech(text: String): Boolean {
+        val camera = uiState.camera
+
+        if (CameraConsent.isStopCamera(text)) {
+            when (camera) {
+                CameraShare.LIVE -> stopCamera("RIDER_SAID_STOP")
+                CameraShare.ASKING -> declineCamera("RIDER_DECLINED")
+                CameraShare.OFF -> speakAroundMic("Your camera is already off.")
+            }
+            return true
+        }
+
+        if (camera == CameraShare.ASKING &&
+            (micPurpose == MicPurpose.CAMERA || micPurpose == MicPurpose.CODE_VERIFY)
+        ) {
+            when (CameraConsent.answer(text)) {
+                CameraConsent.Answer.YES -> { acceptCamera(always = false); return true }
+                CameraConsent.Answer.ALWAYS -> { acceptCamera(always = true); return true }
+                CameraConsent.Answer.NO -> { declineCamera("RIDER_DECLINED"); return true }
+                // At the kerb, anything else is most likely the driver saying the code: let
+                // the code check have it.
+                null -> if (micPurpose == MicPurpose.CAMERA) { reaskCamera(); return true }
+            }
+        }
+
+        if (micPurpose == MicPurpose.CAMERA) {
+            if (Regex("\\bstatus\\b|where is|how far").containsMatchIn(text.lowercase())) {
+                speakStatus()
+            } else if (camera == CameraShare.LIVE) {
+                speakAroundMic("Your camera is still on for your driver. Say stop camera to turn it off.") { }
+            }
+            return true
+        }
+        return false
+    }
+
+    /** The rider (or a helper) answered the camera question with the on-screen buttons. */
+    fun onCameraAnswer(accept: Boolean) {
+        if (uiState.camera != CameraShare.ASKING) return
+        stt?.cancel()
+        closeMic()
+        if (accept) acceptCamera(always = false) else declineCamera("RIDER_DECLINED")
+    }
+
+    /** STOP CAMERA on screen or in the TalkBack actions. */
+    fun onStopCamera() {
+        stopCamera("RIDER_STOPPED")
+    }
+
+    fun onCameraPermissionResult(granted: Boolean) {
+        if (!awaitingCameraPermission) return
+        awaitingCameraPermission = false
+        Log.i(TAG, "CAMERA_PERMISSION granted=$granted")
+        if (uiState.camera != CameraShare.ASKING) return // the request lapsed meanwhile
+        if (granted) {
+            acceptCamera(always = false)
+        } else {
+            declineCamera(
+                "NO_PERMISSION",
+                say = "Without camera permission I can't share it. " +
+                    "Your driver can still use sounds and messages to find you."
+            )
+        }
+    }
+
+    private fun acceptCamera(always: Boolean, intro: String? = null) {
+        val rideId = activeRideId ?: return
+        if (always) prefs.alwaysShareCamera = true
+        // Answered: the local no-answer timer is done. (While the permission dialog is up,
+        // the server's own 45-second limit still applies.)
+        cameraAskJob?.cancel()
+
+        if (!hasCameraPermission()) {
+            val request = cameraPermissionRequest
+            if (request == null) {
+                declineCamera("NO_PERMISSION", say = "I can't use the camera right now, so it stays off.")
+                return
+            }
+            awaitingCameraPermission = true
+            // Said before the dialog, because a bare system prompt means nothing to someone
+            // who cannot read it or see what triggered it.
+            speakAroundMic("Your phone will now ask to use the camera. Choose Allow.") { request() }
+            return
+        }
+
+        viewModelScope.launch {
+            when (val result = api.cameraAnswer(rideId, accept = true)) {
+                is ApiResult.Ok ->
+                    if (result.value == "LIVE") startCameraStream(intro, always)
+                    else uiState = uiState.copy(camera = CameraShare.OFF)
+                is ApiResult.Failed -> {
+                    Log.w(TAG, "CAMERA answer failed: ${result.detail}")
+                    uiState = uiState.copy(camera = CameraShare.OFF)
+                    speakAroundMic(result.spoken)
+                }
+            }
+        }
+    }
+
+    private fun startCameraStream(intro: String?, always: Boolean) {
+        if (!cameraMakesSense()) {
+            stopCamera("NOT_NOW", say = null)
+            return
+        }
+        uiState = uiState.copy(camera = CameraShare.LIVE)
+        lastCameraFrameAt = System.currentTimeMillis()
+
+        cameraStreamer.start(
+            onFrame = { jpeg, n ->
+                lastCameraFrameAt = System.currentTimeMillis()
+                socket.sendFrame(jpeg, n)
+            },
+            onError = {
+                stopCamera(
+                    "CAMERA_UNAVAILABLE",
+                    say = "The camera stopped working, so it's off now. " +
+                        "Your driver can still use sounds and messages."
+                )
+            }
+        )
+
+        engine.earcon(Earcon.UNDERSTOOD)
+        val lead = intro?.let { "$it " }.orEmpty()
+        val remembered = if (always) " I'll share it automatically from now on." else ""
+        speakAroundMic(
+            "${lead}Camera on.$remembered Hold your phone up at chest height, pointing at the road. " +
+                "Say stop camera to turn it off."
+        )
+
+        cameraJobs += viewModelScope.launch {
+            while (uiState.camera == CameraShare.LIVE) {
+                delay(CAMERA_TICK_MS)
+                if (uiState.camera == CameraShare.LIVE) haptics.perform(HapticPattern.CAMERA_TICK)
+            }
+        }
+        cameraJobs += viewModelScope.launch {
+            while (uiState.camera == CameraShare.LIVE) {
+                delay(2_000)
+                val quiet = System.currentTimeMillis() - lastCameraFrameAt
+                if (uiState.camera == CameraShare.LIVE && quiet > CAMERA_STALL_MS) {
+                    Log.w(TAG, "CAMERA no pictures for ${quiet}ms")
+                    stopCamera("NO_PICTURES", say = "The camera stopped, so it's off now.")
+                }
+            }
+        }
+        cameraJobs += viewModelScope.launch {
+            delay(CAMERA_MAX_MS)
+            if (uiState.camera == CameraShare.LIVE) {
+                stopCamera(
+                    "TIME_LIMIT",
+                    say = "Three minutes are up, so I've turned the camera off. " +
+                        "Your driver can still send you messages."
+                )
+            }
+        }
+    }
+
+    /** The rider said no, or nothing. Idempotent. */
+    private fun declineCamera(reason: String, say: String? = null) {
+        if (uiState.camera != CameraShare.ASKING) return
+        cameraAskJob?.cancel()
+        awaitingCameraPermission = false
+        cameraAskedInBackground = false
+        uiState = uiState.copy(camera = CameraShare.OFF)
+        activeRideId?.let { rideId ->
+            viewModelScope.launch { api.cameraAnswer(rideId, accept = false, reason = reason) }
+        }
+        if (micPurpose == MicPurpose.CAMERA && stt?.isListening == true) {
+            stt?.cancel()
+            closeMic()
+        }
+        speakAroundMic(
+            say ?: if (reason == "NO_ANSWER") "No answer, so your camera stays off."
+            else "Okay, your camera stays off."
+        )
+    }
+
+    /**
+     * Turns the camera off, whatever it was doing. Idempotent, and safe from any path.
+     *
+     * @param say spoken afterwards — queued behind anything said in the same breath, so
+     *   "That's the right code" is never cut off by "Camera off". Null says nothing.
+     * @param tellServer false when the server is the one that stopped it
+     */
+    private fun stopCamera(reason: String, say: String? = "Camera off.", tellServer: Boolean = true) {
+        val was = uiState.camera
+        if (was == CameraShare.OFF) return
+        cameraAskJob?.cancel()
+        cameraJobs.forEach { it.cancel() }
+        cameraJobs.clear()
+        awaitingCameraPermission = false
+        cameraAskedInBackground = false
+        cameraStreamer.stop()
+        uiState = uiState.copy(camera = CameraShare.OFF)
+        Log.i(TAG, "CAMERA stopped reason=$reason was=$was")
+
+        val rideId = activeRideId
+        if (tellServer && rideId != null) {
+            viewModelScope.launch {
+                if (was == CameraShare.LIVE) api.cameraStop(rideId, reason)
+                else api.cameraAnswer(rideId, accept = false, reason = reason)
+            }
+        }
+        if (was == CameraShare.LIVE && say != null) {
+            viewModelScope.launch {
+                yield()
+                speakAroundMic(say)
+            }
+        }
+    }
+
+    private fun onCameraDeclinedByServer(event: RideEvent) {
+        if (uiState.camera != CameraShare.ASKING) return
+        // The server's own timeout; this phone's no is already handled before it echoes back.
+        cameraAskJob?.cancel()
+        awaitingCameraPermission = false
+        cameraAskedInBackground = false
+        uiState = uiState.copy(camera = CameraShare.OFF)
+        if (event.string("reason") == "NO_ANSWER") {
+            if (micPurpose == MicPurpose.CAMERA && stt?.isListening == true) {
+                stt?.cancel()
+                closeMic()
+            }
+            speakAroundMic("No answer, so your camera stays off.")
+        }
+    }
+
+    private fun onCameraStoppedByServer(event: RideEvent) {
+        val reason = event.string("reason")
+        if (uiState.camera == CameraShare.ASKING) {
+            stopCamera(reason, say = null, tellServer = false)
+            return
+        }
+        val sentence = when {
+            event.string("by") == "DRIVER" -> "Your driver has turned the camera off."
+            reason == "TIME_LIMIT" -> "Three minutes are up, so the camera is off."
+            else -> "Camera off."
+        }
+        stopCamera(reason, say = sentence, tellServer = false)
+    }
+
+    /**
+     * Speaks without ever talking over an open microphone, then puts the right one back.
+     *
+     * Any listen in progress is cut the moment speech starts (the phone must not transcribe
+     * itself), and afterwards the mic reopens for whatever is still open: the boarding code
+     * at the kerb, otherwise the camera question. [then] replaces that when given.
+     */
+    private fun speakAroundMic(text: String, then: (() -> Unit)? = null) {
+        speak(
+            text,
+            NarrationTier.QUEUED,
+            onStart = {
+                if (stt?.isListening == true && micPurpose != MicPurpose.CANCEL_WINDOW) {
+                    stt?.cancel()
+                    closeMic()
+                }
+            }
+        ) {
+            if (then != null) {
+                then()
+                return@speak
+            }
+            when {
+                uiState.ride is RiderState.Arrived && !codeVerified -> {
+                    armCodeListenTimeout()
+                    openMic(MicPurpose.CODE_VERIFY)
+                }
+                uiState.camera == CameraShare.ASKING && appInForeground -> openMic(MicPurpose.CAMERA)
+            }
+        }
+    }
+
+    // =================================================================================
+    //  Payment — in-app, sandbox gateway, end to end
+    // =================================================================================
+    //
+    //  Ride completes  →  the app opens the payment panel by itself: amount + "Pay by UPI"
+    //  →  customer taps PAY (or says "pay"; "card" / "net banking" changes the method;
+    //     "decline" declines) — all inside this app, no browser, no other app
+    //  →  the server's gateway decides the outcome and returns a 12-digit bank reference
+    //  →  one spoken ending: paid (with receipt), failed (try again), or unknown.
+    //
+    //  A sighted companion can also pay by scanning the QR code on the DRIVER's screen; this
+    //  app is watching the same order and announces that payment too.
+    //
+    //  Nothing on this phone can mark a payment as paid. The gateway on the server does.
+
+    /**
+     * The customer tapped the payment button, or said "pay".
+     *
+     * One button, meaning the obvious next thing: start a payment, confirm it, retry it, or —
+     * once paid — read the receipt back.
+     */
+    fun onPayTapped() {
+        when (uiState.payment?.phase) {
+            null, PaymentPhase.ERROR, PaymentPhase.FAILED -> startPayment(announceFare = true)
+            PaymentPhase.AWAITING -> authorizeAndPay()
+            PaymentPhase.PAID -> uiState.payment?.let {
+                speak(receiptSentence(it.amountRupees, it.bankRef), NarrationTier.INTERRUPT)
+            }
+            PaymentPhase.STARTING, PaymentPhase.PROCESSING -> Unit
+        }
+    }
+
+    /** UPI, CARD or NETBANKING, chosen by tap or by voice. */
+    fun onPaymentMethod(method: String) {
+        val current = uiState.payment ?: return
+        if (current.phase != PaymentPhase.AWAITING) return
+        setPayment(current.copy(method = method))
+        speak("Paying by ${spokenMethod(method)}.", NarrationTier.INTERRUPT)
+    }
+
+    /** The customer chose not to pay now. The gateway records a declined payment. */
+    fun onDeclinePayment() {
+        val current = uiState.payment ?: return
+        if (current.phase != PaymentPhase.AWAITING) return
+        setPayment(current.copy(phase = PaymentPhase.PROCESSING, message = "Declining…"))
+        viewModelScope.launch {
+            when (val result = api.simulatePayment(current.orderId, success = false,
+                method = current.method, reason = "You declined the payment")) {
+                is ApiResult.Ok -> onOrderFailed(result.value.amountRupees, result.value.failureReason)
+                is ApiResult.Failed -> {
+                    setPayment(current)
+                    speak(result.spoken, NarrationTier.INTERRUPT)
+                }
+            }
+        }
+    }
+
+    /**
+     * Gets (or reuses) the order for this ride's fare and shows the confirm panel.
+     *
+     * Called automatically when the ride completes, so a blind customer is never left to find
+     * a payment screen on their own — and by TRY AGAIN after a failure.
+     */
+    private fun startPayment(announceFare: Boolean) {
+        val done = uiState.ride as? RiderState.Done
+        val rideId = activeRideId ?: lastCompletedRideId
+        if (done == null || rideId == null) {
+            speak("There's no finished ride to pay for.", NarrationTier.QUEUED)
+            return
+        }
+
+        paymentPollJob?.cancel()
+        setPayment(PaymentUi(PaymentPhase.STARTING, done.fareRupees, message = "Preparing payment…"))
+
+        viewModelScope.launch {
+            when (val result = api.createPaymentOrder(rideId)) {
+                is ApiResult.Ok -> {
+                    val order = result.value
+                    if (order.status == PaymentOrderStatus.PAID) {
+                        onOrderPaid(order.amountRupees, order.bankRef, order.method)
+                        return@launch
+                    }
+                    setPayment(
+                        PaymentUi(
+                            phase = PaymentPhase.AWAITING,
+                            amountRupees = order.amountRupees,
+                            orderId = order.orderId,
+                            method = "UPI",
+                            message = "Tap Pay or say \"pay\""
+                        )
+                    )
+                    val fare = if (announceFare) "Your fare is ${order.amountRupees} rupees. " else ""
+                    speak(
+                        "${fare}Paying by UPI. Tap Pay, or say pay, to confirm.",
+                        NarrationTier.QUEUED
+                    )
+                    // Watches for payment by any route — including a companion scanning the
+                    // QR code on the driver's screen.
+                    watchOrder(order.orderId)
+                }
+
+                is ApiResult.Failed -> {
+                    // "Already paid" arrives as a refusal. Check first, so a customer who paid
+                    // is told so rather than told something went wrong.
+                    val snapshot = (api.paymentStatus(rideId) as? ApiResult.Ok<RideSnapshot>)?.value
+                    if (snapshot?.paymentStatus == "CONFIRMED") {
+                        onOrderPaid(snapshot.fareRupees, snapshot.paymentRef, "")
+                        return@launch
+                    }
+                    setPayment(PaymentUi(PaymentPhase.ERROR, done.fareRupees, message = result.spoken))
+                    engine.earcon(Earcon.ERROR)
+                    speak("${result.spoken} Tap Pay to try again.", NarrationTier.INTERRUPT)
+                }
+            }
+        }
+    }
+
+    /**
+     * The owner confirms with fingerprint, face or screen lock, then the payment is sent.
+     *
+     * Nothing reaches the gateway until the phone's owner has confirmed. Cancelling costs
+     * nothing and says so — "nothing was charged" is the sentence a customer who cannot see
+     * the screen most needs to hear after backing out.
+     */
+    private fun authorizeAndPay() {
+        val current = uiState.payment ?: return
+        if (current.phase != PaymentPhase.AWAITING) return
+        val request = paymentAuthRequest
+        if (request == null) {
+            confirmPayment()
+            return
+        }
+
+        setPayment(current.copy(phase = PaymentPhase.PROCESSING, message = "Confirm with fingerprint or screen lock"))
+        speak("Confirm with your fingerprint or screen lock.", NarrationTier.INTERRUPT)
+
+        request(current.amountRupees) { result ->
+            when (result) {
+                BiometricGate.Result.Confirmed -> {
+                    engine.earcon(Earcon.UNDERSTOOD)
+                    setPayment(current)
+                    confirmPayment()
+                }
+
+                BiometricGate.Result.Unavailable -> {
+                    // No fingerprint, face or screen lock exists on this phone. Refusing would
+                    // strand the customer at the end of the ride, so pay — and say why.
+                    speak(
+                        "This phone has no fingerprint or screen lock, so I'll pay without one.",
+                        NarrationTier.QUEUED
+                    )
+                    setPayment(current)
+                    confirmPayment()
+                }
+
+                BiometricGate.Result.Cancelled -> {
+                    setPayment(current)
+                    speak(
+                        "Payment not confirmed. Nothing was charged. Tap Pay when you're ready.",
+                        NarrationTier.INTERRUPT
+                    )
+                }
+
+                is BiometricGate.Result.Failed -> {
+                    setPayment(current)
+                    engine.earcon(Earcon.ERROR)
+                    speak(
+                        "The fingerprint check didn't work. Nothing was charged. Tap Pay to try again.",
+                        NarrationTier.INTERRUPT
+                    )
+                }
+            }
+        }
+    }
+
+    /** Sends the payment to the gateway and speaks what the gateway decided. */
+    private fun confirmPayment() {
+        val current = uiState.payment ?: return
+        setPayment(current.copy(phase = PaymentPhase.PROCESSING, message = "Processing payment…"))
+        speak("Processing.", NarrationTier.INTERRUPT)
+
+        viewModelScope.launch {
+            when (val result = api.simulatePayment(current.orderId, success = true, method = current.method)) {
+                is ApiResult.Ok -> {
+                    val order = result.value
+                    when (order.status) {
+                        PaymentOrderStatus.PAID -> onOrderPaid(order.amountRupees, order.bankRef, order.method)
+                        PaymentOrderStatus.FAILED, PaymentOrderStatus.EXPIRED ->
+                            onOrderFailed(order.amountRupees, order.failureReason)
+                        else -> Unit // the watcher will settle it
+                    }
+                }
+
+                is ApiResult.Failed -> {
+                    // The order may have been paid or expired meanwhile; the server's refusal
+                    // says which. Otherwise put the confirm panel back.
+                    val order = (api.paymentOrder(current.orderId) as? ApiResult.Ok<PaymentOrder>)?.value
+                    when (order?.status) {
+                        PaymentOrderStatus.PAID -> onOrderPaid(order.amountRupees, order.bankRef, order.method)
+                        PaymentOrderStatus.FAILED, PaymentOrderStatus.EXPIRED ->
+                            onOrderFailed(order.amountRupees, order.failureReason)
+                        else -> {
+                            setPayment(current)
+                            engine.earcon(Earcon.ERROR)
+                            speak("${result.spoken} Nothing was charged. Tap Pay to try again.",
+                                NarrationTier.INTERRUPT)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Watches one order until it is final. Silent while waiting, and ends in exactly one
+     * sentence. Also how a payment made from the driver's QR code reaches this customer.
+     */
+    private fun watchOrder(orderId: String) {
+        paymentPollJob?.cancel()
+        paymentPollJob = viewModelScope.launch {
+            val deadline = System.currentTimeMillis() + PAYMENT_WATCH_TIMEOUT_MS
+
+            while (System.currentTimeMillis() < deadline) {
+                delay(PAYMENT_POLL_INTERVAL_MS)
+                val order = (api.paymentOrder(orderId) as? ApiResult.Ok<PaymentOrder>)?.value ?: continue
+
+                when (order.status) {
+                    PaymentOrderStatus.PAID -> {
+                        onOrderPaid(order.amountRupees, order.bankRef, order.method)
+                        return@launch
+                    }
+                    PaymentOrderStatus.FAILED, PaymentOrderStatus.EXPIRED -> {
+                        onOrderFailed(order.amountRupees, order.failureReason)
+                        return@launch
+                    }
+                    else -> Unit
+                }
+            }
+
+            if (uiState.payment?.phase == PaymentPhase.AWAITING) {
+                speak("The payment is still waiting. Tap Pay when you're ready.", NarrationTier.QUEUED)
+            }
+        }
+    }
+
+    private fun onOrderPaid(amountRupees: Int, bankRef: String, method: String) {
+        // Both the confirm call and the watcher can see PAID; say it once.
+        if (uiState.payment?.phase == PaymentPhase.PAID) return
+        paymentPollJob?.cancel()
+        setPayment(
+            PaymentUi(
+                phase = PaymentPhase.PAID,
+                amountRupees = amountRupees,
+                method = method,
+                bankRef = bankRef,
+                message = "Payment received"
+            )
+        )
+        engine.earcon(Earcon.UNDERSTOOD)
+        // Paid is the end of this ride's business; the receipt leads straight into the optional
+        // feedback question and then the next journey — never to a dead end.
+        speak(receiptSentence(amountRupees, bankRef), NarrationTier.INTERRUPT) {
+            if (uiState.ride is RiderState.Done) startFeedback()
+        }
+    }
+
+    private fun onOrderFailed(amountRupees: Int, failureReason: String) {
+        if (uiState.payment?.phase == PaymentPhase.FAILED) return
+        paymentPollJob?.cancel()
+        val reason = failureReason.ifBlank { "The payment was declined" }
+        setPayment(PaymentUi(PaymentPhase.FAILED, amountRupees, message = reason))
+        engine.earcon(Earcon.ERROR)
+        speak(
+            "That payment didn't go through. ${reason.trimEnd('.')}. No money was taken. " +
+                "Tap Try again, or say pay.",
+            NarrationTier.INTERRUPT
+        )
+    }
+
+    private fun receiptSentence(amountRupees: Int, bankRef: String): String =
+        if (bankRef.length >= 4) {
+            "Payment of $amountRupees rupees received. Reference ending ${bankRef.lastFourSpoken()}. Thank you."
+        } else {
+            "Payment of $amountRupees rupees received. Thank you."
+        }
+
+    private fun spokenMethod(method: String): String = when (method) {
+        "CARD" -> "card"
+        "NETBANKING" -> "net banking"
+        else -> "UPI"
+    }
+
+    private fun setPayment(payment: PaymentUi?) {
+        uiState = uiState.copy(payment = payment)
+    }
+
+    private fun isPaymentSpeech(text: String): Boolean {
+        val t = text.lowercase()
+        return listOf(PAYMENT_WORDS, DECLINE_WORDS, CARD_WORDS, NETBANKING_WORDS, UPI_WORDS)
+            .any { it.containsMatchIn(t) }
+    }
+
+    /**
+     * Voice on the Done screen. Returns true when the words were about payment and were
+     * handled, so they are never parsed as a new destination.
+     */
+    private fun handlePaymentSpeech(text: String): Boolean {
+        val t = text.lowercase()
+        val awaiting = uiState.payment?.phase == PaymentPhase.AWAITING
+
+        if (awaiting && DECLINE_WORDS.containsMatchIn(t)) {
+            onDeclinePayment()
+            return true
+        }
+
+        val method = when {
+            CARD_WORDS.containsMatchIn(t) -> "CARD"
+            NETBANKING_WORDS.containsMatchIn(t) -> "NETBANKING"
+            UPI_WORDS.containsMatchIn(t) -> "UPI"
+            else -> null
+        }
+        val wantsPay = PAYMENT_WORDS.containsMatchIn(t)
+
+        if (awaiting && method != null) {
+            val current = uiState.payment ?: return true
+            setPayment(current.copy(method = method))
+            if (wantsPay) authorizeAndPay() else speak("Paying by ${spokenMethod(method)}.", NarrationTier.INTERRUPT)
+            return true
+        }
+        if (wantsPay) {
+            onPayTapped()
+            return true
+        }
+        return false
+    }
+
+    /**
+     * The rider's UPI app came back (the "UPI APP" button).
+     *
+     * What a UPI app returns is a claim from another app on this phone, so it is relayed to the
+     * server as REPORTED and never spoken as "paid". The order watcher — already running —
+     * speaks the real outcome when the gateway settles it. A FAILURE claim is believed at once:
+     * a false failure costs one retry; a false success costs an unpaid fare nobody notices.
+     *
+     * @param response the raw `response` extra, e.g. `txnId=..&Status=SUCCESS&txnRef=..`,
+     *   or null when no UPI app handled the request
+     */
+    fun onPaymentResult(response: String?) {
+        val upi = UpiResponse.parse(response)
+        Log.i(TAG, "PAYMENT upi-app status=\"${upi.status}\" ref=\"${upi.txnRef}\"")
+        val rideId = activeRideId ?: lastCompletedRideId
+
+        when (upi.status) {
+            "FAILURE", "FAILED" -> {
+                engine.earcon(Earcon.ERROR)
+                speak(
+                    "Your UPI app says the payment didn't go through. You can tap Pay now instead.",
+                    NarrationTier.INTERRUPT
+                )
+            }
+            "SUCCESS" -> speak(
+                "Your UPI app reported success. I'm waiting for the gateway to confirm it.",
+                NarrationTier.QUEUED
+            )
+            "SUBMITTED" -> speak("Payment submitted. I'm checking.", NarrationTier.QUEUED)
+            else -> {
+                speak(
+                    "I didn't get a response from the UPI app. Nothing has been charged as far " +
+                        "as I can tell. You can tap Pay now instead.",
+                    NarrationTier.QUEUED
+                )
+                return
+            }
+        }
+
+        if (rideId == null) {
+            Log.w(TAG, "PAYMENT no ride id to report against")
+            return
+        }
+
+        viewModelScope.launch {
+            api.reportPayment(rideId, upi.status.ifBlank { "SUBMITTED" }, upi.txnRef)
+        }
+        // Keep (or restart) watching the open order: the gateway is the only source of "paid".
+        val open = uiState.payment
+        if (open != null && open.phase == PaymentPhase.AWAITING && paymentPollJob?.isActive != true) {
+            watchOrder(open.orderId)
         }
     }
 
@@ -836,6 +1831,17 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         //  a rider who presses during it is entitled to abandon the booking and start over.
         //  Arrived keeps its own existing behaviour (CODE_VERIFY) below.
         // ------------------------------------------------------------------------------
+        // With the camera question open or the camera on, a press means "let me answer" or
+        // "let me stop it" — the mic opens for camera words only, so nothing can be misheard
+        // as a booking. At the kerb (Arrived) the code listen below already understands them.
+        if (uiState.camera != CameraShare.OFF && isRideUnderway(uiState.ride)) {
+            trace?.tapCount = (trace?.tapCount ?: 0) + 1
+            engine.stopSpeaking()
+            if (stt?.isListening == true) stt?.cancel()
+            openMic(MicPurpose.CAMERA)
+            return
+        }
+
         if (isRideUnderway(uiState.ride)) {
             trace?.tapCount = (trace?.tapCount ?: 0) + 1
             engine.stopSpeaking()
@@ -844,6 +1850,9 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
+        // Remembered so that saying "pay" from here can come back to this screen.
+        doneBeforeListening = uiState.ride as? RiderState.Done
+
         trace = Telemetry.RideTrace(rideId = activeRideId ?: "local").also { it.tapCount++ }
 
         consecutiveSpeechErrors = 0
@@ -851,6 +1860,11 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         pendingNearMiss = null
         pendingOptions = null
         heldRideType = null
+        pendingSpokenAs = ""
+        pendingMemory = null
+        pendingMemoryHeard = ""
+        rejectedMemoryKeys.clear()
+        memoryRescueUsed = false
 
         engine.stopSpeaking()
         listPlacesJob?.cancel()
@@ -861,8 +1875,13 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         // While the driver is at the kerb, a press means "I want to check the code", not "book
         // me a new ride". Interpreting it as a fresh booking here would be the app ignoring the
         // most important thing happening to the rider.
-        val purpose =
-            if (uiState.ride is RiderState.Arrived) MicPurpose.CODE_VERIFY else MicPurpose.BOOKING
+        val purpose = when (uiState.ride) {
+            is RiderState.Arrived -> MicPurpose.CODE_VERIFY
+            // A press during the post-ride questions answers the question on screen.
+            is RiderState.Feedback -> MicPurpose.FEEDBACK
+            is RiderState.NextJourney -> MicPurpose.NEXT_JOURNEY
+            else -> MicPurpose.BOOKING
+        }
         openMic(purpose)
     }
 
@@ -915,6 +1934,10 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         trace?.tapCount = (trace?.tapCount ?: 0) + 1
         stt?.cancel()
         closeMic()
+        if (pendingMemory != null) {
+            if (accepted) acceptMemory() else rejectMemory()
+            return
+        }
         if (accepted) acceptNearMiss() else rejectNearMiss()
     }
 
@@ -993,7 +2016,11 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         // the countdown is the information, and `arrived`, where the rider is being asked to
         // wait for the driver to speak. Moving either to `Listening` would replace the thing
         // the rider needs with a generic listening screen.
-        if (purpose != MicPurpose.CANCEL_WINDOW && purpose != MicPurpose.CODE_VERIFY) {
+        // The post-ride questions stay on screen too: their step lives in the state itself.
+        if (purpose != MicPurpose.CANCEL_WINDOW && purpose != MicPurpose.CODE_VERIFY &&
+            purpose != MicPurpose.FEEDBACK && purpose != MicPurpose.NEXT_JOURNEY &&
+            purpose != MicPurpose.CAMERA
+        ) {
             transition(
                 RiderState.Listening(isFollowUp = purpose != MicPurpose.BOOKING),
                 announce = false
@@ -1001,6 +2028,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         uiState = uiState.copy(micOpen = true)
+        lastPartial = ""
         micOpenedAtMillis = System.currentTimeMillis()
         recogniser.start(speechListener)
         startSilenceWatch(purpose)
@@ -1035,6 +2063,24 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             stt?.cancel()
             closeMic()
 
+            // Feedback is optional and the next-journey question is a courtesy: saying nothing
+            // is an answer to both, and the app takes it rather than nagging.
+            if (purpose == MicPurpose.FEEDBACK) {
+                Log.i(TAG, "SILENCE on feedback — moving on")
+                finishFeedback(send = true, spokenThanks = false)
+                return@launch
+            }
+            if (purpose == MicPurpose.NEXT_JOURNEY) {
+                Log.i(TAG, "SILENCE on next journey — finishing")
+                endPostRide("I'll wait. Hold anywhere when you need a ride.")
+                return@launch
+            }
+            // Silence to the camera question is a no; silence while it is on means nothing.
+            if (purpose == MicPurpose.CAMERA) {
+                if (uiState.camera == CameraShare.ASKING) declineCamera("NO_ANSWER")
+                return@launch
+            }
+
             if (!silenceRepromptUsed) {
                 silenceRepromptUsed = true
                 Log.i(TAG, "SILENCE timeoutMs=${RecoveryLadder.SILENCE_TIMEOUT_MS} action=REPROMPT")
@@ -1058,7 +2104,10 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         override fun onPartial(text: String) = onMain {
-            if (text.isNotBlank()) startSilenceWatch(micPurpose)
+            if (text.isNotBlank()) {
+                startSilenceWatch(micPurpose)
+                lastPartial = text
+            }
             val current = uiState.ride
             if (current is RiderState.Listening) {
                 uiState = uiState.copy(ride = current.copy(partialTranscript = text))
@@ -1072,13 +2121,12 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        override fun onFinal(text: String) = onMain {
-            // T1 — recogniser returned.
-            trace?.mark(Telemetry.Stage.SPEECH_FINAL)
-            silenceJob?.cancel()
-            closeMic()
-            engine.earcon(Earcon.LISTENING_END)
-            handleTranscript(text)
+        override fun onFinal(text: String) = onMain { finalTranscript(text) }
+
+        // Several guesses: take the first one that fits the question being answered.
+        override fun onFinalAlternatives(alternatives: List<String>) = onMain {
+            if (alternatives.isEmpty()) return@onMain
+            finalTranscript(chooseTranscript(alternatives))
         }
 
         override fun onError(error: SpeechError) = onMain {
@@ -1086,6 +2134,67 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             closeMic()
             handleSpeechError(error)
         }
+    }
+
+    private fun finalTranscript(text: String) {
+        // T1 — recogniser returned.
+        trace?.mark(Telemetry.Stage.SPEECH_FINAL)
+        silenceJob?.cancel()
+        closeMic()
+        engine.earcon(Earcon.LISTENING_END)
+        handleTranscript(text)
+    }
+
+    /**
+     * The recogniser's guesses, best first; returns the first one that answers the question
+     * the app actually asked. Asked for the boarding code, "zero three six" is worth more than
+     * a higher-ranked "zero three sticks"; asked "yes or no", a "yes" in second place beats
+     * "yet" in first. For free answers (a destination) the best guess stands.
+     */
+    private fun chooseTranscript(alternatives: List<String>): String {
+        val best = alternatives.first()
+        if (alternatives.size == 1) return best
+
+        val camera = uiState.camera
+        val yesNo: (String) -> Boolean = { text ->
+            val intent = Classifier.classify(text, rideActive = uiState.ride !is RiderState.Idle).intent
+            intent is RiderIntent.Yes || intent is RiderIntent.No
+        }
+
+        val chosen = when {
+            camera != CameraShare.OFF && alternatives.any { CameraConsent.isStopCamera(it) } ->
+                alternatives.first { CameraConsent.isStopCamera(it) }
+
+            micPurpose == MicPurpose.CODE_VERIFY -> {
+                val expected = expectedCode.filter { it.isDigit() }
+                // Only the top three guesses may prove the code: the lower ones are the
+                // recogniser reaching, and a reached-for match must not let a wrong car pass.
+                alternatives.take(3).firstOrNull { expected.isNotEmpty() && digitsFrom(it).contains(expected) }
+                    ?: alternatives.firstOrNull { camera == CameraShare.ASKING && CameraConsent.answer(it) != null }
+                    ?: alternatives.firstOrNull { digitsFrom(it).isNotEmpty() }
+            }
+
+            micPurpose == MicPurpose.CAMERA ->
+                alternatives.firstOrNull { CameraConsent.answer(it) != null }
+
+            micPurpose == MicPurpose.FEEDBACK -> when ((uiState.ride as? RiderState.Feedback)?.step) {
+                FeedbackStep.RATING -> alternatives.firstOrNull { FeedbackParser.intentOf(it) != FeedbackParser.Intent.NONE }
+                FeedbackStep.RATING_CHECK -> alternatives.firstOrNull { yesNo(it) || FeedbackParser.rating(it) != null }
+                FeedbackStep.CONFIRM -> alternatives.firstOrNull { yesNo(it) || FeedbackParser.isSendCommand(it) }
+                else -> null
+            }
+
+            micPurpose == MicPurpose.NEAR_MISS_ANSWER || micPurpose == MicPurpose.MEMORY_ANSWER ||
+                micPurpose == MicPurpose.MEETING_ANSWER || micPurpose == MicPurpose.CONTACT_CONFIRM_ANSWER ->
+                alternatives.firstOrNull(yesNo)
+
+            else -> null
+        }
+
+        if (chosen != null && chosen != best) {
+            Log.i(TAG, "HEARD picked \"$chosen\" over \"$best\" for ${micPurpose.name}")
+        }
+        return chosen ?: best
     }
 
     // =================================================================================
@@ -1103,10 +2212,28 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         consecutiveSpeechErrors = 0
         silenceRepromptUsed = false
 
+        // Camera words first: "stop camera" must never reach the classifier, where a leading
+        // "stop" is the command that cancels the whole ride.
+        if (handleCameraSpeech(text)) return
+
+        // "Speak slower", "louder": only as a short command from the main question, so a
+        // report like "the driver was going too fast" is never taken as a setting.
+        if (micPurpose == MicPurpose.BOOKING && handleVoiceSettings(text)) return
+
         // The one purpose where the expected speaker is not the rider. Checked before anything
         // else, because a driver saying "four seven two" must not be parsed as a destination.
         if (micPurpose == MicPurpose.CODE_VERIFY) {
             verifyBoardingCode(text)
+            return
+        }
+
+        // Held from the Done screen, "pay" means pay — not a destination called Pay. The mic
+        // moved the screen to Listening, so the finished ride is restored before paying.
+        val doneScreen = doneBeforeListening
+        doneBeforeListening = null
+        if (micPurpose == MicPurpose.BOOKING && doneScreen != null && isPaymentSpeech(text)) {
+            transition(doneScreen, announce = false)
+            if (!handlePaymentSpeech(text)) speak("Say pay to confirm, or decline.", NarrationTier.QUEUED)
             return
         }
 
@@ -1121,8 +2248,22 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
 
         // Cancel wins everywhere, and especially inside the cancel window. This is the one
         // promise the optimistic-booking design cannot break.
-        if (classification.intent is RiderIntent.Cancel) {
+        // Free-text answers — a feedback report, a landmark, where a scheduled ride should go —
+        // may mention cancelling ("he told me to cancel") without the rider meaning it. There,
+        // only a short utterance ("cancel", "stop it") is the command.
+        val freeText = micPurpose == MicPurpose.FEEDBACK || micPurpose == MicPurpose.NEXT_JOURNEY ||
+            micPurpose == MicPurpose.LANDMARK_ANSWER
+        val isShort = text.trim().split(Regex("\\s+")).size <= 3
+        if (classification.intent is RiderIntent.Cancel && (!freeText || isShort)) {
             onCancel()
+            return
+        }
+
+        // "go back" is honoured from every question the booking dialogue can ask — the
+        // A-or-B question, "did you mean…?", the meeting-contact ladder and the cancel
+        // window. It always lands on the same, previous step: "where would you like to go?".
+        if (classification.intent is RiderIntent.Back) {
+            goBack()
             return
         }
 
@@ -1169,7 +2310,23 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                 return
             }
 
+            MicPurpose.MEMORY_ANSWER -> {
+                resolveMemoryAnswer(classification, text)
+                return
+            }
+
+            MicPurpose.FEEDBACK -> {
+                resolveFeedback(classification, text)
+                return
+            }
+
+            MicPurpose.NEXT_JOURNEY -> {
+                resolveNextJourney(classification, text)
+                return
+            }
+
             MicPurpose.CODE_VERIFY -> return // handled above
+            MicPurpose.CAMERA -> return // handled above
             MicPurpose.BOOKING -> Unit
         }
 
@@ -1235,7 +2392,24 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun resolveDestination(query: String, rawPhrase: String, rideType: RideType) {
+        pendingSpokenAs = rawPhrase
         transition(RiderState.Resolving(query), announce = false)
+
+        // The rider's own words for a place they have been before — a learned alias like
+        // "piece g", or the exact name — go straight to the normal booking announcement and
+        // its cancel window, without a round trip to Places that might not understand them.
+        if (app.memory.enabled) {
+            val direct = PreferenceMemoryAgent.direct(rawPhrase, app.memory.current, memoryMoment())
+            val option = direct?.place?.toOption()
+            if (direct != null && option != null) {
+                Log.i(TAG, "MEMORY direct heard=\"$rawPhrase\" place=\"${direct.place.name}\" sim=${direct.similarity}")
+                heldRideType = rideType
+                failureCount = 0
+                engine.earcon(Earcon.UNDERSTOOD)
+                beginOptimisticBooking(option, rideType, note = "one of your usual places")
+                return
+            }
+        }
         heldRideType = rideType
 
         // Very short/empty queries should never spend a Places request. This also preserves the
@@ -1285,8 +2459,27 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
 
         when (decision) {
             is MatchGate.Decision.Proceed -> proceedWith(decision, rideType)
-            is MatchGate.Decision.NearMiss -> askNearMiss(decision.candidate)
+            is MatchGate.Decision.NearMiss -> {
+                // Places is only half sure. If the rider's own history has a clearly better
+                // candidate for these words, ask about that instead.
+                val memory = memoryRepair(rawPhrase)
+                if (memory != null && memory.confidence > decision.candidate.score &&
+                    memory.place.placeId != decision.candidate.placeId
+                ) {
+                    askMemory(memory, heard = rawPhrase, prompt = repairPrompt(memory, heardClearly = true))
+                } else {
+                    askNearMiss(decision.candidate)
+                }
+            }
             is MatchGate.Decision.Reject -> {
+                // Before the recovery ladder: does this sound like somewhere the rider has
+                // been? "Brook fields" → "Did you mean Brookefields Mall, where you've been
+                // three times?"
+                val memory = memoryRepair(rawPhrase)
+                if (memory != null) {
+                    askMemory(memory, heard = rawPhrase, prompt = repairPrompt(memory, heardClearly = true))
+                    return
+                }
                 engine.earcon(Earcon.NOT_UNDERSTOOD)
                 runLadder(unrecognised = Stopwords.strip(rawPhrase).ifBlank { rawPhrase })
             }
@@ -1307,6 +2500,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             if (shouldAsk) {
                 trace?.clarificationTurns = (trace?.clarificationTurns ?: 0) + 1
                 pendingOptions = top to runnerUp
+                clarifyUnclear = 0
                 transition(RiderState.Clarify(top, runnerUp, gap, divergenceKm), announce = false)
 
                 speak("Did you mean ${top.name}, or ${runnerUp.name}?", NarrationTier.QUEUED) {
@@ -1547,10 +2741,23 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         beginOptimisticBooking(candidate, heldRideType ?: RideType.AUTO)
     }
 
+    /**
+     * "No" to "Did you mean Adyar?" goes back one step — ask for the place again — instead of
+     * treating the rider's clear answer as a recognition failure. Only a second rejection in a
+     * row escalates to the recovery ladder, which offers landmarks and the place list.
+     */
     private fun rejectNearMiss() {
+        val rejected = pendingNearMiss
         pendingNearMiss = null
         engine.earcon(Earcon.NOT_UNDERSTOOD)
-        runLadder(unrecognised = "")
+        failureCount++
+        if (failureCount >= 2) {
+            failureCount-- // runLadder counts this failure itself
+            runLadder(unrecognised = "")
+            return
+        }
+        val which = rejected?.let { "not ${it.name}. " } ?: ""
+        askDestinationAgain("Okay, ${which}Say the place again, or a nearby landmark.")
     }
 
     private fun resolveClarifyAnswer(text: String) {
@@ -1564,27 +2771,795 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        val normalised = Gazetteer.normalise(text)
-        val chosen = when {
-            normalised.contains("first") || normalised.contains("one") ||
-                normalised.contains(Gazetteer.normalise(a.name)) -> a
-            normalised.contains("second") || normalised.contains("two") ||
-                normalised.contains(Gazetteer.normalise(b.name)) -> b
-            else -> Gazetteer.score(text).firstOrNull { it.name == a.name || it.name == b.name }
-        }
+        val answer = ClarifyAnswer.interpret(text, a.name, b.name)
+        Log.i(TAG, "CLARIFY answer=$answer heard=\"$text\"")
 
-        if (chosen == null) {
-            speak("Sorry — ${a.name}, or ${b.name}?", NarrationTier.QUEUED) {
+        when (answer) {
+            ClarifyAnswer.Kind.A, ClarifyAnswer.Kind.B -> {
+                val chosen = if (answer == ClarifyAnswer.Kind.A) a else b
+                pendingOptions = null
+                clarifyUnclear = 0
+                failureCount = 0
+                engine.earcon(Earcon.UNDERSTOOD)
+                beginOptimisticBooking(chosen, heldRideType ?: RideType.AUTO)
+            }
+
+            // Back one step: the rider meant neither, so ask for the place again.
+            ClarifyAnswer.Kind.NEITHER -> {
+                pendingOptions = null
+                clarifyUnclear = 0
+                engine.earcon(Earcon.NOT_UNDERSTOOD)
+                askDestinationAgain("Okay, neither. Say the place again, or a nearby landmark.")
+            }
+
+            ClarifyAnswer.Kind.WHICH -> speak("Which one: ${a.name}, or ${b.name}?", NarrationTier.QUEUED) {
                 openMic(MicPurpose.CLARIFY_ANSWER)
             }
+
+            ClarifyAnswer.Kind.UNCLEAR -> {
+                if (clarifyUnclear == 0) {
+                    clarifyUnclear++
+                    speak("Sorry. ${a.name}, or ${b.name}? Or say neither.", NarrationTier.QUEUED) {
+                        openMic(MicPurpose.CLARIFY_ANSWER)
+                    }
+                } else {
+                    // Forward, not round in circles: twice not an option means the rider has
+                    // most likely named a different place. Resolve what they said.
+                    clarifyUnclear = 0
+                    pendingOptions = null
+                    val normalised = Stopwords.normalise(text)
+                    resolveDestination(
+                        query = Stopwords.strip(normalised),
+                        rawPhrase = normalised,
+                        rideType = heldRideType ?: RideType.AUTO
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * "go back" — return to the previous step of booking, which is always the destination
+     * question. What the rider already settled (auto or cab) is kept; the half-asked question
+     * and anything it had collected are dropped.
+     */
+    private fun goBack() {
+        val ride = uiState.ride
+        if (activeRideId != null || (isRideUnderway(ride) && ride !is RiderState.Done)) {
+            speak("Your ride is already booked. Say cancel if you want to cancel it.", NarrationTier.QUEUED)
             return
         }
 
+        // Inside the five-second window nothing has reached the server yet, so going back is
+        // simply not booking — and the ride type the rider chose is carried back with them.
+        val wasBooking = ride as? RiderState.Confirming
+        cancelWindowJob?.cancel()
+        if (wasBooking != null) heldRideType = wasBooking.rideType
+
         pendingOptions = null
+        pendingNearMiss = null
+        pendingMemory?.let { rejectedMemoryKeys += it.place.placeKey }
+        pendingMemory = null
+        clarifyUnclear = 0
+        pendingVaguePlace = null
+        pendingVagueRideType = null
+        meetingAsks = 0
+        pendingContacts = emptyList()
         failureCount = 0
+        uiState = uiState.copy(selectedDestination = null)
         engine.earcon(Earcon.UNDERSTOOD)
-        beginOptimisticBooking(chosen, heldRideType ?: RideType.AUTO)
+        Log.i(TAG, "BACK from=${ride::class.simpleName} purpose=${micPurpose.name}")
+
+        askDestinationAgain(
+            if (wasBooking != null) "Okay, not booking that. Where would you like to go?"
+            else "Okay. Where would you like to go?"
+        )
     }
+
+    /** The previous step: ask for the destination, and listen for it. */
+    private fun askDestinationAgain(prompt: String) {
+        transition(RiderState.Idle, announce = false)
+        speak(prompt, NarrationTier.QUEUED) { reopenMicAfterGap(MicPurpose.SLOT_ANSWER) }
+    }
+
+    // =================================================================================
+    //  The Preference-Memory Agent
+    //
+    //  Three ways in, one way out:
+    //    proactive  — idle, signed in, a habit for this moment    → "…like usual?"
+    //    repair     — Places found nothing / was unsure / STT hazy → "Did you mean …?"
+    //    direct     — the rider's own learned words for a place    → normal booking
+    //  and every answer lands: yes → booking with its cancel window, no → the previous step
+    //  ("where would you like to go?"), another place → that place.
+    // =================================================================================
+
+    private fun memoryMoment() = PreferenceMemoryAgent.Moment(
+        now = System.currentTimeMillis(),
+        zone = ZoneId.systemDefault(),
+        pickupLatitude = pickupLatitude,
+        pickupLongitude = pickupLongitude
+    )
+
+    private fun memoryThresholds() = PreferenceMemoryAgent.Thresholds.from(app.memory.current.stats)
+
+    private fun memoryRepair(heard: String): PreferenceMemoryAgent.Suggestion? {
+        if (!app.memory.enabled || heard.isBlank()) return null
+        return PreferenceMemoryAgent.repair(
+            heard, app.memory.current, memoryMoment(), memoryThresholds(), rejectedMemoryKeys
+        )
+    }
+
+    private fun memoryGuess(): PreferenceMemoryAgent.Suggestion? {
+        if (!app.memory.enabled) return null
+        return PreferenceMemoryAgent.guessWhenUnheard(
+            app.memory.current, memoryMoment(), memoryThresholds(), rejectedMemoryKeys
+        )
+    }
+
+    private fun repairPrompt(s: PreferenceMemoryAgent.Suggestion, heardClearly: Boolean): String {
+        val lead = if (heardClearly) "" else "I didn't catch that clearly. "
+        return "${lead}Did you mean ${s.place.name}, ${s.reason}? Say yes, or no."
+    }
+
+    /**
+     * Unprompted: "It's 8 40 AM. Going to PSG College, like most weekday mornings?"
+     *
+     * Offered only when nothing else is happening — idle, microphone closed, no ride — at most
+     * once every [PROACTIVE_COOLDOWN_MS], and not at all once the rider has turned two down in
+     * this session. A suggestion that interrupts is worse than none.
+     */
+    private fun offerProactive(trigger: String) {
+        if (!app.memory.enabled || app.memory.current.isEmpty) return
+        if (uiState.ride !is RiderState.Idle || uiState.micOpen || activeRideId != null) return
+        if (proactiveDeclines >= MAX_PROACTIVE_DECLINES) return
+        val now = System.currentTimeMillis()
+        if (now - lastProactiveAt < PROACTIVE_COOLDOWN_MS) return
+
+        viewModelScope.launch {
+            // Where the rider is matters: no "college, like usual?" to someone at college.
+            val location = runCatching { app.locationProvider.current() }.getOrNull()
+            if (location != null) {
+                pickupLatitude = location.latitude
+                pickupLongitude = location.longitude
+            }
+            val moment = memoryMoment()
+            val suggestion = PreferenceMemoryAgent.proactive(
+                app.memory.current, moment, memoryThresholds(), rejectedMemoryKeys
+            ) ?: return@launch
+            // Re-check: the rider may have started talking while the location was fetched.
+            if (uiState.ride !is RiderState.Idle || uiState.micOpen || activeRideId != null) return@launch
+
+            lastProactiveAt = System.currentTimeMillis()
+            Log.i(TAG, "MEMORY proactive trigger=$trigger place=\"${suggestion.place.name}\" " +
+                "confidence=${suggestion.confidence} threshold=${memoryThresholds().proactive}")
+            askMemory(
+                suggestion,
+                heard = "",
+                prompt = "It's ${PreferenceMemoryAgent.spokenTime(moment)}. Going to ${suggestion.place.name}, " +
+                    "${suggestion.reason}? Say yes, or tell me another place."
+            )
+        }
+    }
+
+    private fun askMemory(s: PreferenceMemoryAgent.Suggestion, heard: String, prompt: String) {
+        pendingMemory = s
+        pendingMemoryHeard = heard
+        pendingNearMiss = null
+        pendingOptions = null
+        val option = s.place.toOption() ?: PlaceOption(s.place.name, 0.0, 0.0, s.confidence)
+        // The near-miss screen already is "Did you mean X? Yes / No" — the same question.
+        transition(RiderState.Clarify(option, option, 0f, 0f, isNearMiss = true), announce = false)
+        engine.earcon(Earcon.UNDERSTOOD)
+        speak(prompt, NarrationTier.QUEUED) { openMic(MicPurpose.MEMORY_ANSWER) }
+    }
+
+    private fun resolveMemoryAnswer(classification: Classification, raw: String) {
+        when (classification.intent) {
+            is RiderIntent.Yes -> acceptMemory()
+            is RiderIntent.No -> rejectMemory()
+            else -> {
+                // Another place entirely: an implicit "no" to the suggestion, and a new request.
+                val s = pendingMemory
+                if (s != null) {
+                    app.memory.reportOutcome(s.place.placeKey, s.kind, accepted = false, heard = pendingMemoryHeard)
+                    rejectedMemoryKeys += s.place.placeKey
+                    if (s.kind == SuggestionKind.PROACTIVE) proactiveDeclines++
+                }
+                pendingMemory = null
+                resolveSlotAnswer(classification, raw)
+            }
+        }
+    }
+
+    private fun acceptMemory() {
+        val s = pendingMemory ?: return
+        pendingMemory = null
+        failureCount = 0
+        // The yes is evidence twice over: the suggestion was right, and — for a repair — the
+        // misheard words are now this rider's name for the place.
+        app.memory.reportOutcome(s.place.placeKey, s.kind, accepted = true, heard = pendingMemoryHeard)
+        if (s.kind == SuggestionKind.REPAIR && pendingMemoryHeard.isNotBlank()) pendingSpokenAs = pendingMemoryHeard
+        Log.i(TAG, "MEMORY accepted kind=${s.kind} place=\"${s.place.name}\"")
+        engine.earcon(Earcon.UNDERSTOOD)
+
+        val rideType = heldRideType ?: preferredRideType()
+        val option = s.place.toOption()
+        if (option != null) {
+            beginOptimisticBooking(option, rideType)
+        } else {
+            // A remembered place without coordinates: look its name up like any other.
+            resolveDestination(s.place.name, s.place.name, rideType)
+        }
+    }
+
+    /** "No" — back one step, and this place is not offered again in this booking. */
+    private fun rejectMemory() {
+        val s = pendingMemory ?: return
+        pendingMemory = null
+        app.memory.reportOutcome(s.place.placeKey, s.kind, accepted = false, heard = pendingMemoryHeard)
+        rejectedMemoryKeys += s.place.placeKey
+        Log.i(TAG, "MEMORY rejected kind=${s.kind} place=\"${s.place.name}\"")
+        engine.earcon(Earcon.NOT_UNDERSTOOD)
+        if (s.kind == SuggestionKind.PROACTIVE) {
+            proactiveDeclines++
+            askDestinationAgain("Okay. Where would you like to go?")
+        } else {
+            askDestinationAgain("Okay, not ${s.place.name}. Say the place again, or a nearby landmark.")
+        }
+    }
+
+    /** "my places": the three most visited, then listen for a choice. */
+    private fun speakMyPlaces() {
+        if (!app.memory.enabled) {
+            speak("I only remember your places when you're signed in. Say sign in to set that up.",
+                NarrationTier.QUEUED) { openMic(MicPurpose.BOOKING) }
+            return
+        }
+        val top = app.memory.current.places.take(3)
+        if (top.isEmpty()) {
+            speak("You haven't finished a ride with me yet, so I don't have any places for you. " +
+                "Where would you like to go?", NarrationTier.QUEUED) { openMic(MicPurpose.BOOKING) }
+            return
+        }
+        val names = when (top.size) {
+            1 -> top[0].name
+            2 -> "${top[0].name}, and ${top[1].name}"
+            else -> "${top[0].name}, ${top[1].name}, and ${top[2].name}"
+        }
+        speak("Your usual places are $names. Say one of them, or anywhere else.", NarrationTier.QUEUED) {
+            openMic(MicPurpose.BOOKING)
+        }
+    }
+
+    private fun forgetHistory() {
+        if (!app.memory.enabled) {
+            speak("I'm not keeping any history for you.", NarrationTier.QUEUED)
+            return
+        }
+        app.memory.forgetAll { ok ->
+            onMain {
+                speak(
+                    if (ok) "Done. I've forgotten your places and past trips."
+                    else "I've forgotten them on this phone. I couldn't reach the server, so I'll need to try again later.",
+                    NarrationTier.QUEUED
+                )
+            }
+        }
+    }
+
+    private fun preferredRideType(): RideType =
+        runCatching { RideType.valueOf(app.riderAccount.value?.rider?.preferredRideType ?: "AUTO") }
+            .getOrDefault(RideType.AUTO)
+
+    private fun VisitedPlace.toOption(): PlaceOption? {
+        val lat = latitude ?: return null
+        val lng = longitude ?: return null
+        return PlaceOption(
+            name = name,
+            latitude = lat,
+            longitude = lng,
+            score = 1f,
+            coversWholeToken = true,
+            formattedAddress = address,
+            placeId = placeId
+        )
+    }
+
+    // =================================================================================
+    //  After the ride: optional feedback, then the next journey
+    //
+    //     paid ─▶ "How was your ride with Karthik?"  (1–5 / report a problem / skip / silence)
+    //               │ low rating or "report" ─▶ "What went wrong?" ─▶ read back ─▶ yes ─▶ sent
+    //               ▼
+    //            "Book another ride now, schedule one for later, or are you done?"
+    //               ├─ now      ─▶ "Where would you like to go?"
+    //               ├─ later    ─▶ "When?" ─▶ "Where to?" ─▶ read back ─▶ yes ─▶ scheduled
+    //               └─ done / silence ─▶ idle, with how to come back
+    // =================================================================================
+
+    private fun startFeedback() {
+        postRideMisses = 0
+        val name = lastDriverName.ifBlank { "your driver" }
+        transition(RiderState.Feedback(driverName = name), announce = false)
+        speak(
+            "How was your ride with $name? Say a number from one to five, say report a problem, or say skip.",
+            NarrationTier.QUEUED
+        ) { openMic(MicPurpose.FEEDBACK) }
+    }
+
+    private fun resolveFeedback(classification: Classification, text: String) {
+        val state = uiState.ride as? RiderState.Feedback ?: run {
+            finishFeedback(send = false, spokenThanks = false)
+            return
+        }
+        val intent = FeedbackParser.intentOf(text)
+
+        when (state.step) {
+            FeedbackStep.RATING -> when {
+                // "One. There was no OTP verification": a rating and the report in one breath.
+                // Keep both — found in the demo, where the words after the number were lost.
+                intent == FeedbackParser.Intent.RATING && FeedbackParser.wordCount(
+                    FeedbackParser.cleanReport(text, FeedbackParser.rating(text))
+                ) >= 3 -> {
+                    val rating = FeedbackParser.rating(text) ?: 3
+                    confirmReport(state.copy(rating = rating), FeedbackParser.cleanReport(text, rating), withRating = true)
+                }
+                intent == FeedbackParser.Intent.RATING -> takeRating(state, FeedbackParser.rating(text) ?: 3)
+                intent == FeedbackParser.Intent.REPORT ->
+                    askFeedback(state.copy(step = FeedbackStep.REPORT), "Tell me what happened.")
+                intent == FeedbackParser.Intent.SKIP || classification.intent is RiderIntent.No ->
+                    finishFeedback(send = false, spokenThanks = false)
+                // A sentence rather than a number is usually the report itself.
+                text.trim().split(Regex("\\s+")).size >= 4 -> confirmReport(state, FeedbackParser.cleanReport(text))
+                else -> {
+                    postRideMisses++
+                    if (postRideMisses >= 2) finishFeedback(send = false, spokenThanks = false)
+                    else askFeedback(state, "Say a number from one to five, or say skip.")
+                }
+            }
+
+            // "One out of five. Is that right?"
+            FeedbackStep.RATING_CHECK -> {
+                val said = FeedbackParser.rating(text)
+                when {
+                    // "No, five": the corrected number wins over the no.
+                    said != null && said != state.rating -> takeRating(state, said)
+                    classification.intent is RiderIntent.Yes || (said != null && said == state.rating) -> {
+                        engine.earcon(Earcon.UNDERSTOOD)
+                        askFeedback(state.copy(step = FeedbackStep.REPORT),
+                            "Sorry it wasn't good. What went wrong? Say it now, or say skip.")
+                    }
+                    classification.intent is RiderIntent.No ->
+                        askFeedback(state.copy(rating = null, step = FeedbackStep.RATING),
+                            "Okay. Say a number from one to five.")
+                    intent == FeedbackParser.Intent.SKIP -> finishFeedback(send = false, spokenThanks = false)
+                    else -> {
+                        postRideMisses++
+                        if (postRideMisses >= 2) finishFeedback(send = false, spokenThanks = false)
+                        else askFeedback(state, "Say yes if ${state.rating} out of 5 is right, or say the number again.")
+                    }
+                }
+            }
+
+            FeedbackStep.REPORT -> {
+                val report = FeedbackParser.cleanReport(text, state.rating)
+                if ((intent == FeedbackParser.Intent.SKIP && text.trim().split(Regex("\\s+")).size <= 3) || report.isBlank()) {
+                    finishFeedback(send = state.rating != null, spokenThanks = state.rating != null)
+                } else {
+                    confirmReport(state, report)
+                }
+            }
+
+            FeedbackStep.CONFIRM -> when {
+                classification.intent is RiderIntent.Yes && FeedbackParser.wordCount(FeedbackParser.cleanReport(text)) < 3 -> {
+                    uiState = uiState.copy(ride = state.copy(step = FeedbackStep.SENT))
+                    finishFeedback(send = true, spokenThanks = true)
+                }
+                // "Send it" / "send this as feedback" means yes. Anything more they said with it
+                // is added and read back once more, so nothing is sent unheard.
+                FeedbackParser.isSendCommand(text) -> {
+                    val extra = FeedbackParser.cleanReport(text)
+                    if (FeedbackParser.wordCount(extra) >= 3) {
+                        confirmReport(state, "${state.report}. $extra".trim('.', ' '))
+                    } else {
+                        uiState = uiState.copy(ride = state.copy(step = FeedbackStep.SENT))
+                        finishFeedback(send = true, spokenThanks = true)
+                    }
+                }
+                // "Yes, and he was also on his phone": add it and read back once more.
+                classification.intent is RiderIntent.Yes ->
+                    confirmReport(state, "${state.report}. ${FeedbackParser.afterYes(text)}".trim('.', ' '))
+                classification.intent is RiderIntent.No -> {
+                    postRideMisses++
+                    if (postRideMisses >= 2) finishFeedback(send = state.rating != null, spokenThanks = false)
+                    else askFeedback(state.copy(step = FeedbackStep.REPORT, category = "", report = ""),
+                        "Okay. Tell me again, or say skip.")
+                }
+                intent == FeedbackParser.Intent.SKIP -> finishFeedback(send = state.rating != null, spokenThanks = false)
+                // More words: the rider is adding to or correcting the report.
+                else -> {
+                    val extra = FeedbackParser.cleanReport(text)
+                    if (extra.isBlank()) askFeedback(state, "Say yes to send it, or no to change it.")
+                    else confirmReport(state, "${state.report}. $extra".trim('.', ' '))
+                }
+            }
+
+            FeedbackStep.SENT -> finishFeedback(send = false, spokenThanks = false)
+        }
+    }
+
+    /**
+     * A rating was heard. High ones are thanked with the number said back, so a mishearing is
+     * audible; low ones are read back and confirmed before anything is sent.
+     */
+    private fun takeRating(state: RiderState.Feedback, rating: Int) {
+        postRideMisses = 0
+        engine.earcon(Earcon.UNDERSTOOD)
+        if (rating <= 2) {
+            askFeedback(state.copy(rating = rating, step = FeedbackStep.RATING_CHECK),
+                "$rating out of 5. Is that right?")
+        } else {
+            uiState = uiState.copy(ride = state.copy(rating = rating, step = FeedbackStep.SENT))
+            finishFeedback(send = true, spokenThanks = true)
+        }
+    }
+
+    /**
+     * Reads the report back exactly as it will be sent — the admin sees these same words — and
+     * asks before sending. With [withRating] the rating heard in the same sentence is read too.
+     */
+    private fun confirmReport(state: RiderState.Feedback, words: String, withRating: Boolean = false) {
+        val category = FeedbackParser.categorise(words)
+        engine.earcon(Earcon.UNDERSTOOD)
+        val lead = if (withRating && state.rating != null) "${state.rating} out of 5. " else ""
+        askFeedback(
+            state.copy(step = FeedbackStep.CONFIRM, category = category.name, report = words.trim()),
+            "${lead}I'll report this as ${category.spoken}: ${words.trim()}. Shall I send it?"
+        )
+    }
+
+    private fun askFeedback(next: RiderState.Feedback, question: String) {
+        transition(next, announce = false)
+        speak(question, NarrationTier.QUEUED) { openMic(MicPurpose.FEEDBACK) }
+    }
+
+    /**
+     * Sends whatever feedback there is (if asked to), then moves on to the next journey.
+     * The send is fire-and-forget: a rider is never kept waiting on a server to say goodbye.
+     */
+    private fun finishFeedback(send: Boolean, spokenThanks: Boolean) {
+        val state = uiState.ride as? RiderState.Feedback
+        val rideId = lastCompletedRideId
+        val urgent = state?.category == FeedbackParser.Category.SAFETY.name
+        if (send && state != null && rideId != null && (state.rating != null || state.report.isNotBlank())) {
+            viewModelScope.launch {
+                val result = api.submitFeedback(
+                    rideId, state.rating, state.category.ifBlank { null }, state.report.ifBlank { null }
+                )
+                if (result is ApiResult.Failed) Log.w(TAG, "FEEDBACK not sent: ${result.detail}")
+            }
+            Log.i(TAG, "FEEDBACK ride=$rideId rating=${state.rating} category=${state.category.ifBlank { "-" }}")
+        }
+        val thanks = when {
+            urgent && send -> "I've sent it and marked it urgent. If you are in danger now, press the S O S button. "
+            spokenThanks && state?.report?.isNotBlank() == true -> "Sent. Thank you for telling me. "
+            spokenThanks && state?.rating != null -> "${state.rating} out of 5. Thank you. "
+            spokenThanks -> "Thank you. "
+            else -> ""
+        }
+        askNextJourney(thanks)
+    }
+
+    private fun askNextJourney(lead: String = "") {
+        postRideMisses = 0
+        draftAt = null
+        draftPhrase = ""
+        draftPlace = null
+        transition(RiderState.NextJourney(NextStep.CHOOSE), announce = false)
+        speak(
+            "${lead}Would you like to book another ride now, schedule one for later, or are you done?",
+            NarrationTier.QUEUED
+        ) { openMic(MicPurpose.NEXT_JOURNEY) }
+    }
+
+    private fun resolveNextJourney(classification: Classification, text: String) {
+        val state = uiState.ride as? RiderState.NextJourney ?: return
+        when (state.step) {
+            NextStep.CHOOSE -> {
+                // Said it all at once: "tomorrow at 8 30".
+                val at = SpokenTime.parse(text, ZonedDateTime.now(SpokenTime.zone()))
+                if (at != null) {
+                    draftAt = at
+                    askWhere()
+                    return
+                }
+                // Or named a place: "take me to Gandhipuram" — that is "now", with the answer.
+                // ("book another ride" also parses as a booking, to a place called "other
+                // ride"; words like that are not a destination.)
+                if (classification.kind == UtteranceClass.BOOKING) {
+                    val book = classification.intent as RiderIntent.Book
+                    val real = book.destinationQuery.split(" ")
+                        .filter { it.isNotBlank() && it !in NOT_A_PLACE }
+                    if (real.isNotEmpty()) {
+                        endPostRide(null)
+                        resolveDestination(book.destinationQuery, book.rawDestination, book.rideType)
+                        return
+                    }
+                }
+                when (NextJourneyChoice.classify(text)) {
+                    NextJourneyChoice.Kind.NOW -> {
+                        endPostRide(null)
+                        askDestinationAgain("Where would you like to go?")
+                    }
+                    NextJourneyChoice.Kind.LATER -> startScheduling(fromIdle = false)
+                    NextJourneyChoice.Kind.DONE -> endPostRide("Okay. Hold anywhere when you need a ride.")
+                    NextJourneyChoice.Kind.NONE -> {
+                        postRideMisses++
+                        if (postRideMisses >= 2) endPostRide("I'll wait. Hold anywhere when you need a ride.")
+                        else askNext(state, "Say book now, schedule, or done.")
+                    }
+                }
+            }
+
+            NextStep.WHEN -> {
+                if (classification.intent is RiderIntent.Back || classification.intent is RiderIntent.No) {
+                    askNextJourney()
+                    return
+                }
+                val at = SpokenTime.parse(text, ZonedDateTime.now(SpokenTime.zone()))
+                if (at == null) {
+                    postRideMisses++
+                    if (postRideMisses >= 3) endPostRide("Let's leave it for now. Say schedule a ride any time.")
+                    else askNext(state, "I didn't get a time. Say something like tomorrow at 8 30, or in two hours.")
+                    return
+                }
+                postRideMisses = 0
+                draftAt = at
+                askWhere()
+            }
+
+            NextStep.WHERE -> {
+                if (classification.intent is RiderIntent.Back) {
+                    startScheduling(fromIdle = false)
+                    return
+                }
+                val extraction = com.cabeye.rider.intent.IntentParser.extract(text)
+                val phrase = extraction.rawDestination.ifBlank { Stopwords.normalise(text) }.trim()
+                if (Stopwords.strip(phrase).isBlank()) {
+                    postRideMisses++
+                    if (postRideMisses >= 3) endPostRide("Let's leave it for now. Say schedule a ride any time.")
+                    else askNext(state, "Where should the ride go?")
+                    return
+                }
+                postRideMisses = 0
+                draftPhrase = phrase
+                // Look it up in the rider's places so the confirmation names the real place;
+                // anything else is resolved normally when the time comes.
+                draftPlace = if (app.memory.enabled) {
+                    val moment = memoryMoment()
+                    (PreferenceMemoryAgent.direct(phrase, app.memory.current, moment)
+                        ?: PreferenceMemoryAgent.repair(phrase, app.memory.current, moment, memoryThresholds()))?.place
+                } else null
+                val when_ = draftAt?.let { SpokenTime.spoken(it, ZonedDateTime.now(SpokenTime.zone())) } ?: ""
+                val to = draftPlace?.name ?: phrase
+                askNext(
+                    RiderState.NextJourney(NextStep.CONFIRM, scheduledAtText = when_, scheduledTo = to),
+                    "A ride to $to, $when_. Shall I schedule it?"
+                )
+            }
+
+            NextStep.CONFIRM -> when {
+                classification.intent is RiderIntent.Yes -> saveSchedule()
+                classification.intent is RiderIntent.No || classification.intent is RiderIntent.Back -> {
+                    speak("Okay, let's try again.", NarrationTier.QUEUED)
+                    startScheduling(fromIdle = false)
+                }
+                else -> {
+                    postRideMisses++
+                    if (postRideMisses >= 2) endPostRide("I didn't schedule it. Say schedule a ride any time.")
+                    else askNext(state, "Say yes to schedule it, or no to change it.")
+                }
+            }
+
+            NextStep.SCHEDULED -> endPostRide(null)
+        }
+    }
+
+    /** "schedule a ride" from anywhere, or "later" from the next-journey question. */
+    private fun startScheduling(fromIdle: Boolean) {
+        postRideMisses = 0
+        draftAt = null
+        draftPhrase = ""
+        draftPlace = null
+        if (fromIdle && activeRideId != null) {
+            speak("You're on a ride now. Ask me again when it's finished.", NarrationTier.QUEUED)
+            return
+        }
+        askNext(
+            RiderState.NextJourney(NextStep.WHEN),
+            "When should I book it? For example, tomorrow at 8 30, or in two hours."
+        )
+    }
+
+    private fun askWhere() {
+        val when_ = draftAt?.let { SpokenTime.spoken(it, ZonedDateTime.now(SpokenTime.zone())) } ?: ""
+        askNext(
+            RiderState.NextJourney(NextStep.WHERE, scheduledAtText = when_),
+            "$when_. Where should the ride go?"
+        )
+    }
+
+    private fun askNext(next: RiderState.NextJourney, question: String) {
+        transition(next, announce = false)
+        speak(question, NarrationTier.QUEUED) { openMic(MicPurpose.NEXT_JOURNEY) }
+    }
+
+    private fun saveSchedule() {
+        val at = draftAt ?: return startScheduling(fromIdle = false)
+        val place = draftPlace
+        val saved = app.scheduler.add(
+            ScheduledRide(
+                id = "",
+                at = at.toInstant().toEpochMilli(),
+                destinationPhrase = draftPhrase,
+                placeName = place?.name.orEmpty(),
+                latitude = place?.latitude,
+                longitude = place?.longitude,
+                address = place?.address.orEmpty(),
+                placeId = place?.placeId.orEmpty(),
+                rideType = preferredRideType().name
+            )
+        )
+        val spokenAt = SpokenTime.spoken(at, ZonedDateTime.now(SpokenTime.zone()))
+        engine.earcon(Earcon.BOOKING_CONFIRMED)
+        uiState = uiState.copy(
+            ride = RiderState.NextJourney(NextStep.SCHEDULED, scheduledAtText = spokenAt, scheduledTo = saved.spokenDestination)
+        )
+        endPostRide(
+            "Scheduled for $spokenAt. When it's time I'll tell you and book your ride to " +
+                "${saved.spokenDestination}, with the usual chance to cancel.",
+            keepScreen = true
+        )
+    }
+
+    /**
+     * Leaves the post-ride questions. [line] is said on the way out (null for silence), and the
+     * screen returns to idle once it has been said.
+     */
+    private fun endPostRide(line: String?, keepScreen: Boolean = false) {
+        postRideMisses = 0
+        setPayment(null)
+        if (line == null) {
+            transition(RiderState.Idle, announce = false)
+            return
+        }
+        if (!keepScreen) transition(RiderState.Idle, announce = false)
+        speak(line, NarrationTier.QUEUED) {
+            if (uiState.ride is RiderState.NextJourney) transition(RiderState.Idle, announce = false)
+        }
+    }
+
+    // ---------------------------------------------------------------------------------
+    //  Scheduled rides coming due
+    // ---------------------------------------------------------------------------------
+
+    private fun watchSchedules() {
+        viewModelScope.launch {
+            app.dueScheduledRide.collect { id -> if (id != null) startDueRide() }
+        }
+    }
+
+    /**
+     * A scheduled ride is due. Started only from a quiet moment — idle, or at the end of the
+     * post-ride questions — and never on top of a ride in progress. If the moment is not quiet
+     * the id stays pending and is picked up the next time the app returns to idle.
+     */
+    private fun startDueRide() {
+        val id = app.dueScheduledRide.value ?: return
+        val ride = uiState.ride
+        // A finished ride that is still waiting to be paid is not a quiet moment: starting a
+        // new booking there would throw away the payment panel the rider is using.
+        val paidOrNoFare = ride is RiderState.Done &&
+            (uiState.payment?.phase == PaymentPhase.PAID || ride.fareRupees == 0)
+        val quiet = activeRideId == null && !uiState.micOpen &&
+            (ride is RiderState.Idle || ride is RiderState.NextJourney || paidOrNoFare)
+        if (!quiet) return
+        // Opened cold from the notification, the voice may still be warming up; the first
+        // sentence here is the only warning the rider gets that a booking is starting.
+        if (!app.audioReady) {
+            viewModelScope.launch {
+                val deadline = System.currentTimeMillis() + 6_000L
+                while (!app.audioReady && System.currentTimeMillis() < deadline) delay(100)
+                if (app.audioReady || System.currentTimeMillis() >= deadline) startDueRideNow()
+            }
+            return
+        }
+        startDueRideNow()
+    }
+
+    private fun startDueRideNow() {
+        val id = app.dueScheduledRide.value ?: return
+
+        app.dueScheduledRide.value = null
+        val scheduled = app.scheduler.find(id) ?: return
+        app.scheduler.remove(id)
+        Log.i(TAG, "SCHEDULE starting id=$id to=\"${scheduled.spokenDestination}\"")
+
+        setPayment(null)
+        val rideType = runCatching { RideType.valueOf(scheduled.rideType) }.getOrDefault(RideType.AUTO)
+        val lat = scheduled.latitude
+        val lng = scheduled.longitude
+        speak("It's time for your scheduled ride to ${scheduled.spokenDestination}.", NarrationTier.INTERRUPT) {
+            if (lat != null && lng != null) {
+                beginOptimisticBooking(
+                    PlaceOption(
+                        name = scheduled.placeName.ifBlank { scheduled.destinationPhrase },
+                        latitude = lat, longitude = lng, score = 1f, coversWholeToken = true,
+                        formattedAddress = scheduled.address, placeId = scheduled.placeId
+                    ),
+                    rideType,
+                    note = "as scheduled"
+                )
+            } else {
+                resolveDestination(
+                    Stopwords.strip(scheduled.destinationPhrase), scheduled.destinationPhrase, rideType
+                )
+            }
+        }
+    }
+
+    /**
+     * The post-ride buttons, for a sighted helper or a TalkBack user:
+     * "skip" / "report" on the feedback screen, "now" / "schedule" / "done" on the next one.
+     */
+    fun onPostRideAction(action: String) {
+        stt?.cancel()
+        closeMic()
+        engine.stopSpeaking()
+        val ride = uiState.ride
+        when (action) {
+            "skip" -> if (ride is RiderState.Feedback) finishFeedback(send = ride.rating != null, spokenThanks = false)
+            "report" -> if (ride is RiderState.Feedback) askFeedback(ride.copy(step = FeedbackStep.REPORT), "Tell me what happened.")
+            "send" -> if (ride is RiderState.Feedback) finishFeedback(send = true, spokenThanks = true)
+            "rating-yes" -> if (ride is RiderState.Feedback && ride.step == FeedbackStep.RATING_CHECK) {
+                askFeedback(ride.copy(step = FeedbackStep.REPORT), "Sorry it wasn't good. What went wrong? Say it now, or say skip.")
+            }
+            "rating-no" -> if (ride is RiderState.Feedback && ride.step == FeedbackStep.RATING_CHECK) {
+                askFeedback(ride.copy(rating = null, step = FeedbackStep.RATING), "Okay. Say a number from one to five.")
+            }
+            "now" -> { endPostRide(null); askDestinationAgain("Where would you like to go?") }
+            "schedule" -> startScheduling(fromIdle = false)
+            "confirm" -> if (ride is RiderState.NextJourney && ride.step == NextStep.CONFIRM) saveSchedule()
+            "done" -> endPostRide("Okay. Hold anywhere when you need a ride.")
+        }
+    }
+
+    private fun speakScheduled() {
+        val upcoming = app.scheduler.upcoming().filter { it.at > System.currentTimeMillis() }
+        val now = ZonedDateTime.now(SpokenTime.zone())
+        val line = when (upcoming.size) {
+            0 -> "You have no rides scheduled. Say schedule a ride to book one for later."
+            1 -> "You have one ride scheduled: to ${upcoming[0].spokenDestination}, " +
+                "${SpokenTime.spoken(upcoming[0].atZoned(), now)}."
+            else -> "You have ${upcoming.size} rides scheduled. " + upcoming.take(3).joinToString(" ") {
+                "To ${it.spokenDestination}, ${SpokenTime.spoken(it.atZoned(), now)}."
+            }
+        }
+        speak(line, NarrationTier.QUEUED)
+    }
+
+    private fun cancelScheduled() {
+        val count = app.scheduler.upcoming().size
+        app.scheduler.clear()
+        speak(
+            if (count == 0) "You have no scheduled rides." else
+                "Cancelled ${if (count == 1) "your scheduled ride" else "all $count scheduled rides"}.",
+            NarrationTier.QUEUED
+        )
+    }
+
+    private fun ScheduledRide.atZoned(): ZonedDateTime =
+        java.time.Instant.ofEpochMilli(at).atZone(SpokenTime.zone())
 
     // =================================================================================
     //  Commands
@@ -1605,6 +3580,27 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             is RiderIntent.SwitchCity -> switchCity(intent.spokenCity)
             is RiderIntent.SetTheme -> setTheme(intent.theme)
             is RiderIntent.DemoRide -> startDemoRide()
+            is RiderIntent.Back -> goBack()
+            is RiderIntent.MyPlaces -> speakMyPlaces()
+            is RiderIntent.GiveFeedback -> {
+                if (lastCompletedRideId == null) {
+                    speak("There's no finished ride to give feedback on yet.", NarrationTier.QUEUED)
+                } else startFeedback()
+            }
+            is RiderIntent.ScheduleRide -> startScheduling(fromIdle = true)
+            is RiderIntent.ListScheduled -> speakScheduled()
+            is RiderIntent.CancelScheduled -> cancelScheduled()
+            is RiderIntent.ForgetHistory -> forgetHistory()
+            is RiderIntent.SignOut, is RiderIntent.SignIn -> {
+                // Either way the sign-in screen comes next: signing out shows it for a new
+                // number, and a guest asking to sign in is shown it for the first time.
+                app.auth.riderIsGuest = false
+                speak(
+                    if (intent is RiderIntent.SignOut) "Signing out." else "Okay, let's sign you in.",
+                    NarrationTier.INTERRUPT
+                )
+                app.signOut(com.cabeye.rider.net.AppRole.RIDER)
+            }
             is RiderIntent.Greeting -> handleGreeting()
             is RiderIntent.BookAgain -> {
                 val previous = lastBooking
@@ -1764,7 +3760,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
      * The countdown starts when the **microphone opens**, not when the sentence starts —
      * otherwise part of the "five second window" would be spent listening to the app talk.
      */
-    private fun beginOptimisticBooking(place: PlaceOption, rideType: RideType) {
+    private fun beginOptimisticBooking(place: PlaceOption, rideType: RideType, note: String = "") {
         cancelWindowJob?.cancel()
         silenceJob?.cancel()
         lastBooking = place.name to rideType
@@ -1795,7 +3791,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         engine.earcon(Earcon.BOOKING_CONFIRMED)
 
         speak(
-            buildBookingAnnouncement(place, rideType),
+            buildBookingAnnouncement(place, rideType, note),
             NarrationTier.QUEUED,
             onStart = {
                 // T4 — the moment the rider first HEARS something.
@@ -1813,12 +3809,17 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         bookingStartedAt = System.currentTimeMillis()
     }
 
-    private fun buildBookingAnnouncement(place: PlaceOption, rideType: RideType): String {
+    /**
+     * @param note why this place, when the memory chose it ("one of your usual places"). Said
+     *   so the rider knows the app is going on their history rather than on what it heard.
+     */
+    private fun buildBookingAnnouncement(place: PlaceOption, rideType: RideType, note: String = ""): String {
         val address = place.formattedAddress.takeIf { it.isNotBlank() }
+        val why = if (note.isNotBlank()) ", $note" else ""
         return if (address != null) {
-            "Booking ${rideType.spokenName} to ${place.name}, $address. Say cancel to stop."
+            "Booking ${rideType.spokenName} to ${place.name}$why, $address. Say cancel to stop."
         } else {
-            "Booking ${rideType.spokenName} to ${place.name}. Say cancel to stop."
+            "Booking ${rideType.spokenName} to ${place.name}$why. Say cancel to stop."
         }
     }
 
@@ -1873,12 +3874,16 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                 // this booking. The phonebook itself never leaves the phone.
                 contactName = chosenContact?.name.orEmpty(),
                 contactPhone = chosenContact?.phone.orEmpty(),
-                dropNote = chosenDropNote
+                dropNote = chosenDropNote,
+                spokenAs = pendingSpokenAs.also { pendingSpokenAs = "" }
             )) {
                 is ApiResult.Ok -> {
                     val snapshot = result.value
                     activeRideId = snapshot.rideId
                     expectedCode = snapshot.boardingCode
+                    // A new ride: the last ride's payment panel and watcher belong to it, not this.
+                    paymentPollJob?.cancel()
+                    setPayment(null)
                     lastSpokenPhase = RidePhase.REQUESTED
 
                     Log.i(TAG, "RIDE created id=${snapshot.rideId} code=${snapshot.boardingCode}")
@@ -1906,7 +3911,9 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Closes the socket for a finished ride and forgets its state. */
     private fun endRide(reason: String) {
+        stopCamera("RIDE_ENDED")
         socket.unsubscribe(reason)
+        lastCompletedRideId = activeRideId
         activeRideId = null
         expectedCode = ""
         lastSpokenPhase = null
@@ -1999,11 +4006,64 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 
+    /**
+     * The narrator's speed and volume, by voice. Speed is remembered on this phone; volume is
+     * the phone's own media volume, the same one the volume keys change.
+     */
+    private fun handleVoiceSettings(text: String): Boolean {
+        val t = text.lowercase().trim()
+        if (t.split(Regex("\\s+")).size > 5) return false
+
+        val rateChange = when {
+            Regex("\\b(slower|slow down|more slowly|too fast)\\b").containsMatchIn(t) -> -0.15f
+            Regex("\\b(faster|speed up|more quickly|too slow)\\b").containsMatchIn(t) -> 0.15f
+            else -> null
+        }
+        if (rateChange != null) {
+            val rate = (prefs.speechRate + rateChange).coerceIn(0.6f, 1.6f)
+            prefs.speechRate = rate
+            engine.setSpeechRate(rate)
+            Log.i(TAG, "SETTINGS speechRate=$rate")
+            engine.earcon(Earcon.UNDERSTOOD)
+            speak(
+                when {
+                    rateChange < 0 && rate <= 0.6f -> "This is as slow as I go."
+                    rateChange > 0 && rate >= 1.6f -> "This is as fast as I go."
+                    rateChange < 0 -> "Okay, I'll speak slower. Is this better?"
+                    else -> "Okay, I'll speak faster. Is this better?"
+                },
+                NarrationTier.QUEUED
+            )
+            return true
+        }
+
+        val volume = when {
+            Regex("\\b(louder|speak up|volume up|can'?t hear|cannot hear)\\b").containsMatchIn(t) ->
+                android.media.AudioManager.ADJUST_RAISE
+            Regex("\\b(quieter|softer|volume down|too loud)\\b").containsMatchIn(t) ->
+                android.media.AudioManager.ADJUST_LOWER
+            else -> null
+        }
+        if (volume != null) {
+            val audio = getApplication<Application>().getSystemService(android.media.AudioManager::class.java)
+            repeat(2) { audio?.adjustStreamVolume(android.media.AudioManager.STREAM_MUSIC, volume, 0) }
+            Log.i(TAG, "SETTINGS volume ${if (volume == android.media.AudioManager.ADJUST_RAISE) "up" else "down"}")
+            speak(
+                if (volume == android.media.AudioManager.ADJUST_RAISE) "Louder. Is this better?"
+                else "Quieter. Is this better?",
+                NarrationTier.QUEUED
+            )
+            return true
+        }
+        return false
+    }
+
     private fun speakHelp() {
         speak(
             "I cover ${Gazetteer.activeCity.displayName}. Say: take me to a place. " +
-                    "Or say list places, status, repeat, cancel, call driver, book again, " +
-                    "switch city, or yellow theme.",
+                    "Or say my places, list places, status, repeat, go back, cancel, call driver, book again, " +
+                    "switch city, or yellow theme. To change how I sound, say speak slower, speak faster, " +
+                    "louder, or quieter. A short press on the volume keys also changes the volume.",
             NarrationTier.QUEUED
         ) { openMic(MicPurpose.BOOKING) }
     }
@@ -2030,6 +4090,8 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                 else "Your driver is here, waiting for you to check the code."
             is RiderState.InTrip -> "On the way to ${ride.destination}."
             is RiderState.Done -> "That ride is finished."
+            is RiderState.Feedback -> "I'm asking about your last ride. Say skip to move on."
+            is RiderState.NextJourney -> "Say book now, schedule, or done."
             else -> "Working on it."
         }
         speak(status, NarrationTier.QUEUED)
@@ -2048,6 +4110,30 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         if (micPurpose == MicPurpose.CODE_VERIFY) {
             if (!codeVerified && uiState.ride is RiderState.Arrived) openMic(MicPurpose.CODE_VERIFY)
             return
+        }
+
+        // Not heard while answering the camera question: ask once more, then take it as a no.
+        if (micPurpose == MicPurpose.CAMERA) {
+            if (uiState.camera == CameraShare.ASKING) reaskCamera()
+            return
+        }
+
+        // Not heard clearly while naming a destination: before the generic "I didn't catch
+        // that", let the memory try — once per booking. It uses the half-heard partial if
+        // there was one, and otherwise the rider's habit for this time of day: "I didn't catch
+        // that. Were you going to PSG College, like most weekday mornings?"
+        if ((micPurpose == MicPurpose.BOOKING || micPurpose == MicPurpose.SLOT_ANSWER) &&
+            (error == SpeechError.NO_MATCH || error == SpeechError.NO_SPEECH) &&
+            !memoryRescueUsed && app.memory.enabled
+        ) {
+            val heard = lastPartial
+            val rescue = if (heard.isNotBlank()) memoryRepair(heard) else memoryGuess()
+            if (rescue != null) {
+                memoryRescueUsed = true
+                Log.i(TAG, "MEMORY rescue error=$error partial=\"$heard\" place=\"${rescue.place.name}\"")
+                askMemory(rescue, heard = heard, prompt = repairPrompt(rescue, heardClearly = false))
+                return
+            }
         }
 
         consecutiveSpeechErrors++
@@ -2082,7 +4168,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             MicPurpose.CLARIFY_ANSWER -> {
                 val options = pendingOptions
                 if (options != null) {
-                    speak("Sorry — ${options.first.name}, or ${options.second.name}?", NarrationTier.QUEUED) {
+                    speak("Sorry. ${options.first.name}, or ${options.second.name}? Or say neither.", NarrationTier.QUEUED) {
                         openMic(MicPurpose.CLARIFY_ANSWER)
                     }
                     return
@@ -2106,6 +4192,29 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                 return
             }
 
+            MicPurpose.FEEDBACK, MicPurpose.NEXT_JOURNEY -> {
+                postRideMisses++
+                if (postRideMisses >= 2) {
+                    if (micPurpose == MicPurpose.FEEDBACK) finishFeedback(send = true, spokenThanks = false)
+                    else endPostRide("I'll wait. Hold anywhere when you need a ride.")
+                } else {
+                    speak("Sorry, I didn't catch that. ${lastSpoken}", NarrationTier.QUEUED) {
+                        openMic(micPurpose)
+                    }
+                }
+                return
+            }
+
+            MicPurpose.MEMORY_ANSWER -> {
+                val pending = pendingMemory
+                if (pending != null) {
+                    speak("Sorry. ${pending.place.name}? Yes or no.", NarrationTier.QUEUED) {
+                        openMic(MicPurpose.MEMORY_ANSWER)
+                    }
+                    return
+                }
+            }
+
             // Not hearing an answer to a ladder question is a legitimate answer to it. The
             // rider is standing on a street with somewhere to be; the app takes the silence,
             // books the ride, and stops asking.
@@ -2117,7 +4226,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                 return
             }
 
-            MicPurpose.CANCEL_WINDOW, MicPurpose.CODE_VERIFY -> return
+            MicPurpose.CANCEL_WINDOW, MicPurpose.CODE_VERIFY, MicPurpose.CAMERA -> return
             MicPurpose.BOOKING -> Unit
         }
 
@@ -2213,6 +4322,10 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         )
         if (next is RiderState.Idle) engine.heartbeat(false)
         uiState = uiState.copy(ride = next)
+        // A scheduled ride that came due while the app was busy starts at the next quiet moment.
+        if (next is RiderState.Idle && app.dueScheduledRide.value != null) {
+            viewModelScope.launch { startDueRide() }
+        }
     }
 
     /** TTS callbacks arrive on a binder thread; state updates must not. */
@@ -2221,10 +4334,12 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     override fun onCleared() {
+        cameraStreamer.stop()
         cancelWindowJob?.cancel()
         silenceJob?.cancel()
         micReopenJob?.cancel()
         codeListenJob?.cancel()
+        paymentPollJob?.cancel()
         listPlacesJob?.cancel()
         demoRideJob?.cancel()
         stt?.cancel()

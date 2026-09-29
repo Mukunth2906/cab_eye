@@ -1,6 +1,9 @@
 package com.cabeye.rider.net
 
 import android.util.Log
+import com.cabeye.rider.auth.AccountInfo
+import com.cabeye.rider.auth.AuthStore
+import com.cabeye.rider.memory.RiderMemory
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.Call
@@ -49,7 +52,7 @@ sealed interface ApiResult<out T> {
  * forgot the header would report the wrong role to the backend under precisely the conditions
  * the toggle exists to create.
  */
-class RideApi(private val settings: AppSettings) {
+class RideApi(private val settings: AppSettings, private val auth: AuthStore) {
 
     private companion object {
         const val TAG = "CabEye.Api"
@@ -66,8 +69,12 @@ class RideApi(private val settings: AppSettings) {
         .retryOnConnectionFailure(true)
         .addInterceptor { chain ->
             val s = settings.current()
+            val builder = chain.request().newBuilder()
+            // The sign-in token for whichever role this phone is in right now. The server
+            // trusts it over X-User-Id, so a rider's token never rides on a driver's request.
+            auth.token(s.role)?.let { builder.header("Authorization", "Bearer $it") }
             chain.proceed(
-                chain.request().newBuilder()
+                builder
                     .header("X-User-Id", s.userId)
                     .header("X-Role", s.role.wireName)
                     // ngrok's free tier serves an HTML interstitial to browser-looking clients.
@@ -127,7 +134,8 @@ class RideApi(private val settings: AppSettings) {
         pickupLongitude: Double? = null,
         contactName: String = "",
         contactPhone: String = "",
-        dropNote: String = ""
+        dropNote: String = "",
+        spokenAs: String = ""
     ): ApiResult<RideSnapshot> {
         val body = JSONObject()
             .put("destination", destination)
@@ -138,6 +146,8 @@ class RideApi(private val settings: AppSettings) {
             .put("contactName", contactName)
             .put("contactPhone", contactPhone)
             .put("dropNote", dropNote)
+            // The rider's own words, for their memory's alias learning.
+            .put("spokenAs", spokenAs)
         if (destinationLatitude != null) body.put("destinationLatitude", destinationLatitude)
         if (destinationLongitude != null) body.put("destinationLongitude", destinationLongitude)
         if (pickupLatitude != null) body.put("pickupLatitude", pickupLatitude)
@@ -155,6 +165,88 @@ class RideApi(private val settings: AppSettings) {
                 ?.let { ApiResult.Ok(it) }
                 ?: ApiResult.Failed("The server sent something I couldn't read.", result.value.take(200))
             is ApiResult.Failed -> result
+        }
+    }
+
+    /**
+     * Relays what the rider's UPI app claimed. The server records it as a claim, not as proof.
+     */
+    suspend fun reportPayment(
+        rideId: String,
+        status: String,
+        txnRef: String
+    ): ApiResult<RideSnapshot> =
+        postForSnapshot(
+            "${base()}/rides/$rideId/payment",
+            JSONObject().put("status", status).put("txnRef", txnRef)
+        )
+
+    /** Polled until the payment status settles, so the rider can be told the real outcome. */
+    suspend fun paymentStatus(rideId: String): ApiResult<RideSnapshot> {
+        val request = Request.Builder().url("${base()}/rides/$rideId/payment").get().build()
+        return when (val result = call(request)) {
+            is ApiResult.Ok -> RideSnapshot.parse(result.value)
+                ?.let { ApiResult.Ok(it) }
+                ?: ApiResult.Failed("The server sent something I couldn't read.", result.value.take(200))
+            is ApiResult.Failed -> result
+        }
+    }
+
+    // ===================================================================================
+    //  Payment gateway (sandbox)
+    // ===================================================================================
+
+    /**
+     * Creates — or returns the still-open — payment order for a finished ride's fare.
+     * Idempotent on the server, so a double tap cannot create two orders.
+     */
+    suspend fun createPaymentOrder(rideId: String): ApiResult<PaymentOrder> {
+        val request = Request.Builder()
+            .url("${base()}/rides/$rideId/payment/order")
+            .post("{}".toRequestBody(JSON))
+            .build()
+        return orderResult(call(request))
+    }
+
+    /** Polled while the rider is paying. Only the gateway can move an order to PAID. */
+    suspend fun paymentOrder(orderId: String): ApiResult<PaymentOrder> {
+        val request = Request.Builder().url("${base()}/payments/$orderId").get().build()
+        return orderResult(call(request))
+    }
+
+    /**
+     * Pays (or declines) an order through the sandbox gateway, from inside the app.
+     * The server decides and returns the final order — PAID with a bank reference, or FAILED.
+     */
+    suspend fun simulatePayment(
+        orderId: String,
+        success: Boolean,
+        method: String,
+        reason: String = ""
+    ): ApiResult<PaymentOrder> {
+        val body = JSONObject()
+            .put("outcome", if (success) "SUCCESS" else "FAILURE")
+            .put("method", method.ifBlank { "UPI" })
+        if (reason.isNotBlank()) body.put("reason", reason)
+        val request = Request.Builder()
+            .url("${base()}/payments/$orderId/simulate")
+            .post(body.toString().toRequestBody(JSON))
+            .build()
+        return orderResult(call(request))
+    }
+
+    /**
+     * Maps a gateway reply. On a refusal the server sends `{"error": "..."}` already phrased
+     * to be spoken ("This ride is already paid."), which is far more useful to the rider than
+     * the generic sentence for the status code, so it is preferred when present.
+     */
+    private fun orderResult(result: ApiResult<String>): ApiResult<PaymentOrder> = when (result) {
+        is ApiResult.Ok -> PaymentOrder.parse(result.value)
+            ?.let { ApiResult.Ok(it) }
+            ?: ApiResult.Failed("The server sent something I couldn't read.", result.value.take(200))
+        is ApiResult.Failed -> {
+            val serverSaid = PaymentOrder.errorMessage(result.detail.substringAfter(": ", ""))
+            if (serverSaid != null) ApiResult.Failed(serverSaid, result.detail) else result
         }
     }
 
@@ -234,6 +326,144 @@ class RideApi(private val settings: AppSettings) {
         )
 
     // ===================================================================================
+    //  Sign-in and profile
+    // ===================================================================================
+
+    /** Asks the server to send a one-time code. */
+    suspend fun sendOtp(phone: String, role: AppRole): ApiResult<OtpSent> {
+        val body = JSONObject().put("phone", phone).put("role", role.wireName)
+        return when (val result = call(post("${base()}/auth/otp", body))) {
+            is ApiResult.Ok -> runCatching { OtpSent.parse(JSONObject(result.value)) }.fold(
+                onSuccess = { ApiResult.Ok(it) },
+                onFailure = { ApiResult.Failed("The server sent something I couldn't read.", it.toString()) }
+            )
+            is ApiResult.Failed -> result.preferServerSentence()
+        }
+    }
+
+    /** Checks the code; on success the caller stores [SignIn.token]. */
+    suspend fun verifyOtp(phone: String, role: AppRole, code: String, name: String = ""): ApiResult<SignIn> {
+        val body = JSONObject().put("phone", phone).put("role", role.wireName).put("code", code)
+        if (name.isNotBlank()) body.put("name", name)
+        return when (val result = call(post("${base()}/auth/verify", body))) {
+            is ApiResult.Ok -> runCatching {
+                val json = JSONObject(result.value)
+                SignIn(
+                    token = json.getString("token"),
+                    account = AccountInfo.parse(json) ?: error("no account"),
+                    isNew = json.optBoolean("isNew", false)
+                )
+            }.fold(
+                onSuccess = { ApiResult.Ok(it) },
+                onFailure = { ApiResult.Failed("The server sent something I couldn't read.", it.toString()) }
+            )
+            is ApiResult.Failed -> result.preferServerSentence()
+        }
+    }
+
+    /** The signed-in account. A 401 here means the stored token is dead. */
+    suspend fun me(): ApiResult<AccountInfo> = accountResult(
+        call(Request.Builder().url("${base()}/me").get().build())
+    )
+
+    /** Partial profile update: only the keys in [changes] are touched on the server. */
+    suspend fun updateProfile(changes: JSONObject): ApiResult<AccountInfo> = accountResult(
+        call(
+            Request.Builder()
+                .url("${base()}/me/profile")
+                .patch(changes.toString().toRequestBody(JSON))
+                .build()
+        )
+    )
+
+    /**
+     * Revokes [token] on the server. Takes the token explicitly because the phone forgets it
+     * first — signing out must work offline, so the local wipe cannot wait for this call.
+     */
+    suspend fun logout(token: String): ApiResult<String> = call(
+        Request.Builder()
+            .url("${base()}/auth/logout")
+            .header("Authorization", "Bearer $token")
+            .post("{}".toRequestBody(JSON))
+            .build()
+    )
+
+    // ===================================================================================
+    //  Feedback
+    // ===================================================================================
+
+    /** Optional post-ride feedback. Any of the three may be null; the server refuses all-null. */
+    suspend fun submitFeedback(rideId: String, rating: Int?, category: String?, text: String?): ApiResult<String> {
+        val body = JSONObject()
+        if (rating != null) body.put("rating", rating)
+        if (!category.isNullOrBlank()) body.put("category", category)
+        if (!text.isNullOrBlank()) body.put("text", text)
+        return when (val result = call(post("${base()}/rides/$rideId/feedback", body))) {
+            is ApiResult.Ok -> result
+            is ApiResult.Failed -> result.preferServerSentence()
+        }
+    }
+
+    // ===================================================================================
+    //  Rider memory
+    // ===================================================================================
+
+    suspend fun memory(): ApiResult<RiderMemory> =
+        when (val result = call(Request.Builder().url("${base()}/me/memory").get().build())) {
+            is ApiResult.Ok -> runCatching { RiderMemory.parse(JSONObject(result.value)) }.fold(
+                onSuccess = { ApiResult.Ok(it) },
+                onFailure = { ApiResult.Failed("The server sent something I couldn't read.", it.toString()) }
+            )
+            is ApiResult.Failed -> result
+        }
+
+    suspend fun memoryOutcome(placeKey: String, kind: String, accepted: Boolean, heard: String): ApiResult<String> =
+        call(
+            post(
+                "${base()}/me/memory/outcome",
+                JSONObject().put("placeKey", placeKey).put("kind", kind)
+                    .put("accepted", accepted).put("heard", heard)
+            )
+        )
+
+    // ---- Live camera ("help me find my passenger") -----------------------------------
+    // Control only. The pictures travel over the ride socket (RideSocket.sendFrame); these
+    // calls decide whether they may. Each returns the camera's new state — OFF, REQUESTED or
+    // LIVE — or a refusal whose sentence can be shown to the driver or spoken to the rider.
+
+    suspend fun cameraRequest(rideId: String): ApiResult<String> =
+        cameraState(call(post("${base()}/rides/$rideId/camera/request", JSONObject())))
+
+    suspend fun cameraAnswer(rideId: String, accept: Boolean, reason: String = ""): ApiResult<String> =
+        cameraState(
+            call(post("${base()}/rides/$rideId/camera/answer",
+                JSONObject().put("accept", accept).put("reason", reason)))
+        )
+
+    suspend fun cameraStop(rideId: String, reason: String): ApiResult<String> =
+        cameraState(call(post("${base()}/rides/$rideId/camera/stop", JSONObject().put("reason", reason))))
+
+    private fun cameraState(result: ApiResult<String>): ApiResult<String> = when (result) {
+        is ApiResult.Ok -> ApiResult.Ok(
+            runCatching { JSONObject(result.value).optString("state", "OFF") }.getOrDefault("OFF")
+        )
+        is ApiResult.Failed -> result.preferServerSentence()
+    }
+
+    suspend fun forgetMemory(): ApiResult<String> =
+        call(Request.Builder().url("${base()}/me/memory").delete().build())
+
+    private fun accountResult(result: ApiResult<String>): ApiResult<AccountInfo> = when (result) {
+        is ApiResult.Ok -> AccountInfo.parse(result.value)
+            ?.let { ApiResult.Ok(it) }
+            ?: ApiResult.Failed("The server sent something I couldn't read.", result.value.take(200))
+        is ApiResult.Failed -> result.preferServerSentence()
+    }
+
+    private fun post(url: String, body: JSONObject): Request =
+        Request.Builder().url(url).post(body.toString().toRequestBody(JSON)).build()
+
+    // ===================================================================================
     //  Plumbing
     // ===================================================================================
 
@@ -299,4 +529,36 @@ class RideApi(private val settings: AppSettings) {
             })
         }
     }
+}
+
+/** `/auth/otp` reply. [devCode] is present only while the backend runs in mock-OTP mode. */
+data class OtpSent(
+    val sent: Boolean,
+    val expiresInSeconds: Int,
+    val registered: Boolean,
+    val devCode: String?
+) {
+    companion object {
+        fun parse(o: JSONObject) = OtpSent(
+            sent = o.optBoolean("sent", false),
+            expiresInSeconds = o.optInt("expiresInSeconds", 300),
+            registered = o.optBoolean("registered", false),
+            devCode = o.optString("devCode", "").ifBlank { null }
+        )
+    }
+}
+
+data class SignIn(val token: String, val account: AccountInfo, val isNew: Boolean)
+
+/** True when the server said the token is missing, wrong or expired. */
+val ApiResult.Failed.isUnauthorized: Boolean get() = detail.startsWith("HTTP 401")
+
+/**
+ * The account and auth endpoints answer refusals with `{"error": "<a sentence to speak>"}`.
+ * That sentence is always better than the generic one for the status code.
+ */
+fun ApiResult.Failed.preferServerSentence(): ApiResult.Failed {
+    val json = detail.substringAfter(": ", "")
+    val said = runCatching { JSONObject(json).optString("error", "") }.getOrDefault("")
+    return if (said.isNotBlank()) ApiResult.Failed(said, detail) else this
 }

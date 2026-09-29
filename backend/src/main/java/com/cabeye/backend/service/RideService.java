@@ -17,7 +17,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 
 /**
  * The ride state machine, and the only thing allowed to move a ride between phases.
@@ -50,8 +52,55 @@ public class RideService {
     private final AtomicLong rideCounter = new AtomicLong(1000);
     private final SecureRandom random = new SecureRandom();
 
+    /**
+     * Called once when a ride reaches COMPLETED — driver stats and the rider's trip memory hang
+     * off this. Listeners register themselves, so this class never learns about accounts or
+     * memory and its constructor stays the one the tests already use.
+     */
+    private final List<Consumer<Ride>> completionListeners = new CopyOnWriteArrayList<>();
+
     public RideService(RideSessionManager sessions) {
         this.sessions = sessions;
+    }
+
+    public void onCompleted(Consumer<Ride> listener) {
+        completionListeners.add(listener);
+    }
+
+    /**
+     * Every event this service publishes on a ride, after it has been recorded and broadcast.
+     * The live camera hangs off this so it can switch itself off the moment the boarding code
+     * is confirmed, the passenger is seated or the ride ends — without this class knowing the
+     * camera exists.
+     */
+    private final List<java.util.function.BiConsumer<Ride, RideEvent>> eventListeners = new CopyOnWriteArrayList<>();
+
+    public void onEvent(java.util.function.BiConsumer<Ride, RideEvent> listener) {
+        eventListeners.add(listener);
+    }
+
+    /** Called once for every new ride, right after it is created — used to save it. */
+    private final List<Consumer<Ride>> createdListeners = new CopyOnWriteArrayList<>();
+
+    public void onCreated(Consumer<Ride> listener) {
+        createdListeners.add(listener);
+    }
+
+    /**
+     * Puts back a ride saved before a restart. Ride numbering continues after the highest
+     * restored id, so a new ride can never reuse the id of one already in the database.
+     */
+    public synchronized void restore(Ride ride) {
+        rides.put(ride.rideId(), ride);
+        String id = ride.rideId();
+        if (id != null && id.startsWith("ride-")) {
+            try {
+                long n = Long.parseLong(id.substring(5));
+                rideCounter.accumulateAndGet(n, Math::max);
+            } catch (NumberFormatException ignored) {
+                // Not one of ours; leave the counter alone.
+            }
+        }
     }
 
     // ===================================================================================
@@ -163,6 +212,13 @@ public class RideService {
 
         log.info("RIDE_CREATED ride={} rider={} destination=\"{}\" type={} code={}",
                 rideId, riderId, destination, rideType, code);
+        for (Consumer<Ride> listener : createdListeners) {
+            try {
+                listener.accept(ride);
+            } catch (RuntimeException e) {
+                log.warn("CREATED_LISTENER_FAILED ride={} : {}", rideId, e.toString());
+            }
+        }
         return ride;
     }
 
@@ -297,6 +353,14 @@ public class RideService {
         if (ride == null || ride.phase().isTerminal()) {
             return Optional.empty();
         }
+        // The boarding code is the rider's only proof this is their car, so "seated" cannot
+        // skip it. Found in the demo: the driver tapped PASSENGER IS SEATED and the ride moved
+        // on with no code ever checked. If the rider's phone cannot hear the driver, the rider
+        // (or a helper) confirms with "Code is right" on their own phone — never the driver.
+        if (!ride.codeConfirmed()) {
+            log.warn("SEATED_REFUSED ride={} phase={} (boarding code not confirmed)", rideId, ride.phase());
+            return Optional.empty();
+        }
         ride.phase(RidePhase.SEATED);
         publish(ride, RideEventType.PASSENGER_SEATED, driverId, "DRIVER", Map.of());
         return Optional.of(ride);
@@ -333,6 +397,14 @@ public class RideService {
                 "fareRupees", fareRupees,
                 "durationMinutes", durationMinutes
         ));
+        for (Consumer<Ride> listener : completionListeners) {
+            // A memory or stats failure must never undo a finished ride.
+            try {
+                listener.accept(ride);
+            } catch (RuntimeException e) {
+                log.warn("COMPLETION_LISTENER_FAILED ride={} : {}", rideId, e.toString());
+            }
+        }
         return Optional.of(ride);
     }
 
@@ -406,10 +478,112 @@ public class RideService {
     }
 
     /** Records an event and then broadcasts it to everyone on the ride topic. */
+    // ===================================================================================
+    //  Payment
+    // ===================================================================================
+
+    /**
+     * Records what the rider's phone said its UPI app claimed.
+     *
+     * <p>Deliberately never reaches CONFIRMED. The claim crosses an Intent boundary on the
+     * rider's own device and can be wrong, stale or forged, so the most it can justify is
+     * REPORTED. Treating it as proof would mean eventually telling a blind rider their fare is
+     * settled when it is not — and unlike a sighted rider they cannot glance at a screen and
+     * catch it.
+     *
+     * <p>A FAILURE is the exception and is trusted at once: a false failure costs one retry,
+     * whereas a false success costs an unpaid fare nobody notices.
+     */
+    public synchronized Optional<Ride> reportPayment(String rideId, String status, String txnRef) {
+        Ride ride = rides.get(rideId);
+        if (ride == null) return Optional.empty();
+
+        // A settled fare is never downgraded by a late or stale claim from the phone. Without
+        // this, a UPI app returning FAILURE after the gateway already confirmed would tell the
+        // driver an already-paid fare had failed.
+        if (ride.paymentStatus() == Ride.PaymentStatus.CONFIRMED) {
+            log.info("PAYMENT_REPORT_IGNORED ride={} already CONFIRMED", rideId);
+            return Optional.of(ride);
+        }
+
+        String claimed = status == null ? "" : status.trim().toUpperCase();
+        Ride.PaymentStatus next = switch (claimed) {
+            case "FAILURE", "FAILED" -> Ride.PaymentStatus.FAILED;
+            default -> Ride.PaymentStatus.REPORTED;
+        };
+
+        ride.paymentStatus(next);
+        ride.paymentRef(txnRef);
+        log.info("PAYMENT_REPORTED ride={} claimed=\"{}\" stored={} ref={}",
+                rideId, claimed, next, ride.paymentRef());
+        publishPayment(ride, next == Ride.PaymentStatus.FAILED ? "Your payment app reported a failure" : "");
+        return Optional.of(ride);
+    }
+
+    /**
+     * The only transition that means money actually arrived.
+     *
+     * <p>In production this is driven by the payment provider's webhook. On a plain
+     * {@code upi://} deep link there is no provider and therefore no webhook, so nothing calls
+     * this automatically — which is a limitation stated in the open rather than papered over
+     * by having the client confirm its own payment.
+     */
+    public synchronized Optional<Ride> confirmPayment(String rideId) {
+        return confirmPayment(rideId, null);
+    }
+
+    /**
+     * Marks the fare paid on the gateway's word, recording its bank reference, and tells both
+     * phones. Called by {@code MockPaymentGateway} today and by a provider webhook later.
+     *
+     * @param bankRef the settlement reference; null or blank keeps whatever was recorded
+     */
+    public synchronized Optional<Ride> confirmPayment(String rideId, String bankRef) {
+        Ride ride = rides.get(rideId);
+        if (ride == null) return Optional.empty();
+        ride.paymentStatus(Ride.PaymentStatus.CONFIRMED);
+        if (bankRef != null && !bankRef.isBlank()) ride.paymentRef(bankRef);
+        log.info("PAYMENT_CONFIRMED ride={} ref={}", rideId, ride.paymentRef());
+        publishPayment(ride, "");
+        return Optional.of(ride);
+    }
+
+    /**
+     * The gateway refused the payment. Ignored once the fare is confirmed: a failed retry
+     * after a successful payment does not un-pay the ride.
+     */
+    public synchronized Optional<Ride> failPayment(String rideId, String reason) {
+        Ride ride = rides.get(rideId);
+        if (ride == null) return Optional.empty();
+        if (ride.paymentStatus() == Ride.PaymentStatus.CONFIRMED) return Optional.of(ride);
+        ride.paymentStatus(Ride.PaymentStatus.FAILED);
+        log.info("PAYMENT_FAILED ride={} reason=\"{}\"", rideId, reason);
+        publishPayment(ride, reason);
+        return Optional.of(ride);
+    }
+
+    /** Tells everyone still on the ride topic — in practice the driver's Complete screen. */
+    private void publishPayment(Ride ride, String reason) {
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("status", ride.paymentStatus().name());
+        payload.put("paymentRef", ride.paymentRef());
+        payload.put("fareRupees", ride.fareRupees());
+        if (reason != null && !reason.isBlank()) payload.put("reason", reason);
+        publish(ride, RideEventType.PAYMENT_UPDATED, "server", "SYSTEM", payload);
+    }
+
     private RideEvent publish(Ride ride, RideEventType type, String senderId, String role,
                               Map<String, Object> payload) {
         RideEvent event = record(ride, type, senderId, role, payload);
         sessions.broadcast(ride.rideId(), event);
+        for (java.util.function.BiConsumer<Ride, RideEvent> listener : eventListeners) {
+            // A listener failing must never undo or hide a transition that already happened.
+            try {
+                listener.accept(ride, event);
+            } catch (RuntimeException e) {
+                log.warn("EVENT_LISTENER_FAILED ride={} type={} : {}", ride.rideId(), type, e.toString());
+            }
+        }
         return event;
     }
 

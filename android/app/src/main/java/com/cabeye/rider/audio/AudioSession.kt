@@ -95,6 +95,8 @@ class AudioSession(private val context: Context) {
     private fun activateRider(onReady: () -> Unit) {
         // Fresh instances every time. See the class javadoc: nothing survives the boundary.
         val realEngine = AudioEngineImpl(context)
+        // The rider's chosen speed ("speak slower"), from before the first sentence.
+        realEngine.setSpeechRate(com.cabeye.rider.RiderPreferences(context).speechRate)
         engine = realEngine
         speech = OnDeviceSpeechInput(context)
 

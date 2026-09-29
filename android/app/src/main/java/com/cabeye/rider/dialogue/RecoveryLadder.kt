@@ -89,12 +89,13 @@ object RecoveryLadder {
 
         attempt <= 1 -> Recovery(firstRung(unrecognised, city), openMicAfter = true, rung = 1)
         attempt == 2 -> Recovery(SECOND_RUNG, openMicAfter = true, rung = 2)
-        // The last rung deliberately does NOT reopen the microphone. Three failed attempts in
-        // a row, each followed by the mic springing open again, is the app talking over the
-        // rider's own thinking time — and on device it reads as a microphone that never turns
-        // off. The app has been wrong three times; the honest move is to stop and hand control
-        // back. The message says exactly how to resume, so the silence is explained silence.
-        else -> Recovery(THIRD_RUNG, openMicAfter = false, rung = MAX_RUNG)
+        // The last rung offers two exits — help, or a person — and listens for which one.
+        // An earlier version fell silent here, and on device that was the "it doesn't go back
+        // or forward" dead end: three misses and the rider was left with nothing but a screen
+        // to press. What stops this looping is not silence but the other two brakes: the
+        // counter resets after this rung, and the silence timeout re-prompts once and then
+        // rests with an explanation.
+        else -> Recovery(THIRD_RUNG, openMicAfter = true, rung = MAX_RUNG)
     }
 
     /**
@@ -141,7 +142,7 @@ object RecoveryLadder {
      */
     private const val SECOND_RUNG =
         "Still not finding it. You can say a nearby landmark, " +
-                "or say 'list places' to hear what I know."
+                "or say 'list places' to hear what I know, or 'go back' to start over."
 
     /**
      * Third failure: offer a way out.
@@ -150,7 +151,7 @@ object RecoveryLadder {
      * attempt will go better. Both options here lead somewhere other than another guess.
      */
     private const val THIRD_RUNG =
-        "I'm having trouble understanding. Hold the screen and try again when you're ready, " +
+        "I'm having trouble understanding. Say the place slowly, say 'help' to hear what I can do, " +
                 "or say 'call support' to talk to a person."
 
     // =================================================================================

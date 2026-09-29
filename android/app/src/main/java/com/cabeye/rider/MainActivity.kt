@@ -5,7 +5,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.view.KeyEvent
-import androidx.activity.ComponentActivity
+import androidx.fragment.app.FragmentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.LaunchedEffect
@@ -18,11 +18,16 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.cabeye.rider.audio.NarrationTier
+import com.cabeye.rider.auth.RiderSignInViewModel
+import com.cabeye.rider.driver.DriverAccountScreen
+import com.cabeye.rider.driver.DriverAccountViewModel
 import com.cabeye.rider.driver.DriverSurface
 import com.cabeye.rider.driver.DriverViewModel
 import com.cabeye.rider.net.ApiResult
 import com.cabeye.rider.net.AppRole
+import com.cabeye.rider.security.BiometricGate
 import com.cabeye.rider.ui.DebugSettingsScreen
+import com.cabeye.rider.ui.RiderSignInSurface
 import com.cabeye.rider.ui.RiderSurface
 import com.cabeye.rider.ui.theme.CabEyeTheme
 import kotlinx.coroutines.launch
@@ -44,15 +49,22 @@ import kotlinx.coroutines.launch
  * a visible button, precisely so a rider cannot reach it by accident — a blind user landing on
  * a settings screen with no idea how they got there is the worst possible navigation failure.
  */
-class MainActivity : ComponentActivity() {
+// FragmentActivity (a ComponentActivity subclass) only because Android's fingerprint prompt,
+// BiometricPrompt, requires one. setContent, the permission launchers and everything else
+// behave exactly as before.
+class MainActivity : FragmentActivity() {
 
     private var viewModel: RiderViewModel? = null
+
+    /** Non-null while the rider sign-in screen is showing, so volume keys and permissions reach it. */
+    private var signInViewModel: RiderSignInViewModel? = null
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { granted ->
         val micGranted = granted[Manifest.permission.RECORD_AUDIO] == true
         viewModel?.micPermissionGranted = micGranted
+        signInViewModel?.micPermissionGranted = micGranted
     }
 
     /**
@@ -72,14 +84,29 @@ class MainActivity : ComponentActivity() {
         viewModel?.onContactPermissionResult(granted)
     }
 
+    /**
+     * CAMERA, asked only at the moment the rider has just said yes to sharing it with their
+     * driver — never at launch. The app says out loud what the dialog is before it appears.
+     */
+    private val cameraPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        viewModel?.onCameraPermissionResult(granted)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         val app = application as CabEyeApp
+        handleScheduledIntent(intent)
 
         setContent {
             val role by app.role.collectAsStateWithLifecycle()
+            val riderAccount by app.riderAccount.collectAsStateWithLifecycle()
+            val driverAccount by app.driverAccount.collectAsStateWithLifecycle()
             var showSettings by remember { mutableStateOf(false) }
+            // Re-read each time Settings opens: the rider may have said "always" by voice since.
+            var cameraAlways by remember(showSettings) { mutableStateOf(app.preferences.alwaysShareCamera) }
             var settingsUrl by remember { mutableStateOf(app.settings.current().backendBaseUrl) }
 
             // Read from the view model in rider mode; falls back to the stored default in
@@ -101,10 +128,70 @@ class MainActivity : ComponentActivity() {
                             // see CabEyeApp.switchRole for why that order matters.
                             app.switchRole(next)
                         },
-                        onClose = { showSettings = false }
+                        onClose = { showSettings = false },
+                        signedInAs = (if (role == AppRole.DRIVER) driverAccount else riderAccount)?.let {
+                            when {
+                                it.isGuest -> "Using the app as a guest"
+                                it.name.isNotBlank() -> "Signed in as ${it.name} (${it.phone})"
+                                else -> "Signed in (${it.phone})"
+                            }
+                        }.orEmpty(),
+                        cameraAlwaysShare = if (role == AppRole.RIDER) cameraAlways else null,
+                        onCameraAlwaysShare = { on ->
+                            app.preferences.alwaysShareCamera = on
+                            cameraAlways = on
+                        },
+                        onSignOut = {
+                            app.signOut(role)
+                            showSettings = false
+                        }
                     )
 
+                    // -------------------------------------------------------------------
+                    //  Driver: sign in, then complete the profile, before any ride screen.
+                    // -------------------------------------------------------------------
+                    role == AppRole.DRIVER && (driverAccount?.profileComplete != true) -> {
+                        val accountVm: DriverAccountViewModel = viewModel()
+                        LaunchedEffect(driverAccount) {
+                            accountVm.start()
+                            if (driverAccount != null && accountVm.ui.step != com.cabeye.rider.driver.DriverAccountStep.PROFILE) {
+                                accountVm.editProfile()
+                            }
+                        }
+                        DriverAccountScreen(
+                            ui = accountVm.ui,
+                            canCancel = false,
+                            onPhoneChange = accountVm::onPhoneChange,
+                            onSendCode = accountVm::sendCode,
+                            onCodeChange = accountVm::onCodeChange,
+                            onVerify = accountVm::verify,
+                            onChangeNumber = accountVm::changeNumber,
+                            onField = accountVm::onField,
+                            onSave = accountVm::saveProfile,
+                            onCancel = accountVm::cancelEdit,
+                            onSignOut = accountVm::signOut,
+                            onSettings = { showSettings = true }
+                        )
+                    }
+
                     role == AppRole.DRIVER -> {
+                        val accountVm: DriverAccountViewModel = viewModel()
+                        if (accountVm.ui.editing) {
+                            DriverAccountScreen(
+                                ui = accountVm.ui,
+                                canCancel = true,
+                                onPhoneChange = accountVm::onPhoneChange,
+                                onSendCode = accountVm::sendCode,
+                                onCodeChange = accountVm::onCodeChange,
+                                onVerify = accountVm::verify,
+                                onChangeNumber = accountVm::changeNumber,
+                                onField = accountVm::onField,
+                                onSave = accountVm::saveProfile,
+                                onCancel = accountVm::cancelEdit,
+                                onSignOut = accountVm::signOut,
+                                onSettings = { showSettings = true }
+                            )
+                        } else {
                         val driverVm: DriverViewModel = viewModel()
                         DriverSurface(
                             uiState = driverVm.uiState,
@@ -122,16 +209,53 @@ class MainActivity : ComponentActivity() {
                             onFinish = driverVm::finishAndGoOnline,
                             onCancel = driverVm::cancelRide,
                             onMessage = driverVm::sendMessage,
-                            onSettings = { showSettings = true }
+                            onSettings = { showSettings = true },
+                            driverName = driverAccount?.name.orEmpty(),
+                            onProfile = accountVm::editProfile,
+                            cameraFrame = driverVm.cameraFrame,
+                            onRequestCamera = driverVm::requestCamera,
+                            onStopCamera = driverVm::stopCamera
+                        )
+                        }
+                    }
+
+                    // -------------------------------------------------------------------
+                    //  Rider: voice sign-in (or fingerprint unlock) before the ride surface.
+                    // -------------------------------------------------------------------
+                    riderAccount == null -> {
+                        val signIn: RiderSignInViewModel = viewModel()
+                        signInViewModel = signIn
+                        viewModel = null
+                        signIn.micPermissionGranted = hasMicPermission()
+                        signIn.unlockRequest = { name, onResult ->
+                            BiometricGate.unlock(this@MainActivity, name, onResult)
+                        }
+                        LaunchedEffect(Unit) {
+                            requestPermissionsIfNeeded()
+                            signIn.start()
+                        }
+                        RiderSignInSurface(
+                            ui = signIn.ui,
+                            onHoldStart = signIn::onHoldStart,
+                            onHoldEnd = signIn::onHoldEnd,
+                            onTyped = signIn::onTyped,
+                            onSkip = signIn::onSkip
                         )
                     }
 
                     else -> {
+                        signInViewModel = null
                         val vm: RiderViewModel = viewModel()
                         viewModel = vm
                         vm.micPermissionGranted = hasMicPermission()
                         vm.contactPermissionRequest = {
                             contactsPermissionLauncher.launch(Manifest.permission.READ_CONTACTS)
+                        }
+                        vm.cameraPermissionRequest = {
+                            cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+                        }
+                        vm.paymentAuthRequest = { amount, onResult ->
+                            BiometricGate.authenticate(this@MainActivity, amount, onResult)
                         }
 
                         // Permission is requested from inside rider mode only. Asking a driver
@@ -149,7 +273,14 @@ class MainActivity : ComponentActivity() {
                             onCodeConfirmed = vm::onCodeConfirmed,
                             onSos = vm::onSos,
                             onDismissSos = vm::onDismissSos,
-                            onOpenSettings = { showSettings = true }
+                            onPaymentResult = vm::onPaymentResult,
+                            onPay = vm::onPayTapped,
+                            onPaymentMethod = vm::onPaymentMethod,
+                            onDeclinePayment = vm::onDeclinePayment,
+                            onOpenSettings = { showSettings = true },
+                            onPostRideAction = vm::onPostRideAction,
+                            onCameraAnswer = vm::onCameraAnswer,
+                            onStopCamera = vm::onStopCamera
                         )
                     }
                 }
@@ -217,10 +348,34 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** Opened from a "time for your ride" notification while the app was already running. */
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleScheduledIntent(intent)
+    }
+
+    private fun handleScheduledIntent(intent: android.content.Intent?) {
+        val id = intent?.getStringExtra(com.cabeye.rider.schedule.RideScheduler.EXTRA_ID) ?: return
+        intent.removeExtra(com.cabeye.rider.schedule.RideScheduler.EXTRA_ID)
+        // Handed to the app, not straight to a view model: the rider view model may not exist
+        // yet (sign-in screen), and picks the id up the moment it reaches idle.
+        (application as CabEyeApp).onScheduledRideDue(id)
+    }
+
     override fun onResume() {
         super.onResume()
         // Permission can be revoked from Settings while the app is backgrounded.
         viewModel?.micPermissionGranted = hasMicPermission()
+        signInViewModel?.micPermissionGranted = hasMicPermission()
+        // Opening the app is the natural moment for "PSG College, like usual?".
+        viewModel?.onForeground()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        // A backgrounded app cannot keep the camera; the view model turns it off and says so.
+        viewModel?.onBackground()
     }
 
     /**
@@ -232,33 +387,74 @@ class MainActivity : ComponentActivity() {
      * Only active in rider mode: a driver reaching for the volume keys wants the volume, and
      * hijacking them in a moving car would be a genuinely bad idea.
      */
+    // ---------------------------------------------------------------------------------
+    //  Volume keys: a short press changes the volume, holding either key talks.
+    //
+    //  Both keys used to be hold-to-talk only, which left a blind rider no way to turn the
+    //  narrator up or down while Cab Eye was open — found in the demo. Now a press shorter
+    //  than HOLD_TO_TALK_MS is an ordinary volume step (with the system click, so the level
+    //  can be heard), and holding past it opens the microphone as before.
+    // ---------------------------------------------------------------------------------
+
+    private val keyHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var volumeKeyTalking = false
+    private var pendingTalk: Runnable? = null
+
+    private fun holdStart() {
+        signInViewModel?.onHoldStart() ?: viewModel?.onHoldStart()
+    }
+
+    private fun holdEnd() {
+        signInViewModel?.onHoldEnd() ?: viewModel?.onHoldEnd()
+    }
+
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        if ((application as CabEyeApp).role.value != AppRole.RIDER) {
+        val volumeKey = keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN
+        if (!volumeKey || (application as CabEyeApp).role.value != AppRole.RIDER ||
+            (signInViewModel == null && viewModel == null)
+        ) {
             return super.onKeyDown(keyCode, event)
         }
-        val vm = viewModel ?: return super.onKeyDown(keyCode, event)
-
-        return when (keyCode) {
-            KeyEvent.KEYCODE_VOLUME_UP, KeyEvent.KEYCODE_VOLUME_DOWN -> {
-                if (event?.repeatCount == 0) vm.onHoldStart()
-                true
+        if (event?.repeatCount == 0) {
+            volumeKeyTalking = false
+            pendingTalk?.let { keyHandler.removeCallbacks(it) }
+            val talk = Runnable {
+                volumeKeyTalking = true
+                holdStart()
             }
-            else -> super.onKeyDown(keyCode, event)
+            pendingTalk = talk
+            keyHandler.postDelayed(talk, HOLD_TO_TALK_MS)
         }
+        return true
     }
 
     override fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean {
-        if ((application as CabEyeApp).role.value != AppRole.RIDER) {
+        val volumeKey = keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN
+        if (!volumeKey || (application as CabEyeApp).role.value != AppRole.RIDER ||
+            (signInViewModel == null && viewModel == null)
+        ) {
             return super.onKeyUp(keyCode, event)
         }
-        val vm = viewModel ?: return super.onKeyUp(keyCode, event)
-
-        return when (keyCode) {
-            KeyEvent.KEYCODE_VOLUME_UP, KeyEvent.KEYCODE_VOLUME_DOWN -> {
-                vm.onHoldEnd()
-                true
-            }
-            else -> super.onKeyUp(keyCode, event)
+        pendingTalk?.let { keyHandler.removeCallbacks(it) }
+        pendingTalk = null
+        if (volumeKeyTalking) {
+            volumeKeyTalking = false
+            holdEnd()
+        } else {
+            // A short press: an ordinary volume step on whatever is playing.
+            val audio = getSystemService(android.media.AudioManager::class.java)
+            audio?.adjustSuggestedStreamVolume(
+                if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) android.media.AudioManager.ADJUST_RAISE
+                else android.media.AudioManager.ADJUST_LOWER,
+                android.media.AudioManager.STREAM_MUSIC,
+                android.media.AudioManager.FLAG_SHOW_UI or android.media.AudioManager.FLAG_PLAY_SOUND
+            )
         }
+        return true
+    }
+
+    private companion object {
+        /** Holding a volume key longer than this talks; anything shorter changes the volume. */
+        const val HOLD_TO_TALK_MS = 350L
     }
 }

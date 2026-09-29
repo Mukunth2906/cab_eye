@@ -70,6 +70,7 @@ class AudioEngineImpl(
     // ---------------------------------------------------------------------------------
 
     override fun initialise(onReady: () -> Unit) {
+        ensureAudible()
         requestAudioFocus()
         tts.initialise { success ->
             if (!success) {
@@ -86,6 +87,25 @@ class AudioEngineImpl(
         earconExecutor.shutdownNow()
         heartbeatExecutor.shutdownNow()
         abandonAudioFocus()
+    }
+
+    /**
+     * A voice-first app the rider cannot hear is an app that does not work. If the media volume
+     * is below 30% when the rider's session starts, it is raised to half — once, at start, and
+     * never lowered. (In the demo the narrator was hard to hear, and the volume keys belong to
+     * hold-to-talk, so there was no easy way to turn it up.)
+     */
+    private fun ensureAudible() {
+        runCatching {
+            val stream = AudioManager.STREAM_MUSIC
+            val max = audioManager.getStreamMaxVolume(stream)
+            val current = audioManager.getStreamVolume(stream)
+            if (max > 0 && current < max * 0.3) {
+                val target = (max * 0.5).toInt().coerceAtLeast(1)
+                audioManager.setStreamVolume(stream, target, 0)
+                Log.i(TAG, "VOLUME raised $current -> $target of $max so the narrator can be heard")
+            }
+        }.onFailure { Log.w(TAG, "Could not check the volume: $it") }
     }
 
     private fun requestAudioFocus() {
@@ -295,6 +315,10 @@ class AudioEngineImpl(
                 onDone?.invoke()
             }
         )
+    }
+
+    override fun setSpeechRate(rate: Float) {
+        tts.setSpeechRate(rate)
     }
 
     override fun stopSpeaking() {

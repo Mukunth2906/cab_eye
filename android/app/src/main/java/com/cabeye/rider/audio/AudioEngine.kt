@@ -147,6 +147,12 @@ interface AudioEngine {
      */
     fun stopSpeaking()
 
+    /**
+     * Speech speed, 1.0 = normal. The rider sets it by voice ("speak slower") and it is kept
+     * with their profile. Engines that do not speak ignore it.
+     */
+    fun setSpeechRate(rate: Float) {}
+
     /** True while TTS is producing audio. The microphone must stay closed whenever this is true. */
     val isSpeaking: Boolean
 

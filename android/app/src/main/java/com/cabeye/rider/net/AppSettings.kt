@@ -123,6 +123,14 @@ class AppSettings(context: Context) {
      * able to speak as each other — and the boarding-code flow depends on the rider's app and
      * the driver's app being genuinely distinguishable.
      */
+    /**
+     * Replaces the per-install id with the signed-in account's id, so `X-User-Id` on REST and on
+     * the socket names the real rider or driver. Called on sign-in and on role switch.
+     */
+    suspend fun setUserId(id: String) {
+        appContext.settingsStore.edit { it[Keys.USER_ID] = id }
+    }
+
     suspend fun ensureUserId(): String {
         val existing = appContext.settingsStore.data.first()[Keys.USER_ID]
         if (existing != null) return existing

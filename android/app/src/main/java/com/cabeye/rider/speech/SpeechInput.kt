@@ -3,13 +3,11 @@ package com.cabeye.rider.speech
 /**
  * Speech recognition, behind an interface so the engine is swappable.
  *
- * ## Why the default never leaves the phone
- * Sending recorded audio to Spring, then to Cloud STT, then back costs seconds — and this
- * project's entire claim is about time. The default is therefore Android's on-device
- * [android.speech.SpeechRecognizer] with streaming partial results.
+ * The default is Android's [android.speech.SpeechRecognizer] — online first for accuracy,
+ * on-device when there is no network — with streaming partial results and several guesses per
+ * utterance (see [SpeechInputListener.onFinalAlternatives]).
  *
- * [CloudSpeechInput] exists so on-device can be **measured against** a cloud engine later.
- * It is a benchmark target, not a fallback the app silently drifts onto.
+ * [CloudSpeechInput] exists so the recogniser can be **measured against** another engine later.
  */
 interface SpeechInput {
 
@@ -62,6 +60,18 @@ interface SpeechInputListener {
 
     /** The final transcript. Marks T1 in the latency budget. */
     fun onFinal(text: String)
+
+    /**
+     * Every transcript the recogniser offered for this utterance, best guess first.
+     *
+     * The recogniser's first guess is often not the one that fits the question: asked for a
+     * ten-digit number it may rank "98765 for 3210" above "98765 43210". A listener that knows
+     * what it asked for overrides this and picks the first guess that makes sense. By default
+     * only the best guess is used.
+     */
+    fun onFinalAlternatives(alternatives: List<String>) {
+        alternatives.firstOrNull()?.let { onFinal(it) }
+    }
 
     /** Normalised 0..1 microphone level, for the visual ring only. */
     fun onLevel(level: Float)

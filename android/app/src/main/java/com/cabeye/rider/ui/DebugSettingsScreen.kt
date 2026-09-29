@@ -67,6 +67,11 @@ fun DebugSettingsScreen(
     onTestConnection: (onResult: (String) -> Unit) -> Unit,
     onRoleChange: (AppRole) -> Unit,
     onClose: () -> Unit,
+    signedInAs: String = "",
+    onSignOut: (() -> Unit)? = null,
+    /** Rider only: null hides the camera setting. */
+    cameraAlwaysShare: Boolean? = null,
+    onCameraAlwaysShare: (Boolean) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val palette = LocalPalette.current
@@ -246,6 +251,42 @@ fun DebugSettingsScreen(
                     style = MaterialTheme.typography.bodyMedium,
                     color = palette.danger
                 )
+            }
+
+            if (onSignOut != null) {
+                Spacer(Modifier.height(28.dp))
+                Divider()
+                Spacer(Modifier.height(20.dp))
+                Text("Account", style = MaterialTheme.typography.bodyLarge, color = palette.clarify)
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    signedInAs.ifBlank { "Not signed in" },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = palette.muted
+                )
+                Spacer(Modifier.height(12.dp))
+                WideButton("SIGN OUT", palette.danger) { onSignOut() }
+            }
+
+            if (cameraAlwaysShare != null) {
+                Spacer(Modifier.height(28.dp))
+                Divider()
+                Spacer(Modifier.height(20.dp))
+                Text("Camera for your driver", style = MaterialTheme.typography.bodyLarge, color = palette.clarify)
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    if (cameraAlwaysShare)
+                        "Shared automatically when your driver can't find you. Tap to be asked each time."
+                    else
+                        "You are asked each time your driver wants to see your camera.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = palette.muted
+                )
+                Spacer(Modifier.height(12.dp))
+                WideButton(
+                    if (cameraAlwaysShare) "ASK ME EACH TIME" else "ALWAYS SHARE",
+                    palette.clarify
+                ) { onCameraAlwaysShare(!cameraAlwaysShare) }
             }
 
             Spacer(Modifier.height(40.dp))

@@ -1,0 +1,498 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Cab Eye Admin</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #16181d; --muted: #5b6270; --line: #dde1e7;
+    --accent: #1f5fd6; --accent-text: #ffffff; --urgent: #b3261e; --urgent-bg: #fdecea;
+    --ok: #1e7a3c; --ok-bg: #e7f5ec; --warn: #8a5a00; --warn-bg: #fff4dc; --chip: #eef1f5;
+    --focus: #ffbf47;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111317; --panel: #1a1d23; --text: #e9ebef; --muted: #a2a9b6; --line: #2d323b;
+      --accent: #6d9cff; --accent-text: #0c1020; --urgent: #ff8a80; --urgent-bg: #3a1b1a;
+      --ok: #7ed79a; --ok-bg: #16301f; --warn: #ffd27a; --warn-bg: #33290f; --chip: #252a33;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  a { color: var(--accent); }
+  :focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+  button, input, select, textarea { font: inherit; color: inherit; }
+  button { background: var(--chip); border: 1px solid var(--line); border-radius: 8px;
+           padding: 7px 14px; cursor: pointer; min-height: 38px; }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+  button.danger { color: var(--urgent); border-color: var(--urgent); background: transparent; }
+  button:disabled { opacity: .55; cursor: default; }
+  input, select, textarea { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+  textarea { width: 100%; min-height: 60px; resize: vertical; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 16px; }
+  header.top { background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; }
+  header.top .wrap { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; padding-top: 10px; padding-bottom: 10px; }
+  header.top h1 { font-size: 18px; margin: 0; margin-right: auto; }
+  .stat { font-size: 13px; color: var(--muted); }
+  .stat b { color: var(--text); }
+  .stat.hot b { color: var(--urgent); }
+  nav.tabs { display: flex; gap: 6px; flex-wrap: wrap; margin: 16px 0; }
+  nav.tabs button[aria-selected="true"] { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
+  .toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+  .toolbar .spacer { flex: 1; }
+  .muted { color: var(--muted); }
+  .small { font-size: 13px; }
+  .cases { display: grid; gap: 12px; }
+  .case { border: 1px solid var(--line); border-radius: 12px; padding: 14px; background: var(--panel); }
+  .case.urgent { border-color: var(--urgent); box-shadow: inset 4px 0 0 var(--urgent); }
+  .case.resolved { opacity: .75; }
+  .case.flash { outline: 3px solid var(--focus); }
+  .case h3 { margin: 0 0 6px; font-size: 16px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .quote { font-size: 17px; margin: 8px 0; padding: 8px 12px; border-left: 3px solid var(--line); background: var(--bg); border-radius: 0 8px 8px 0; white-space: pre-wrap; }
+  .chip { display: inline-block; font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 999px; background: var(--chip); }
+  .chip.urgent { background: var(--urgent-bg); color: var(--urgent); }
+  .chip.ok { background: var(--ok-bg); color: var(--ok); }
+  .chip.warn { background: var(--warn-bg); color: var(--warn); }
+  dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: 2px 14px; margin: 8px 0; }
+  dl.facts dt { color: var(--muted); }
+  dl.facts dd { margin: 0; overflow-wrap: anywhere; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .notes { margin: 10px 0 0; padding: 0; list-style: none; font-size: 13px; }
+  .notes li { padding: 4px 0; border-top: 1px dashed var(--line); }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 13px; }
+  tr.clickable { cursor: pointer; }
+  tr.clickable:hover { background: var(--bg); }
+  .timeline { list-style: none; padding: 0; margin: 12px 0 0; }
+  .timeline li { display: grid; grid-template-columns: 90px 1fr; gap: 10px; padding: 6px 0; border-top: 1px solid var(--line); }
+  .timeline code { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+  .login { max-width: 380px; margin: 10vh auto; }
+  .login label { display: block; margin: 12px 0 4px; font-weight: 600; }
+  .login input { width: 100%; }
+  .error { color: var(--urgent); min-height: 1.5em; margin: 8px 0; }
+  .steps { padding-left: 20px; }
+  .steps li { margin: 6px 0; }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  .empty { padding: 30px; text-align: center; color: var(--muted); }
+  @media (max-width: 640px) { dl.facts { grid-template-columns: 1fr; } dl.facts dt { margin-top: 6px; } }
+</style>
+</head>
+<body>
+<div id="live" class="sr-only" aria-live="assertive"></div>
+
+<main id="login" class="login panel" hidden>
+  <h1 style="margin-top:0">Cab Eye Admin</h1>
+  <p class="muted">Sign in to see feedback, SOS alerts, rides and drivers.</p>
+  <form id="loginForm">
+    <label for="email">Email</label>
+    <input id="email" type="email" autocomplete="username" required>
+    <label for="password">Password</label>
+    <input id="password" type="password" autocomplete="current-password" required>
+    <p class="error" id="loginError" role="alert"></p>
+    <button class="primary" type="submit" style="width:100%">Sign in</button>
+  </form>
+</main>
+
+<div id="app" hidden>
+  <header class="top">
+    <div class="wrap">
+      <h1>Cab Eye Admin</h1>
+      <span class="stat hot" id="statUrgent"></span>
+      <span class="stat" id="statOpen"></span>
+      <span class="stat" id="statRides"></span>
+      <span class="stat" id="statUpdated"></span>
+      <button id="logout">Sign out</button>
+    </div>
+  </header>
+  <div class="wrap">
+    <nav class="tabs" role="tablist" aria-label="Sections">
+      <button role="tab" data-tab="inbox" aria-selected="true">Inbox</button>
+      <button role="tab" data-tab="rides" aria-selected="false">Rides</button>
+      <button role="tab" data-tab="drivers" aria-selected="false">Drivers</button>
+      <button role="tab" data-tab="riders" aria-selected="false">Riders</button>
+      <button role="tab" data-tab="settings" aria-selected="false">Alerts set-up</button>
+    </nav>
+    <section id="view" class="panel" role="tabpanel" aria-live="polite"></section>
+  </div>
+</div>
+
+<script>
+(() => {
+  "use strict";
+  const TOKEN_KEY = "cabeye.admin.token";
+  const POLL_MS = 5000;
+  let token = null;
+  try { token = sessionStorage.getItem(TOKEN_KEY); } catch (e) {}
+  let tab = "inbox";
+  let inboxFilter = "OPEN";
+  let rideDetail = null;         // ride id being viewed
+  let seenUrgent = null;         // Set of urgent case ids already announced
+  let pollTimer = null;
+  let busy = false;              // don't redraw while the admin is typing a note
+  const $ = (id) => document.getElementById(id);
+
+  // ---------- tiny DOM helper: text is always set as text, never as HTML ----------
+  function h(tag, attrs, ...kids) {
+    const el = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs || {})) {
+      if (v == null || v === false) continue;
+      if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+      else if (k === "class") el.className = v;
+      else el.setAttribute(k, v === true ? "" : v);
+    }
+    for (const kid of kids.flat()) {
+      if (kid == null || kid === false) continue;
+      el.append(kid instanceof Node ? kid : document.createTextNode(String(kid)));
+    }
+    return el;
+  }
+  const when = (t) => {
+    if (!t) return "—";
+    const d = new Date(t);
+    return isNaN(d) ? "—" : d.toLocaleString(undefined, { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+  };
+  const ago = (t) => {
+    const s = Math.round((Date.now() - new Date(t)) / 1000);
+    if (s < 60) return s + "s ago";
+    if (s < 3600) return Math.round(s / 60) + " min ago";
+    if (s < 86400) return Math.round(s / 3600) + " h ago";
+    return when(t);
+  };
+  const tel = (p) => p ? h("a", { href: "tel:" + p }, p) : "—";
+  function announce(msg) { $("live").textContent = ""; setTimeout(() => $("live").textContent = msg, 50); }
+
+  // ---------- API ----------
+  async function api(path, opts = {}) {
+    const res = await fetch("/admin/api/" + path, {
+      method: opts.method || "GET",
+      headers: Object.assign({ "Content-Type": "application/json" }, token ? { Authorization: "Bearer " + token } : {}),
+      body: opts.body ? JSON.stringify(opts.body) : undefined
+    });
+    if (res.status === 401 && path !== "login") { signedOut(); throw new Error("Signed out"); }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || ("Error " + res.status));
+    return data;
+  }
+
+  // ---------- sign in / out ----------
+  function signedOut() {
+    token = null;
+    try { sessionStorage.removeItem(TOKEN_KEY); } catch (e) {}
+    clearInterval(pollTimer);
+    $("app").hidden = true;
+    $("login").hidden = false;
+    $("email").focus();
+  }
+  $("loginForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    $("loginError").textContent = "";
+    try {
+      const r = await api("login", { method: "POST", body: { email: $("email").value, password: $("password").value } });
+      token = r.token;
+      try { sessionStorage.setItem(TOKEN_KEY, token); } catch (err) {}
+      $("password").value = "";
+      start();
+    } catch (err) { $("loginError").textContent = err.message; }
+  });
+  $("logout").addEventListener("click", async () => {
+    try { await api("logout", { method: "POST" }); } catch (e) {}
+    signedOut();
+  });
+
+  // ---------- tabs ----------
+  document.querySelectorAll("nav.tabs button").forEach(b => b.addEventListener("click", () => {
+    tab = b.dataset.tab; rideDetail = null;
+    document.querySelectorAll("nav.tabs button").forEach(x => x.setAttribute("aria-selected", x === b ? "true" : "false"));
+    render();
+  }));
+
+  // ---------- polling ----------
+  async function start() {
+    $("login").hidden = true;
+    $("app").hidden = false;
+    const m = location.hash.match(/case=([\w-]+)/);
+    await refresh();
+    render(m ? m[1] : null);
+    clearInterval(pollTimer);
+    pollTimer = setInterval(async () => { await refresh(); if (!busy) render(); }, POLL_MS);
+  }
+
+  let overview = null, casesCache = [];
+  async function refresh() {
+    try {
+      overview = await api("overview");
+      casesCache = await api("cases?status=ALL");
+    } catch (e) { return; }
+    $("statUrgent").innerHTML = "";
+    $("statUrgent").append(overview.urgentOpen ? h("b", {}, overview.urgentOpen + " urgent") : "");
+    $("statOpen").textContent = overview.openCases + " open";
+    $("statRides").textContent = overview.activeRides + " live ride(s)";
+    $("statUpdated").textContent = "updated " + new Date().toLocaleTimeString();
+    document.title = (overview.urgentOpen ? "(" + overview.urgentOpen + ") " : "") + "Cab Eye Admin";
+
+    const urgentIds = casesCache.filter(c => c.urgent && c.status !== "RESOLVED").map(c => c.id);
+    if (seenUrgent === null) { seenUrgent = new Set(urgentIds); return; }
+    const fresh = urgentIds.filter(id => !seenUrgent.has(id));
+    fresh.forEach(id => seenUrgent.add(id));
+    if (fresh.length) {
+      beep();
+      const c = casesCache.find(x => x.id === fresh[0]);
+      announce("New urgent " + (c.kind === "SOS" ? "S O S" : "feedback") + " on " + (c.rideId || "a ride"));
+      if ("Notification" in window && Notification.permission === "granted") {
+        new Notification("Cab Eye: urgent " + (c.kind === "SOS" ? "SOS" : "feedback"), { body: c.text || c.rideId || "" });
+      }
+    }
+  }
+  function beep() {
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      [0, 0.35, 0.7].forEach((t) => {
+        const o = ctx.createOscillator(), g = ctx.createGain();
+        o.frequency.value = 880; o.connect(g); g.connect(ctx.destination);
+        g.gain.setValueAtTime(0.25, ctx.currentTime + t);
+        g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + t + 0.3);
+        o.start(ctx.currentTime + t); o.stop(ctx.currentTime + t + 0.3);
+      });
+    } catch (e) {}
+  }
+
+  // ---------- render ----------
+  async function render(focusCase) {
+    const view = $("view");
+    try {
+      let content;
+      if (tab === "inbox") content = inbox(focusCase);
+      else if (tab === "rides") content = rideDetail ? await rideView(rideDetail) : await ridesList();
+      else if (tab === "drivers") content = await drivers();
+      else if (tab === "riders") content = await riders();
+      else content = settings();
+      view.replaceChildren(content);
+      if (focusCase) {
+        const el = document.getElementById("case-" + focusCase);
+        if (el) { el.classList.add("flash"); el.scrollIntoView({ block: "center" }); el.querySelector("button")?.focus(); }
+      }
+    } catch (e) {
+      if (e.message !== "Signed out") view.replaceChildren(h("p", { class: "error" }, e.message));
+    }
+  }
+
+  // ----- Inbox -----
+  function inbox() {
+    const filters = [["OPEN", "Open"], ["NEW", "New"], ["ACKNOWLEDGED", "Acknowledged"], ["RESOLVED", "Resolved"], ["ALL", "All"]];
+    const sel = h("select", { id: "inboxFilter", onchange: (e) => { inboxFilter = e.target.value; render(); } },
+      filters.map(([v, l]) => { const o = h("option", { value: v }, l); if (v === inboxFilter) o.selected = true; return o; }));
+    const list = casesCache.filter(c =>
+      inboxFilter === "ALL" ? true : inboxFilter === "OPEN" ? c.status !== "RESOLVED" : c.status === inboxFilter);
+    const notifyBtn = ("Notification" in window && Notification.permission === "default")
+      ? h("button", { onclick: () => Notification.requestPermission().then(() => render()) }, "Allow desktop pop-ups") : null;
+    return h("div", {},
+      h("div", { class: "toolbar" },
+        h("h2", { style: "margin:0;font-size:18px" }, "Inbox"),
+        h("label", { for: "inboxFilter", class: "muted small" }, "Show"), sel,
+        h("span", { class: "spacer" }), notifyBtn),
+      list.length ? h("div", { class: "cases" }, list.map(caseCard))
+                  : h("p", { class: "empty" }, "Nothing here. Feedback and SOS alerts will appear as they arrive."));
+  }
+
+  function caseCard(c) {
+    const statusChip = c.status === "RESOLVED" ? h("span", { class: "chip ok" }, "Resolved")
+      : c.status === "ACKNOWLEDGED" ? h("span", { class: "chip warn" }, "Acknowledged") : h("span", { class: "chip" }, "New");
+    const title = c.kind === "SOS" ? "SOS" : "Feedback" + (c.category ? " · " + c.category.toLowerCase() : "");
+    const noteBox = h("textarea", { "aria-label": "Note for " + c.id, placeholder: "Add a note (what you did, who you called)…",
+      onfocus: () => busy = true, onblur: () => busy = false });
+    const setStatus = (s) => async () => { await api("cases/" + c.id + "/status", { method: "POST", body: { status: s } }); await refresh(); render(); };
+    return h("article", { class: "case" + (c.urgent ? " urgent" : "") + (c.status === "RESOLVED" ? " resolved" : ""), id: "case-" + c.id, "aria-label": title + " " + (c.rideId || "") },
+      h("h3", {}, c.urgent ? h("span", { class: "chip urgent" }, "URGENT") : null, title, statusChip,
+        h("span", { class: "muted small", style: "font-weight:400" }, ago(c.createdAt))),
+      c.rating != null ? h("div", {}, h("b", {}, c.rating + " / 5"), c.rating <= 2 ? h("span", { class: "muted" }, " · low rating") : null) : null,
+      c.text ? h("blockquote", { class: "quote" }, "“" + c.text + "”") : null,
+      c.latitude != null ? h("p", {}, h("a", { href: "https://maps.google.com/?q=" + c.latitude + "," + c.longitude, target: "_blank", rel: "noopener" }, "Open location in Google Maps"),
+        h("span", { class: "muted small" }, " · " + when(c.locationAt))) : null,
+      h("dl", { class: "facts" },
+        h("dt", {}, "Rider"), h("dd", {}, (c.riderName || "Guest") + " · ", tel(c.riderPhone)),
+        c.emergencyContactPhone ? [h("dt", {}, "Emergency contact"), h("dd", {}, (c.emergencyContactName || "") + " · ", tel(c.emergencyContactPhone))] : null,
+        c.driverName ? [h("dt", {}, "Driver"), h("dd", {}, c.driverName + " · ", tel(c.driverPhone))] : null,
+        c.vehiclePlate ? [h("dt", {}, "Vehicle"), h("dd", {}, c.vehiclePlate + (c.vehicle ? " · " + c.vehicle : ""))] : null,
+        c.rideId ? [h("dt", {}, "Ride"), h("dd", {}, h("a", { href: "#", onclick: (e) => { e.preventDefault(); openRide(c.rideId); } }, c.rideId), c.destination ? " · to " + c.destination : "")] : null,
+        c.alertResult ? [h("dt", {}, "Alert"), h("dd", { class: "small" }, c.alertResult)] : null),
+      c.notes && c.notes.length ? h("ul", { class: "notes" }, c.notes.map(n => h("li", {}, h("span", { class: "muted" }, when(n.at) + " · " + (n.by || "") + ": "), n.text))) : null,
+      h("div", { class: "actions" },
+        c.status === "NEW" ? h("button", { class: "primary", onclick: setStatus("ACKNOWLEDGED") }, "Acknowledge") : null,
+        c.status !== "RESOLVED" ? h("button", { onclick: setStatus("RESOLVED") }, "Mark resolved") : h("button", { onclick: setStatus("NEW") }, "Reopen")),
+      h("div", { style: "margin-top:10px" }, noteBox,
+        h("div", { class: "actions" }, h("button", { onclick: async () => {
+          if (!noteBox.value.trim()) return;
+          await api("cases/" + c.id + "/notes", { method: "POST", body: { text: noteBox.value } });
+          busy = false; await refresh(); render();
+        } }, "Save note"))));
+  }
+
+  // ----- Rides -----
+  function openRide(id) {
+    tab = "rides"; rideDetail = id;
+    document.querySelectorAll("nav.tabs button").forEach(x => x.setAttribute("aria-selected", x.dataset.tab === "rides" ? "true" : "false"));
+    render();
+  }
+  const LIVE = new Set(["REQUESTED", "ASSIGNED", "ENROUTE", "ARRIVED", "SEATED", "IN_TRIP"]);
+  async function ridesList() {
+    const rides = await api("rides");
+    if (!rides.length) return h("p", { class: "empty" }, "No rides yet.");
+    return h("div", {},
+      h("div", { class: "toolbar" }, h("h2", { style: "margin:0;font-size:18px" }, "Rides"), h("span", { class: "muted small" }, "Newest first. Choose a ride to see everything that happened.")),
+      h("div", { class: "table-wrap" }, h("table", {},
+        h("thead", {}, h("tr", {}, ["Ride", "Booked", "Status", "To", "Driver", "Plate", "Code checked", "Fare", "Payment"].map(t => h("th", { scope: "col" }, t)))),
+        h("tbody", {}, rides.map(r => h("tr", { class: "clickable", tabindex: "0",
+          onclick: () => openRide(r.rideId), onkeydown: (e) => { if (e.key === "Enter") openRide(r.rideId); } },
+          h("td", {}, h("a", { href: "#", onclick: (e) => e.preventDefault() }, r.rideId)),
+          h("td", {}, when(r.createdAt)),
+          h("td", {}, h("span", { class: "chip" + (LIVE.has(r.phase) ? " warn" : r.phase === "COMPLETED" ? " ok" : "") }, r.phase)),
+          h("td", {}, r.destination || "—"),
+          h("td", {}, r.driverName || "—"),
+          h("td", {}, r.vehiclePlate || "—"),
+          h("td", {}, r.codeConfirmed ? h("span", { class: "chip ok" }, "Yes") : (r.driverId ? h("span", { class: "chip urgent" }, "No") : "—")),
+          h("td", {}, r.fareRupees ? "₹" + r.fareRupees : "—"),
+          h("td", {}, r.paymentStatus || "—")))))));
+  }
+  async function rideView(id) {
+    const d = await api("rides/" + encodeURIComponent(id));
+    const r = d.ride;
+    const quiet = new Set(["DRIVER_LOCATION", "BEACON"]);
+    const events = d.events.filter(e => !quiet.has(e.type));
+    const hidden = d.events.length - events.length;
+    return h("div", {},
+      h("div", { class: "toolbar" }, h("button", { onclick: () => { rideDetail = null; render(); } }, "← All rides"),
+        h("h2", { style: "margin:0;font-size:18px" }, r.rideId), h("span", { class: "chip" }, r.phase)),
+      h("dl", { class: "facts" },
+        h("dt", {}, "Booked"), h("dd", {}, when(r.createdAt)),
+        h("dt", {}, "To"), h("dd", {}, (r.destination || "—") + (r.destinationAddress ? " · " + r.destinationAddress : "")),
+        h("dt", {}, "Rider"), h("dd", {}, r.riderId || "—"),
+        h("dt", {}, "Driver"), h("dd", {}, (r.driverName || "—") + " · ", tel(r.driverPhone)),
+        h("dt", {}, "Vehicle"), h("dd", {}, (r.vehiclePlate || "—") + (r.vehicleModel ? " · " + r.vehicleModel : "")),
+        h("dt", {}, "Boarding code"), h("dd", {}, (r.boardingCode || "—") + " · ", r.codeConfirmed ? h("span", { class: "chip ok" }, "confirmed by the rider's phone") : h("span", { class: "chip urgent" }, "NOT confirmed")),
+        h("dt", {}, "Fare"), h("dd", {}, r.fareRupees ? "₹" + r.fareRupees + " · " + r.durationMinutes + " min · payment " + r.paymentStatus : "—")),
+      h("h3", { style: "margin-top:18px" }, "What happened"),
+      hidden ? h("p", { class: "muted small" }, hidden + " location updates not shown.") : null,
+      h("ol", { class: "timeline" }, events.map(e => h("li", {},
+        h("span", { class: "muted small" }, e.ts ? new Date(e.ts).toLocaleTimeString() : "#" + e.seq),
+        h("div", {}, h("b", {}, e.type.replace(/_/g, " ").toLowerCase()), " ",
+          h("span", { class: "muted small" }, "by " + (e.senderRole || "?").toLowerCase()),
+          e.payload && Object.keys(e.payload).length ? h("div", {}, h("code", {}, JSON.stringify(e.payload))) : null)))));
+  }
+
+  // ----- Drivers -----
+  async function drivers() {
+    const list = await api("drivers");
+    if (!list.length) return h("p", { class: "empty" }, "No drivers have signed up yet.");
+    const toggle = (d) => async () => {
+      let reason = "";
+      if (!d.suspended) {
+        reason = prompt("Why suspend " + (d.name || d.id) + "? (they will not be able to accept rides)");
+        if (reason === null) return;
+        if (!reason.trim()) { alert("Please give a reason."); return; }
+      } else if (!confirm("Let " + (d.name || d.id) + " accept rides again?")) return;
+      try { await api("drivers/" + d.id + "/suspend", { method: "POST", body: { suspended: !d.suspended, reason } }); }
+      catch (e) { alert(e.message); }
+      render();
+    };
+    return h("div", {},
+      h("div", { class: "toolbar" }, h("h2", { style: "margin:0;font-size:18px" }, "Drivers")),
+      h("div", { class: "table-wrap" }, h("table", {},
+        h("thead", {}, h("tr", {}, ["Name", "Phone", "Vehicle", "Plate", "Trips", "Rating", "Complaints", "Status", ""].map(t => h("th", { scope: "col" }, t)))),
+        h("tbody", {}, list.map(d => h("tr", {},
+          h("td", {}, d.name || "—"), h("td", {}, tel(d.phone)),
+          h("td", {}, [d.vehicleColour, d.vehicleModel].filter(Boolean).join(" ") || "—", d.vehicleType ? h("div", { class: "muted small" }, d.vehicleType) : null),
+          h("td", {}, d.vehiclePlate || "—"),
+          h("td", {}, d.completedTrips),
+          h("td", {}, d.ratingCount ? d.ratingAverage + " (" + d.ratingCount + ")" : "—"),
+          h("td", {}, d.complaints ? h("span", { class: "chip urgent" }, d.complaints) : "0"),
+          h("td", {}, d.suspended ? [h("span", { class: "chip urgent" }, "Suspended"), h("div", { class: "muted small" }, d.suspendedReason || "")] : h("span", { class: "chip ok" }, "Active")),
+          h("td", {}, h("button", { class: d.suspended ? "" : "danger", onclick: toggle(d) }, d.suspended ? "Restore" : "Suspend"))))))));
+  }
+
+  // ----- Riders -----
+  async function riders() {
+    const list = await api("riders");
+    if (!list.length) return h("p", { class: "empty" }, "No riders have signed up yet.");
+    return h("div", {},
+      h("div", { class: "toolbar" }, h("h2", { style: "margin:0;font-size:18px" }, "Riders")),
+      h("div", { class: "table-wrap" }, h("table", {},
+        h("thead", {}, h("tr", {}, ["Name", "Phone", "Emergency contact", "Joined", "Last sign-in"].map(t => h("th", { scope: "col" }, t)))),
+        h("tbody", {}, list.map(r => h("tr", {},
+          h("td", {}, r.name || "—"), h("td", {}, tel(r.phone)),
+          h("td", {}, r.emergencyContactPhone ? [(r.emergencyContactName || "") + " · ", tel(r.emergencyContactPhone)] : h("span", { class: "chip warn" }, "Not set")),
+          h("td", {}, when(r.createdAt)), h("td", {}, when(r.lastLoginAt))))))));
+  }
+
+  // ----- Alerts set-up -----
+  function settings() {
+    const a = overview ? overview.alerts : {};
+    const out = h("div", { class: "small", role: "status", style: "margin-top:8px" });
+    const run = (fn) => async (e) => {
+      e.target.disabled = true; out.textContent = "Working…";
+      try { await fn(); } catch (err) { out.textContent = err.message; }
+      e.target.disabled = false;
+    };
+    const linkArea = h("div", {});
+    const startLink = run(async () => {
+      const r = await api("telegram/link", { method: "POST" });
+      out.textContent = "";
+      linkArea.replaceChildren(
+        h("ol", { class: "steps" },
+          h("li", {}, "On the phone with your Telegram: ", h("a", { href: r.link, target: "_blank", rel: "noopener" }, "open this link"), " (or search for ", h("b", {}, r.bot), ")."),
+          h("li", {}, "Press ", h("b", {}, "Start"), " in Telegram."),
+          h("li", {}, "Come back and press ", h("b", {}, "Check"), ". The link works for " + r.expiresInMinutes + " minutes.")),
+        h("button", { class: "primary", onclick: run(async () => {
+          const c = await api("telegram/check", { method: "POST" });
+          if (c.linked) { await refresh(); render(); announce("Telegram linked"); }
+          else out.textContent = "Not yet. Make sure you pressed Start in Telegram, then press Check again.";
+        }) }, "Check"));
+    });
+    return h("div", {},
+      h("h2", { style: "margin-top:0;font-size:18px" }, "Alerts set-up"),
+      h("p", { class: "muted" }, "SOS and urgent feedback alert you on Telegram and by email. Everything else waits in the inbox and a 9 pm daily email."),
+
+      h("h3", {}, "Telegram ", a.telegramLinked ? h("span", { class: "chip ok" }, "Linked") : h("span", { class: "chip warn" }, a.telegramBotSet ? "Not linked" : "No bot yet")),
+      a.telegramLinked ? h("p", {}, "Alerts go to ", h("b", {}, a.telegramChat || "your Telegram"), ". ",
+          h("button", { class: "danger", onclick: run(async () => { await api("telegram/unlink", { method: "POST" }); await refresh(); render(); }) }, "Unlink"))
+        : a.telegramBotSet ? h("div", {}, h("button", { class: "primary", onclick: startLink }, "Link Telegram"), linkArea)
+        : h("ol", { class: "steps" },
+            h("li", {}, "In Telegram, open ", h("b", {}, "@BotFather"), ", send ", h("code", {}, "/newbot"), ", choose a name and a username ending in “bot”."),
+            h("li", {}, "Copy the token it gives you into ", h("code", {}, "backend\\cabeye-secrets.properties"), " as ", h("code", {}, "cabeye.telegram.bot-token=…")),
+            h("li", {}, "Restart the backend and come back here to link your chat.")),
+
+      h("h3", {}, "Email ", a.emailReady ? h("span", { class: "chip ok" }, "Ready") : h("span", { class: "chip warn" }, "Not set up")),
+      a.emailReady ? h("p", {}, "Alerts are emailed to ", h("b", {}, a.emailTo), ".")
+        : h("ol", { class: "steps" },
+            h("li", {}, "Turn on 2-Step Verification on the Gmail account that will send alerts."),
+            h("li", {}, "Google Account → Security → App passwords → create one called “Cab Eye”."),
+            h("li", {}, "Put the Gmail address and the 16-letter app password in ", h("code", {}, "cabeye-secrets.properties"), " (", h("code", {}, "spring.mail.username"), ", ", h("code", {}, "spring.mail.password"), "), then restart.")),
+
+      h("h3", {}, "Try it"),
+      h("button", { onclick: run(async () => { const r = await api("alerts/test", { method: "POST" }); out.textContent = "Test alert: " + r.result; }) }, "Send a test alert"),
+      out);
+  }
+
+  // ---------- boot ----------
+  (async () => {
+    try {
+      const s = await fetch("/admin/api/state").then(r => r.json());
+      if (!s.configured) {
+        $("login").hidden = false;
+        $("loginForm").replaceChildren(h("p", { class: "error" }, "The admin login is not set up yet."),
+          h("p", {}, "Copy ", h("code", {}, "backend\\cabeye-secrets.example.properties"), " to ", h("code", {}, "cabeye-secrets.properties"),
+            ", set ", h("code", {}, "cabeye.admin.email"), " and ", h("code", {}, "cabeye.admin.password"), ", and restart the backend."));
+        return;
+      }
+    } catch (e) {}
+    if (token) start(); else signedOut();
+  })();
+})();
+</script>
+</body>
+</html>

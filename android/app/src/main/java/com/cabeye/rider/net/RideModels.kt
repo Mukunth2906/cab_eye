@@ -125,6 +125,40 @@ enum class RideEventType(
     TRIP_COMPLETED(NarrationTier.QUEUED, Earcon.BOOKING_CONFIRMED),
     RIDE_CANCELLED(NarrationTier.INTERRUPT, Earcon.CANCELLED),
 
+    /**
+     * The fare's payment status changed on the server (payload: status, paymentRef,
+     * fareRupees, reason). Not a phase change — a COMPLETED ride stays COMPLETED while its
+     * payment settles — so it sits after RIDE_CANCELLED and outside [isRideLifecycle]. The
+     * driver's Complete screen listens for it; the rider learns the outcome by polling the
+     * order, because the rider's socket has already left the ride topic by then.
+     */
+    PAYMENT_UPDATED(NarrationTier.EARCON_ONLY),
+
+    // ---- The live camera ------------------------------------------------------------
+    // "Help me find my passenger". Not phase changes, so they sit outside [isRideLifecycle],
+    // and they are never replayed: the server broadcasts them without logging them, so a
+    // reconnect cannot ask the rider an old question again. The rider's view model speaks its
+    // own sentences for these; the tier only matters to [narrate]'s callers.
+
+    /** The driver asked to see the rider's camera. The rider's phone asks for consent. */
+    CAMERA_REQUESTED(NarrationTier.QUEUED),
+
+    /** The rider said yes; the rider's phone starts streaming. */
+    CAMERA_STARTED(NarrationTier.EARCON_ONLY),
+
+    /** The rider said no, or did not answer in time. Payload: reason. */
+    CAMERA_DECLINED(NarrationTier.EARCON_ONLY),
+
+    /** The camera went off. Payload: reason (CODE_CONFIRMED, SEATED, TIME_LIMIT, …), by. */
+    CAMERA_STOPPED(NarrationTier.EARCON_ONLY),
+
+    /**
+     * One picture from the rider's camera, on its way to the driver. Handled by the socket
+     * itself and delivered on [com.cabeye.rider.net.RideSocket.frames] — it never reaches the
+     * ride-event stream, so a few pictures a second cannot crowd out an arrival.
+     */
+    CAMERA_FRAME(NarrationTier.EARCON_ONLY),
+
     // ---- Transport notices ----------------------------------------------------------
     // Facts about the socket, not about the ride. Handled by the socket layer and never
     // narrated from a ride handler, which is why they carry EARCON_ONLY and no sound: the
@@ -202,6 +236,11 @@ data class RideSnapshot(
     val codeConfirmed: Boolean,
     val fareRupees: Int,
     val durationMinutes: Int,
+    // NONE | REPORTED | CONFIRMED | FAILED. REPORTED is only what the rider's UPI app claimed;
+    // CONFIRMED is the server saying money actually arrived. The app must never speak the
+    // first as if it were the second.
+    val paymentStatus: String = "NONE",
+    val paymentRef: String = "",
     val lastSeq: Long
 ) {
     companion object {
@@ -232,6 +271,8 @@ data class RideSnapshot(
                 codeConfirmed = o.optBoolean("codeConfirmed", false),
                 fareRupees = o.optInt("fareRupees", 0),
                 durationMinutes = o.optInt("durationMinutes", 0),
+                paymentStatus = o.optString("paymentStatus", "NONE"),
+                paymentRef = o.optString("paymentRef"),
                 lastSeq = o.optLong("lastSeq", 0L)
             )
         }.getOrNull()

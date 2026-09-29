@@ -106,6 +106,49 @@ object Classifier {
         RegexOption.IGNORE_CASE
     )
 
+    /**
+     * The whole utterance must be the command. "go back home" is a booking to Home, and only a
+     * bare "go back" is a request to return to the previous question.
+     */
+    private val BACK = Regex(
+        "^\\s*(please\\s+)?(go back|back|go to the previous step|previous( step)?|start over|start again|" +
+            "change (the )?(place|destination)|different (place|destination)|wrong (place|destination))" +
+            "\\s*(please)?\\s*[.!]?\\s*$",
+        RegexOption.IGNORE_CASE
+    )
+
+    private val MY_PLACES = Regex(
+        "\\b(my places|my usual places|usual places|favou?rite places|saved places|recent places|" +
+            "previous places|places i (usually )?go|where do i (usually )?go|where have i been)\\b",
+        RegexOption.IGNORE_CASE
+    )
+
+    private val FORGET_HISTORY = Regex(
+        "\\b(forget|delete|clear|erase) (all )?(my )?(history|places|trips|memory|past rides)\\b",
+        RegexOption.IGNORE_CASE
+    )
+
+    private val CANCEL_SCHEDULED = Regex(
+        "\\b(cancel|delete|remove|clear) (my |the |all |all my )?(scheduled|upcoming|later) (rides?|trips?|bookings?)\\b",
+        RegexOption.IGNORE_CASE
+    )
+    private val LIST_SCHEDULED = Regex(
+        "\\b((my |any )?scheduled rides?|my schedule|upcoming rides?|rides? (i )?(booked|scheduled) for later)\\b",
+        RegexOption.IGNORE_CASE
+    )
+    private val SCHEDULE_RIDE = Regex(
+        "\\b(schedule (a |an |another |my )?(ride|cab|auto|trip)|schedule one|" +
+            "book (a ride |a cab |an auto |one )?(for|at) (later|tomorrow|tonight|\\d))\\b",
+        RegexOption.IGNORE_CASE
+    )
+    private val GIVE_FEEDBACK = Regex(
+        "\\b(give feedback|feedback|report (a |an )?(problem|issue)|complain|complaint|rate (the |my )?(ride|driver))\\b",
+        RegexOption.IGNORE_CASE
+    )
+
+    private val SIGN_OUT = Regex("\\b(sign ?out|log ?out|signout|logout)\\b", RegexOption.IGNORE_CASE)
+    private val SIGN_IN = Regex("^\\s*(sign ?in|log ?in|login|signin)\\b", RegexOption.IGNORE_CASE)
+
     private val DEMO_RIDE = Regex("\\b(demo ride|demo mode|simulate (a )?ride)\\b", RegexOption.IGNORE_CASE)
 
     private val YES = Regex(
@@ -114,7 +157,7 @@ object Classifier {
     )
 
     private val NO = Regex(
-        "^\\s*(no|nope|nah|wrong|not that|no thanks|incorrect)\\b",
+        "^\\s*(no|nope|nah|wrong|not that|no thanks|incorrect|neither|none|not this)\\b",
         RegexOption.IGNORE_CASE
     )
 
@@ -136,7 +179,21 @@ object Classifier {
         // ---- Commands ------------------------------------------------------------------
         // Cancel first and unconditionally. It is the safety valve on optimistic booking and
         // the one promise the design cannot break.
+        // Before cancel: "cancel my scheduled ride" is about a ride for later, and must never
+        // cancel the ride the rider is on.
+        if (CANCEL_SCHEDULED.containsMatchIn(text)) return command(RiderIntent.CancelScheduled, text, "cancel_scheduled")
+
         if (IntentParser.CANCEL.containsMatchIn(text)) return command(RiderIntent.Cancel, text, "cancel")
+
+        if (BACK.containsMatchIn(text)) return command(RiderIntent.Back, text, "back")
+
+        if (LIST_SCHEDULED.containsMatchIn(text)) return command(RiderIntent.ListScheduled, text, "list_scheduled")
+        if (SCHEDULE_RIDE.containsMatchIn(text)) return command(RiderIntent.ScheduleRide, text, "schedule_ride")
+        if (!rideActive && GIVE_FEEDBACK.containsMatchIn(text)) return command(RiderIntent.GiveFeedback, text, "give_feedback")
+
+        // Before LIST_PLACES: "forget my places" and "my places" both contain "places".
+        if (FORGET_HISTORY.containsMatchIn(text)) return command(RiderIntent.ForgetHistory, text, "forget_history")
+        if (MY_PLACES.containsMatchIn(text)) return command(RiderIntent.MyPlaces, text, "my_places")
 
         if (LIST_PLACES.containsMatchIn(text)) return command(RiderIntent.ListPlaces, text, "list_places")
 
@@ -158,6 +215,12 @@ object Classifier {
         }
 
         if (DEMO_RIDE.containsMatchIn(text)) return command(RiderIntent.DemoRide, text, "demo_ride")
+
+        // Never mid-ride: "log out" while a driver is on the way would strand the rider.
+        if (!rideActive) {
+            if (SIGN_OUT.containsMatchIn(text)) return command(RiderIntent.SignOut, text, "sign_out")
+            if (SIGN_IN.containsMatchIn(text)) return command(RiderIntent.SignIn, text, "sign_in")
+        }
 
         if (IntentParser.HELP.containsMatchIn(text)) return command(RiderIntent.Help, text, "help")
         if (IntentParser.REPEAT.containsMatchIn(text)) return command(RiderIntent.Repeat, text, "repeat")

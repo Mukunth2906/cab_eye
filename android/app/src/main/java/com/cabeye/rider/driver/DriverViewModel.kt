@@ -9,15 +9,23 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.cabeye.rider.CabEyeApp
 import com.cabeye.rider.net.ApiResult
+import com.cabeye.rider.net.preferServerSentence
 import com.cabeye.rider.net.ConnectionState
 import com.cabeye.rider.net.RideEvent
 import com.cabeye.rider.net.RideEventType
 import com.cabeye.rider.net.RidePhase
 import com.cabeye.rider.net.RideSnapshot
+import com.cabeye.rider.net.PaymentOrder
+import com.cabeye.rider.net.PaymentOrderStatus
 import com.cabeye.rider.telemetry.Telemetry
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.util.Base64
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * The driver's state holder — **entirely separate from the rider's**.
@@ -49,26 +57,37 @@ class DriverViewModel(application: Application) : AndroidViewModel(application) 
     var uiState by mutableStateOf(DriverUiState())
         private set
 
+    /**
+     * The newest picture from the passenger's camera, or null. Kept out of [uiState] because it
+     * changes several times a second and nothing else on the screen should recompose for it.
+     */
+    var cameraFrame by mutableStateOf<Bitmap?>(null)
+        private set
+
     private var pollJob: Job? = null
+    private var paymentJob: Job? = null
     private var bannerJob: Job? = null
 
     /** The ride this driver is currently on. */
     private var rideId: String? = null
 
     /**
-     * Driver identity. Hardcoded for the MVP, and honest about it.
+     * Driver identity, from the signed-in driver's profile.
      *
-     * There is no driver sign-up in this build. These values are what the rider's phone will
-     * say aloud on assignment, so they are written the way they should sound — "Bajaj auto,
-     * yellow" rather than a model code a TTS engine would spell out letter by letter.
+     * The server re-stamps these from the sign-in token anyway, so what is sent here matters only
+     * when no one is signed in (the browser test page path). The fallbacks are written the way
+     * they should sound — "Bajaj auto, yellow" rather than a model code a TTS engine would spell
+     * out letter by letter.
      */
-    private val driverName = "Karthik"
-    private val vehicleModel = "Bajaj auto, yellow"
-    private val vehiclePlate = "TN 37 BX 4412"
-    private val driverPhone = "+910000000000"
+    private val account get() = app.driverAccount.value
+    private val driverName get() = account?.name?.ifBlank { null } ?: "Karthik"
+    private val vehicleModel get() = account?.driver?.vehicleDescription?.ifBlank { null } ?: "Bajaj auto, yellow"
+    private val vehiclePlate get() = account?.driver?.vehiclePlate?.ifBlank { null } ?: "TN 37 BX 4412"
+    private val driverPhone get() = account?.phone?.ifBlank { null }?.let { "+91$it" } ?: "+910000000000"
 
     private companion object {
         const val TAG = "CabEye.Driver"
+        const val PAYMENT_POLL_MS = 3_000L
 
         /**
          * How often to poll for open requests while online.
@@ -100,6 +119,57 @@ class DriverViewModel(application: Application) : AndroidViewModel(application) 
                 uiState = uiState.copy(connected = state is ConnectionState.Connected)
             }
         }
+        viewModelScope.launch {
+            socket.frames.collect { jpeg ->
+                if (uiState.camera != DriverCamera.LIVE) return@collect
+                // Decoded off the main thread; only the newest picture is ever shown.
+                val bitmap = withContext(Dispatchers.Default) {
+                    runCatching {
+                        val bytes = Base64.decode(jpeg, Base64.DEFAULT)
+                        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    }.getOrNull()
+                }
+                if (bitmap != null && uiState.camera == DriverCamera.LIVE) cameraFrame = bitmap
+            }
+        }
+    }
+
+    // =================================================================================
+    //  The passenger's camera — for finding them at pickup
+    // =================================================================================
+
+    /**
+     * Asks to see the passenger's back camera. Their phone asks them by voice; nothing is
+     * shown until they say yes. Refused by the server after the code is confirmed.
+     */
+    fun requestCamera() {
+        val id = rideId ?: return
+        if (uiState.camera == DriverCamera.ASKING || uiState.camera == DriverCamera.LIVE) return
+        Telemetry.logDriverAction("CAMERA_REQUEST", id)
+        viewModelScope.launch {
+            when (val result = api.cameraRequest(id)) {
+                is ApiResult.Ok -> {
+                    val live = result.value == "LIVE"
+                    uiState = uiState.copy(camera = if (live) DriverCamera.LIVE else DriverCamera.ASKING)
+                    if (!live) showBanner("Asking your passenger to share their camera…")
+                }
+                is ApiResult.Failed -> showBanner(result.spoken)
+            }
+        }
+    }
+
+    /** Stops the passenger's camera — found them, or no longer needed. */
+    fun stopCamera() {
+        val id = rideId ?: return
+        if (uiState.camera == DriverCamera.OFF) return
+        Telemetry.logDriverAction("CAMERA_STOP", id)
+        endCamera()
+        viewModelScope.launch { api.cameraStop(id, "DRIVER_STOPPED") }
+    }
+
+    private fun endCamera(state: DriverCamera = DriverCamera.OFF) {
+        cameraFrame = null
+        if (uiState.camera != state) uiState = uiState.copy(camera = state)
     }
 
     // =================================================================================
@@ -224,7 +294,9 @@ class DriverViewModel(application: Application) : AndroidViewModel(application) 
                 is ApiResult.Failed -> {
                     // Usually 409: another driver took it first. That is a normal outcome, not
                     // a failure, so it goes back to waiting rather than to an error screen.
-                    showBanner("That request is no longer available.")
+                    // A 403 carries the server's own sentence (account paused by an admin).
+                    val said = result.preferServerSentence()
+                    showBanner(if (said !== result) said.spoken else "That request is no longer available.")
                     uiState = uiState.copy(state = DriverState.Online())
                     startPolling()
                 }
@@ -371,14 +443,17 @@ class DriverViewModel(application: Application) : AndroidViewModel(application) 
         Telemetry.logDriverAction("SEATED", id)
 
         viewModelScope.launch {
-            when (api.seated(id)) {
+            when (val result = api.seated(id)) {
                 is ApiResult.Ok -> {
+                    endCamera()
                     uiState = uiState.copy(
                         state = DriverState.Seated(id),
                         banner = "Passenger seated. You can start the trip."
                     )
                 }
-                is ApiResult.Failed -> showBanner("Couldn't confirm. Try again.")
+                // Usually 409: the passenger's phone has not confirmed the boarding code yet.
+                // The server's sentence says what to do about it.
+                is ApiResult.Failed -> showBanner(result.preferServerSentence().spoken)
             }
         }
     }
@@ -434,14 +509,68 @@ class DriverViewModel(application: Application) : AndroidViewModel(application) 
                         ),
                         banner = ""
                     )
+                    watchPayment(id)
                 }
                 is ApiResult.Failed -> showBanner(result.spoken)
             }
         }
     }
 
+    /**
+     * Keeps the Complete screen's payment line current until the fare is settled.
+     *
+     * The PAYMENT_UPDATED event normally arrives first over the socket; this poll is the
+     * fallback for a dropped socket, so a driver is never left staring at "waiting" for a fare
+     * that was paid a minute ago.
+     */
+    private fun watchPayment(id: String) {
+        paymentJob?.cancel()
+        paymentJob = viewModelScope.launch {
+            while (true) {
+                val current = uiState.state as? DriverState.Complete ?: return@launch
+                if (current.rideId != id || current.paymentStatus == "CONFIRMED") return@launch
+                (api.paymentStatus(id) as? ApiResult.Ok<RideSnapshot>)?.value?.let { snap ->
+                    applyPayment(id, snap.paymentStatus, snap.paymentRef)
+                }
+                refreshQr(id)
+                delay(PAYMENT_POLL_MS)
+            }
+        }
+    }
+
+    /**
+     * Keeps the QR code pointing at a payable order. The server's create call is idempotent:
+     * it returns the same open order the customer's phone is using, and only makes a new one
+     * after the last one failed or expired — so the customer and the QR always pay the same
+     * order, and a stale QR is replaced by itself.
+     */
+    private suspend fun refreshQr(id: String) {
+        val order = (api.createPaymentOrder(id) as? ApiResult.Ok<PaymentOrder>)?.value ?: return
+        val current = uiState.state as? DriverState.Complete ?: return
+        if (current.rideId != id) return
+        if (order.status == PaymentOrderStatus.PAID) {
+            applyPayment(id, "CONFIRMED", order.bankRef)
+            return
+        }
+        if (current.checkoutUrl != order.checkoutUrl) {
+            uiState = uiState.copy(state = current.copy(checkoutUrl = order.checkoutUrl))
+        }
+    }
+
+    private fun applyPayment(id: String, status: String, ref: String) {
+        val current = uiState.state as? DriverState.Complete ?: return
+        if (current.rideId != id || current.paymentStatus == status) return
+        uiState = uiState.copy(state = current.copy(paymentStatus = status, paymentRef = ref))
+        when (status) {
+            "CONFIRMED" -> showBanner("Payment received: ₹${current.fareRupees}.")
+            "FAILED" -> showBanner("The rider's payment failed. They can try again.")
+        }
+    }
+
     /** Back to waiting, ready for the next request. */
     fun finishAndGoOnline() {
+        endCamera()
+        paymentJob?.cancel()
         socket.unsubscribe("ride finished")
         rideId = null
         uiState = uiState.copy(state = DriverState.Online(), banner = "")
@@ -508,6 +637,44 @@ class DriverViewModel(application: Application) : AndroidViewModel(application) 
                 finishAndGoOnline()
             }
 
+            RideEventType.CAMERA_STARTED -> {
+                if (event.rideId == rideId) {
+                    uiState = uiState.copy(camera = DriverCamera.LIVE)
+                    showBanner("Your passenger is sharing their camera.")
+                }
+            }
+
+            RideEventType.CAMERA_DECLINED -> {
+                if (event.rideId == rideId && uiState.camera == DriverCamera.ASKING) {
+                    endCamera(DriverCamera.DECLINED)
+                    showBanner(
+                        if (event.string("reason") == "NO_ANSWER") "No answer from your passenger. Try a message or the beacon."
+                        else "Your passenger said no. Try a message or the beacon."
+                    )
+                }
+            }
+
+            RideEventType.CAMERA_STOPPED -> {
+                if (event.rideId == rideId && uiState.camera != DriverCamera.OFF) {
+                    endCamera()
+                    showBanner(
+                        when (event.string("reason")) {
+                            "CODE_CONFIRMED" -> "Code confirmed — camera off."
+                            "SEATED", "TRIP_STARTED" -> "Camera off."
+                            "TIME_LIMIT" -> "The camera turns off after three minutes."
+                            "RIDER_SAID_STOP", "RIDER_STOPPED" -> "Your passenger turned the camera off."
+                            "APP_IN_BACKGROUND", "NO_PICTURES", "CAMERA_UNAVAILABLE" ->
+                                "Your passenger's camera stopped."
+                            else -> "Camera off."
+                        }
+                    )
+                }
+            }
+
+            // The fare's payment moved on the server — paid, failed, or reported by the rider.
+            RideEventType.PAYMENT_UPDATED ->
+                applyPayment(event.rideId, event.string("status"), event.string("paymentRef"))
+
             else -> Unit
         }
     }
@@ -543,6 +710,7 @@ class DriverViewModel(application: Application) : AndroidViewModel(application) 
 
     override fun onCleared() {
         pollJob?.cancel()
+        paymentJob?.cancel()
         bannerJob?.cancel()
         super.onCleared()
     }
