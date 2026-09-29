@@ -1026,4 +1026,4 @@ and run the app on an Android device/emulator with Google Play services.
 - Google Places/Maps require a valid Google Maps Platform billing-enabled project and API key.
 - The existing backend is still in-memory; rides disappear when the server restarts.
 - Routes/ETA from Google Routes API are not part of this milestone.
-- Driver GPS remains the existing demo transport path.
+- Driver GPS remains the existing demo transport path.  
