@@ -55,6 +55,9 @@ ngrok.yml
 *.iml
 .vscode/
 *.swp
+.classpath
+.project
+.settings/
 
 # --- OS clutter ----------------------------------------------------------------------
 Thumbs.db
