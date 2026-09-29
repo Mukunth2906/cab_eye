@@ -36,7 +36,10 @@ data class CabEyePalette(
     val confirm: Color,
     val clarify: Color,
     val danger: Color,
-    val outline: Color
+    val outline: Color,
+    val surface: Color = CabEyeColors.SurfaceDark,
+    val surfaceElevated: Color = CabEyeColors.SurfaceElevated,
+    val processing: Color = CabEyeColors.ProcessingPurple
 )
 
 private fun paletteFor(choice: ThemeChoice): CabEyePalette = when (choice) {
@@ -44,14 +47,17 @@ private fun paletteFor(choice: ThemeChoice): CabEyePalette = when (choice) {
     ThemeChoice.DEEP_DARK -> CabEyePalette(
         choice = choice,
         isLight = false,
-        background = Color(CabEyeInk.DD_BACKGROUND),
-        onBackground = Color(CabEyeInk.DD_ON_BACKGROUND),
-        muted = Color(CabEyeInk.DD_MUTED),
-        listening = Color(CabEyeInk.DD_LISTENING),
-        confirm = Color(CabEyeInk.DD_CONFIRM),
-        clarify = Color(CabEyeInk.DD_CLARIFY),
-        danger = Color(CabEyeInk.DD_DANGER),
-        outline = Color(CabEyeInk.DD_OUTLINE)
+        background = CabEyeColors.Background,
+        onBackground = CabEyeColors.TextPrimary,
+        muted = CabEyeColors.TextSecondary,
+        listening = CabEyeColors.VoiceBlue,
+        confirm = CabEyeColors.SuccessGreen,
+        clarify = CabEyeColors.WarningYellow,
+        danger = CabEyeColors.DangerRed,
+        outline = CabEyeColors.CardBorder,
+        surface = CabEyeColors.SurfaceDark,
+        surfaceElevated = CabEyeColors.SurfaceElevated,
+        processing = CabEyeColors.ProcessingPurple
     )
 
     ThemeChoice.HIGH_CONTRAST_YELLOW -> CabEyePalette(
@@ -64,7 +70,10 @@ private fun paletteFor(choice: ThemeChoice): CabEyePalette = when (choice) {
         confirm = Color(CabEyeInk.HCY_CONFIRM),
         clarify = Color(CabEyeInk.HCY_CLARIFY),
         danger = Color(CabEyeInk.HCY_DANGER),
-        outline = Color(CabEyeInk.HCY_OUTLINE)
+        outline = Color(CabEyeInk.HCY_OUTLINE),
+        surface = Color(0xFF121212),
+        surfaceElevated = Color(0xFF1E1E1E),
+        processing = Color(CabEyeInk.HCY_CLARIFY)
     )
 
     ThemeChoice.HIGH_CONTRAST_LIGHT -> CabEyePalette(
@@ -77,7 +86,10 @@ private fun paletteFor(choice: ThemeChoice): CabEyePalette = when (choice) {
         confirm = Color(CabEyeInk.HCL_CONFIRM),
         clarify = Color(CabEyeInk.HCL_CLARIFY),
         danger = Color(CabEyeInk.HCL_DANGER),
-        outline = Color(CabEyeInk.HCL_OUTLINE)
+        outline = Color(CabEyeInk.HCL_OUTLINE),
+        surface = Color(0xFFF2F2F7),
+        surfaceElevated = Color(0xFFE5E5EA),
+        processing = Color(0xFF5856D6)
     )
 }
 

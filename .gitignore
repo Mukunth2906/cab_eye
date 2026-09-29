@@ -9,6 +9,7 @@
 # These are rebuilt every time you run gradlew or the install script. The release APK
 # alone is ~11 MB and changes on every build, so it must never be committed.
 build/
+bin/
 .gradle/
 .kotlin/
 *.apk

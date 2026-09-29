@@ -280,7 +280,9 @@ class MainActivity : FragmentActivity() {
                             onOpenSettings = { showSettings = true },
                             onPostRideAction = vm::onPostRideAction,
                             onCameraAnswer = vm::onCameraAnswer,
-                            onStopCamera = vm::onStopCamera
+                            onStopCamera = vm::onStopCamera,
+                            onCallDriver = vm::onCallDriver,
+                            onHelp = vm::onHelp
                         )
                     }
                 }

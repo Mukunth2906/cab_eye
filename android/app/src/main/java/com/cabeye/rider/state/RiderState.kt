@@ -154,7 +154,9 @@ sealed interface RiderState {
     data class Arrived(
         val driver: DriverInfo,
         val expectedCode: String,
-        val headphonesConnected: Boolean = false
+        val headphonesConnected: Boolean = false,
+        val codeVerified: Boolean = false,
+        val verificationFailed: Boolean = false
     ) : RiderState
 
     /** Passenger seated, journey underway. Heartbeat runs again. */

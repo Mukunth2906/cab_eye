@@ -97,6 +97,10 @@ public class MockPaymentGateway {
         this(rides, Clock.systemUTC(), razorpay);
     }
 
+    public MockPaymentGateway(RideService rides) {
+        this(rides, Clock.systemUTC(), null);
+    }
+
     /** Test seam: lets expiry be tested without sleeping for ten minutes. */
     public MockPaymentGateway(RideService rides, Clock clock) {
         this(rides, clock, null);

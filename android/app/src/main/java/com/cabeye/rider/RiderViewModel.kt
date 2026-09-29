@@ -977,6 +977,9 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
 
         // A wrong code is not a recognition failure to be retried quietly. It is the one
         // outcome this entire mechanism exists to catch, and it is tier 0.
+        uiState = uiState.copy(
+            ride = (uiState.ride as? RiderState.Arrived)?.copy(verificationFailed = true) ?: uiState.ride
+        )
         engine.earcon(Earcon.ERROR)
         speak(
             "That is not the right code. Do not get in. Say S O S if you need help.",
@@ -1018,6 +1021,9 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         codeVerified = true
         codeListenJob?.cancel()
         codeListenJob = null
+        uiState = uiState.copy(
+            ride = (uiState.ride as? RiderState.Arrived)?.copy(codeVerified = true, verificationFailed = false) ?: uiState.ride
+        )
         // The right car is found; the camera's job is done. "Camera off." is queued behind
         // whatever the caller says next, never over it.
         stopCamera("CODE_CONFIRMED")
@@ -1835,6 +1841,31 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         activeRideId?.let { rideId ->
             viewModelScope.launch { api.confirmCode(rideId, matched = true) }
         }
+    }
+
+    /** Triggered when the rider or helper taps "Verify Boarding Code" or "Repeat Code". */
+    fun onVerifyBoardingCode() {
+        if (uiState.ride is RiderState.Arrived) {
+            uiState = uiState.copy(
+                ride = (uiState.ride as RiderState.Arrived).copy(verificationFailed = false)
+            )
+            openMic(MicPurpose.CODE_VERIFY)
+        }
+    }
+
+    /** Tapped "Call Driver" or requested driver phone / vehicle details. */
+    fun onCallDriver() {
+        val driver = currentDriver()
+        if (driver == null) {
+            speak("No driver assigned yet.", NarrationTier.QUEUED)
+        } else {
+            speak("${driver.name}, phone ${driver.phoneNumber}.", NarrationTier.QUEUED)
+        }
+    }
+
+    /** Tapped "Help" from idle or status. */
+    fun onHelp() {
+        speakHelp()
     }
 
     // =================================================================================
