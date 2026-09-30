@@ -152,6 +152,10 @@ public class RideWebSocketHandler extends TextWebSocketHandler {
             return;
         }
 
+        if ("DRIVER_LOCATION".equals(incoming.type())) {
+            sessions.recordDriverLocation(userId, incoming.payload());
+        }
+
         // Re-stamp identity and timestamp from the session rather than trusting the body. Even
         // without a security layer, a client must not be able to speak as the driver simply by
         // setting a field — that would make the boarding-code flow meaningless.

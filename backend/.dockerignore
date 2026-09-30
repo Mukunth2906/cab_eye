@@ -1,0 +1,15 @@
+.git
+.gradle
+bin/
+data/
+*.log
+*.mv.db
+.classpath
+.project
+.settings
+cabeye-secrets.properties
+
+# Ignore build directory except the packaged jar
+build/*
+!build/libs/
+!build/libs/*.jar

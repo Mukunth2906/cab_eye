@@ -32,6 +32,10 @@ public class DataDirectory {
                 PRIMARY KEY (table_name, row_key)
             )""";
 
+    static final String INDEX_ORD = """
+            CREATE INDEX IF NOT EXISTS idx_store_rows_ord ON store_rows (table_name, ord)
+            """;
+
     private final Path root;
     private final ObjectMapper mapper;
     private final JdbcTemplate jdbc;
@@ -40,7 +44,14 @@ public class DataDirectory {
         this.root = Path.of(dir).toAbsolutePath();
         this.mapper = mapper;
         this.jdbc = jdbc;
-        jdbc.execute(SCHEMA);
+        try {
+            jdbc.execute(SCHEMA);
+            jdbc.execute(INDEX_ORD);
+        } catch (Exception e) {
+            // In concurrent multi-instance boot, table/index may already exist or be created by peer
+            org.slf4j.LoggerFactory.getLogger(DataDirectory.class)
+                    .debug("Schema initialization notice: {}", e.getMessage());
+        }
     }
 
     public <T> Table<T> table(String name, Class<T> rowType) {

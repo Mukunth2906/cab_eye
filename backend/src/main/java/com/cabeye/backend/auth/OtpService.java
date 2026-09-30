@@ -47,9 +47,13 @@ public class OtpService {
     private final SecureRandom random = new SecureRandom();
     private final Map<String, Pending> pending = new ConcurrentHashMap<>();
     private final boolean expose;
+    private final com.cabeye.backend.redis.RedisBridge redisBridge;
 
-    public OtpService(@Value("${cabeye.auth.otp.expose:true}") boolean expose) {
+    public OtpService(@Value("${cabeye.auth.otp.expose:true}") boolean expose,
+                      @org.springframework.beans.factory.annotation.Autowired(required = false)
+                      com.cabeye.backend.redis.RedisBridge redisBridge) {
         this.expose = expose;
+        this.redisBridge = redisBridge;
     }
 
     /**
@@ -67,7 +71,11 @@ public class OtpService {
         }
 
         String code = String.format("%06d", random.nextInt(1_000_000));
-        pending.put(key, new Pending(hash(key, code), now, now + TTL_MS, 0));
+        String hashed = hash(key, code);
+        pending.put(key, new Pending(hashed, now, now + TTL_MS, 0));
+        if (redisBridge != null && redisBridge.isEnabled()) {
+            redisBridge.saveOtp(key, hashed + ":" + (now + TTL_MS), TTL_MS / 1000);
+        }
         deliver(role, phone, code);
         return new Sent(true, 0, expose ? code : null, TTL_MS / 1000);
     }
@@ -76,15 +84,24 @@ public class OtpService {
     public Verdict verify(Role role, String phone, String code) {
         String key = key(role, phone);
         Pending p = pending.get(key);
+        if (p == null && redisBridge != null && redisBridge.isEnabled()) {
+            String redisVal = redisBridge.getOtp(key);
+            if (redisVal != null && redisVal.contains(":")) {
+                String[] parts = redisVal.split(":", 2);
+                p = new Pending(parts[0], System.currentTimeMillis(), Long.parseLong(parts[1]), 0);
+            }
+        }
         if (p == null) return Verdict.NO_CODE;
         if (System.currentTimeMillis() > p.expiresAt) {
             pending.remove(key);
+            if (redisBridge != null && redisBridge.isEnabled()) redisBridge.deleteOtp(key);
             return Verdict.EXPIRED;
         }
         String digits = code == null ? "" : code.replaceAll("\\D", "");
         if (MessageDigest.isEqual(p.hash.getBytes(StandardCharsets.UTF_8),
                 hash(key, digits).getBytes(StandardCharsets.UTF_8))) {
             pending.remove(key);
+            if (redisBridge != null && redisBridge.isEnabled()) redisBridge.deleteOtp(key);
             return Verdict.OK;
         }
         int attempts = p.attempts + 1;

@@ -49,9 +49,23 @@ public class RideSessionManager {
     private final Map<String, Set<WebSocketSession>> rooms = new ConcurrentHashMap<>();
 
     private final ObjectMapper objectMapper;
+    private final com.cabeye.backend.redis.RedisBridge redisBridge;
+    private final String instanceId = java.util.UUID.randomUUID().toString();
 
     public RideSessionManager(ObjectMapper objectMapper) {
+        this(objectMapper, null);
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public RideSessionManager(ObjectMapper objectMapper,
+                              @org.springframework.beans.factory.annotation.Autowired(required = false)
+                              com.cabeye.backend.redis.RedisBridge redisBridge) {
         this.objectMapper = objectMapper;
+        this.redisBridge = redisBridge;
+    }
+
+    public String instanceId() {
+        return instanceId;
     }
 
     // -------------------------------------------------------------------------------
@@ -108,33 +122,47 @@ public class RideSessionManager {
     }
 
     // -------------------------------------------------------------------------------
-    //  broadcast
+    //  broadcast & cluster synchronization
     // -------------------------------------------------------------------------------
 
     /**
-     * Sends an event to every open session on a ride.
+     * Sends an event to every open session on a ride across all cluster instances.
      *
      * @param rideId ride topic
      * @param event  event to serialise and deliver
-     * @return number of sessions the event was actually written to
+     * @return number of sessions the event was actually written to locally
      */
     public int broadcast(String rideId, RideEvent event) {
         return broadcastExcept(rideId, event, null);
     }
 
     /**
-     * Sends an event to every open session on a ride except one — used to echo a message
-     * to the <em>other</em> party without bouncing it back to its sender.
+     * Sends an event to every open session on a ride except one, and fans out to cluster peer nodes.
      *
      * @param rideId  ride topic
      * @param event   event to serialise and deliver
      * @param exclude session to skip; {@code null} means send to everyone
-     * @return number of sessions the event was actually written to
+     * @return number of sessions the event was actually written to locally
      */
     public int broadcastExcept(String rideId, RideEvent event, WebSocketSession exclude) {
+        String excludeId = exclude != null ? exclude.getId() : null;
+        int delivered = broadcastLocal(rideId, event, excludeId);
+
+        if (redisBridge != null && redisBridge.isEnabled()) {
+            redisBridge.publish(new com.cabeye.backend.redis.ClusterMessage(
+                    instanceId, rideId, null, excludeId, event));
+        }
+
+        return delivered;
+    }
+
+    /**
+     * Delivers an event to local sessions connected directly to this JVM.
+     */
+    public int broadcastLocal(String rideId, RideEvent event, String excludeSessionId) {
         Set<WebSocketSession> room = rooms.get(rideId);
         if (room == null || room.isEmpty()) {
-            log.debug("BROADCAST ride={} type={} -> no listeners", rideId, event.type());
+            log.debug("BROADCAST ride={} type={} -> no local listeners", rideId, event.type());
             return 0;
         }
 
@@ -148,36 +176,45 @@ public class RideSessionManager {
 
         int delivered = 0;
         for (WebSocketSession session : room) {
-            if (session.equals(exclude) || !session.isOpen()) {
+            if ((excludeSessionId != null && excludeSessionId.equals(session.getId())) || !session.isOpen()) {
                 continue;
             }
             try {
-                // See the thread-safety note in the class javadoc: one writer per session.
                 synchronized (session) {
                     session.sendMessage(new TextMessage(json));
                 }
                 delivered++;
             } catch (IOException e) {
-                // A broken pipe here means the peer vanished without a close frame. Drop it
-                // rather than letting one dead session abort delivery to everyone else.
                 log.warn("Send failed on ride={} session={}, dropping it", rideId, session.getId(), e);
                 room.remove(session);
             }
         }
 
-        log.debug("BROADCAST ride={} type={} -> {} session(s)", rideId, event.type(), delivered);
+        log.debug("BROADCAST ride={} type={} -> {} local session(s)", rideId, event.type(), delivered);
         return delivered;
     }
 
     /**
      * Sends an event only to the sessions on a ride that connected with the given role.
+     * Propagates to cluster peers via Redis.
      *
-     * <p>Used for the live camera: the rider's frames go to the driver and nowhere else — not
-     * back to the rider, and never into the ride's event log.
-     *
-     * @return number of sessions the event was written to
+     * @return number of sessions the event was written to locally
      */
     public int sendToRole(String rideId, String role, RideEvent event) {
+        int delivered = sendToRoleLocal(rideId, role, event);
+
+        if (redisBridge != null && redisBridge.isEnabled()) {
+            redisBridge.publish(new com.cabeye.backend.redis.ClusterMessage(
+                    instanceId, rideId, role, null, event));
+        }
+
+        return delivered;
+    }
+
+    /**
+     * Delivers an event to matching role sessions connected to this JVM.
+     */
+    public int sendToRoleLocal(String rideId, String role, RideEvent event) {
         Set<WebSocketSession> room = rooms.get(rideId);
         if (room == null || room.isEmpty()) return 0;
         final String json;
@@ -201,6 +238,31 @@ public class RideSessionManager {
             }
         }
         return delivered;
+    }
+
+    /**
+     * Receives an inbound event from Redis Pub/Sub broadcast by a peer cluster instance.
+     */
+    public void receiveClusterMessage(com.cabeye.backend.redis.ClusterMessage msg) {
+        if (msg == null || instanceId.equals(msg.getSenderInstanceId())) {
+            return; // ignore self-published messages
+        }
+        if (msg.getRole() != null) {
+            sendToRoleLocal(msg.getRideId(), msg.getRole(), msg.getEvent());
+        } else {
+            broadcastLocal(msg.getRideId(), msg.getEvent(), msg.getExcludeSessionId());
+        }
+    }
+
+    /**
+     * Stores high-frequency GPS ping in Redis rather than hitting relational DB.
+     */
+    public void recordDriverLocation(String driverId, Map<String, Object> payload) {
+        if (redisBridge != null && redisBridge.isEnabled() && driverId != null && payload != null) {
+            try {
+                redisBridge.recordDriverLocation(driverId, objectMapper.writeValueAsString(payload));
+            } catch (Exception ignored) {}
+        }
     }
 
     /**

@@ -58,9 +58,22 @@ public class RideService {
      * memory and its constructor stays the one the tests already use.
      */
     private final List<Consumer<Ride>> completionListeners = new CopyOnWriteArrayList<>();
+    private final com.cabeye.backend.redis.RedisBridge redisBridge;
+    private final com.cabeye.backend.store.Table<com.cabeye.backend.model.RideRecord> rideTable;
 
     public RideService(RideSessionManager sessions) {
+        this(sessions, null, null);
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public RideService(RideSessionManager sessions,
+                       @org.springframework.beans.factory.annotation.Autowired(required = false)
+                       com.cabeye.backend.store.DataDirectory data,
+                       @org.springframework.beans.factory.annotation.Autowired(required = false)
+                       com.cabeye.backend.redis.RedisBridge redisBridge) {
         this.sessions = sessions;
+        this.redisBridge = redisBridge;
+        this.rideTable = data != null ? data.table("rides", com.cabeye.backend.model.RideRecord.class) : null;
     }
 
     public void onCompleted(Consumer<Ride> listener) {
@@ -108,12 +121,34 @@ public class RideService {
     // ===================================================================================
 
     public Optional<Ride> find(String rideId) {
-        return Optional.ofNullable(rides.get(rideId));
+        if (rideId == null) return Optional.empty();
+        Ride local = rides.get(rideId);
+
+        if (rideTable != null) {
+            Optional<com.cabeye.backend.model.RideRecord> record = rideTable.get(rideId);
+            if (record.isPresent()) {
+                com.cabeye.backend.model.RideRecord r = record.get();
+                if (local == null || r.lastSeq > local.lastSeq()) {
+                    try {
+                        Ride restored = Ride.fromRecord(r);
+                        rides.put(rideId, restored);
+                        return Optional.of(restored);
+                    } catch (RuntimeException e) {
+                        log.warn("Failed to restore ride {} from persistence: {}", rideId, e.getMessage());
+                    }
+                }
+            }
+        }
+        return Optional.ofNullable(local);
     }
 
     /** @return true when this ride genuinely exists — the scope check for the debug endpoint. */
     public boolean exists(String rideId) {
-        return rideId != null && rides.containsKey(rideId);
+        return find(rideId).isPresent();
+    }
+
+    private Ride getRide(String rideId) {
+        return find(rideId).orElse(null);
     }
 
     public Collection<Ride> all() {
@@ -122,6 +157,13 @@ public class RideService {
 
     /** Rides a driver may accept: requested, unassigned, not terminal. */
     public List<Ride> openRequests() {
+        if (rideTable != null) {
+            for (com.cabeye.backend.model.RideRecord r : rideTable.all()) {
+                if ("REQUESTED".equals(r.phase) && r.driverId == null) {
+                    find(r.rideId); // refresh
+                }
+            }
+        }
         List<Ride> out = new ArrayList<>();
         for (Ride ride : rides.values()) {
             if (ride.phase() == RidePhase.REQUESTED && ride.driverId() == null) {
@@ -180,7 +222,8 @@ public class RideService {
                        String contactPhone,
                        String dropNote,
                        String rideType) {
-        String rideId = "ride-" + rideCounter.incrementAndGet();
+        Long clusterSeq = (redisBridge != null && redisBridge.isEnabled()) ? redisBridge.incrementRideCounter() : null;
+        String rideId = "ride-" + (clusterSeq != null ? clusterSeq : rideCounter.incrementAndGet());
         String code = generateBoardingCode();
 
         Ride ride = new Ride(rideId, riderId, destination, destinationAddress,
@@ -230,7 +273,7 @@ public class RideService {
                                               String vehiclePlate,
                                               String driverPhone,
                                               int etaMinutes) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null || ride.phase() != RidePhase.REQUESTED || ride.driverId() != null) {
             return Optional.empty();
         }
@@ -271,7 +314,7 @@ public class RideService {
      * transition the reconnect logic would then have to reconcile against.
      */
     public Optional<Ride> location(String rideId, String driverId, int distanceMeters, float bearingDeg) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null || ride.phase().isTerminal()) {
             return Optional.empty();
         }
@@ -292,7 +335,7 @@ public class RideService {
      * produced at the ear that needs it.
      */
     public Optional<Ride> positionPreset(String rideId, String driverId, String text) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null || ride.phase().isTerminal()) {
             return Optional.empty();
         }
@@ -302,7 +345,7 @@ public class RideService {
 
     /** Audio beacon, panned on the rider's phone to the bearing given here. */
     public Optional<Ride> beacon(String rideId, String driverId, float bearingDeg) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null || ride.phase().isTerminal()) {
             return Optional.empty();
         }
@@ -318,7 +361,7 @@ public class RideService {
      * loss permitted to interrupt.
      */
     public Optional<Ride> arrived(String rideId, String driverId) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null || ride.phase().isTerminal()) {
             return Optional.empty();
         }
@@ -332,7 +375,7 @@ public class RideService {
 
     /** The rider's app verified the code it heard the driver say aloud. */
     public Optional<Ride> confirmCode(String rideId, String riderId, boolean matched) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null || ride.phase().isTerminal()) {
             return Optional.empty();
         }
@@ -349,7 +392,7 @@ public class RideService {
      * see a car start moving, so "the trip started" must never be able to precede "they are in".
      */
     public Optional<Ride> passengerSeated(String rideId, String driverId) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null || ride.phase().isTerminal()) {
             return Optional.empty();
         }
@@ -368,7 +411,7 @@ public class RideService {
 
     /** Starts the journey. Refuses unless the passenger has been confirmed seated. */
     public Optional<Ride> startTrip(String rideId, String driverId, int etaMinutes) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null || ride.phase() != RidePhase.SEATED) {
             log.warn("TRIP_START_REFUSED ride={} phase={} (passenger not confirmed seated)",
                     rideId, ride == null ? "MISSING" : ride.phase());
@@ -385,7 +428,7 @@ public class RideService {
 
     /** Ends the journey. */
     public Optional<Ride> complete(String rideId, String driverId, int fareRupees, int durationMinutes) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null || ride.phase().isTerminal()) {
             return Optional.empty();
         }
@@ -410,7 +453,7 @@ public class RideService {
 
     /** Cancelled by either party. */
     public Optional<Ride> cancel(String rideId, String actorId, String actorRole, String reason) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null || ride.phase().isTerminal()) {
             return Optional.empty();
         }
@@ -424,7 +467,7 @@ public class RideService {
 
     /** Route deviation. Tier 0 on the rider's phone. */
     public Optional<Ride> deviation(String rideId, String note) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null || ride.phase().isTerminal()) {
             return Optional.empty();
         }
@@ -448,7 +491,7 @@ public class RideService {
      * @return how many events were sent
      */
     public int replayTo(String rideId, long afterSeq, org.springframework.web.socket.WebSocketSession session) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null) {
             return 0;
         }
@@ -495,7 +538,7 @@ public class RideService {
      * whereas a false success costs an unpaid fare nobody notices.
      */
     public synchronized Optional<Ride> reportPayment(String rideId, String status, String txnRef) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null) return Optional.empty();
 
         // A settled fare is never downgraded by a late or stale claim from the phone. Without
@@ -539,7 +582,7 @@ public class RideService {
      * @param bankRef the settlement reference; null or blank keeps whatever was recorded
      */
     public synchronized Optional<Ride> confirmPayment(String rideId, String bankRef) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null) return Optional.empty();
         ride.paymentStatus(Ride.PaymentStatus.CONFIRMED);
         if (bankRef != null && !bankRef.isBlank()) ride.paymentRef(bankRef);
@@ -553,7 +596,7 @@ public class RideService {
      * after a successful payment does not un-pay the ride.
      */
     public synchronized Optional<Ride> failPayment(String rideId, String reason) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null) return Optional.empty();
         if (ride.paymentStatus() == Ride.PaymentStatus.CONFIRMED) return Optional.of(ride);
         ride.paymentStatus(Ride.PaymentStatus.FAILED);
@@ -595,7 +638,7 @@ public class RideService {
     private Optional<Ride> transition(String rideId, RidePhase to, RideEventType type,
                                       String actorId, Map<String, Object> payload,
                                       RidePhase... allowedFrom) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null || ride.phase().isTerminal()) {
             return Optional.empty();
         }
