@@ -277,6 +277,8 @@ and the APK were built successfully during setup.
 The backend is the server. It has to be running before the app can talk to it (step 2 and
 onward), and you can test it on its own today.
 
+> **Prefer running with Docker?** See [DOCKER_SETUP.md](file:///home/manoj/Documents/cab-booking/DOCKER_SETUP.md) for single-container and multi-instance Docker Compose cluster instructions (PostgreSQL, Redis, Nginx, ALB).
+
 ### Start it
 
 1. Open **File Explorer**, go to `D:\pw`
