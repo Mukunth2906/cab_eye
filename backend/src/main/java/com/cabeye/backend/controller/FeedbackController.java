@@ -4,6 +4,7 @@ import com.cabeye.backend.account.Account;
 import com.cabeye.backend.auth.CurrentAccount;
 import com.cabeye.backend.feedback.FeedbackRecord;
 import com.cabeye.backend.feedback.FeedbackService;
+import com.cabeye.backend.feedback.RiderFeedbackRecord;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.CrossOrigin;
@@ -18,8 +19,10 @@ import java.util.Map;
 
 /**
  * <pre>
- *   POST /rides/{rideId}/feedback   {"rating":4,"category":"SAFETY","text":"…"}   any part optional
- *   GET  /me/feedback               the signed-in rider's own feedback
+ *   POST /rides/{rideId}/feedback         {"rating":4,"category":"SAFETY","text":"…"}   any part optional
+ *   GET  /me/feedback                     the signed-in rider's own feedback
+ *   POST /rides/{rideId}/rider-feedback   the DRIVER rates the passenger:
+ *                                         {"rating":2,"category":"BEHAVIOUR","text":"…"}  any part optional
  * </pre>
  * Guests may give feedback too — a guest's safety report matters as much as anyone's.
  */
@@ -50,6 +53,35 @@ public class FeedbackController {
         }
         try {
             FeedbackRecord saved = feedback.submit(rideId, riderId, rating,
+                    body.get("category") == null ? null : String.valueOf(body.get("category")),
+                    body.get("text") == null ? null : String.valueOf(body.get("text")));
+            return ResponseEntity.ok(saved);
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        }
+    }
+
+    /**
+     * The driver's feedback about their passenger. Categories: SAFETY, BEHAVIOUR, PICKUP,
+     * PAYMENT, OTHER. A signed-in account that is not the ride's driver is refused.
+     */
+    @PostMapping("/rides/{rideId}/rider-feedback")
+    public ResponseEntity<?> fromDriver(@PathVariable String rideId,
+                                        @RequestBody Map<String, Object> body,
+                                        HttpServletRequest request) {
+        String driverId = CurrentAccount.of(request).map(a -> a.id).orElse(null);
+        Integer rating = null;
+        Object r = body.get("rating");
+        if (r instanceof Number n) rating = n.intValue();
+        else if (r != null && !String.valueOf(r).isBlank()) {
+            try {
+                rating = Integer.parseInt(String.valueOf(r).trim());
+            } catch (NumberFormatException e) {
+                return ResponseEntity.badRequest().body(Map.of("error", "A rating is from one to five."));
+            }
+        }
+        try {
+            RiderFeedbackRecord saved = feedback.submitFromDriver(rideId, driverId, rating,
                     body.get("category") == null ? null : String.valueOf(body.get("category")),
                     body.get("text") == null ? null : String.valueOf(body.get("text")));
             return ResponseEntity.ok(saved);

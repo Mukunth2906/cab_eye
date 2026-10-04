@@ -43,6 +43,18 @@ public class RideRecord {
     public int fareRupees;
     public int durationMinutes;
 
+    // Trip meter. Absent in rides saved before it existed, which then load as zero / blank.
+    public Long tripStartedAt;
+    public int tripDistanceMeters;
+    public String distanceSource;
+    public int liveFareRupees;
+    public int lastProgressMeters;
+    public boolean meterHasAnchor;
+    public double meterAnchorLat;
+    public double meterAnchorLng;
+    public long meterAnchorAt;
+    public double meterMeters;
+
     public String paymentStatus;
     public String paymentRef;
 

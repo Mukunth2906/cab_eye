@@ -125,7 +125,13 @@ sealed interface DriverState {
         val destinationAddress: String = "",
         val contactName: String = "",
         val contactPhone: String = "",
-        val dropNote: String = ""
+        val dropNote: String = "",
+        /** Metres the server has measured so far from this phone's GPS. */
+        val distanceMeters: Int = 0,
+        /** What the trip would cost if it ended now, from the server. 0 before the first 100 m. */
+        val fareSoFarRupees: Int = 0,
+        /** True once a GPS fix has reached the server; false = no GPS yet (or no permission). */
+        val gpsLive: Boolean = false
     ) : DriverState
 
     /** Journey finished. */
@@ -141,7 +147,13 @@ sealed interface DriverState {
          * Sandbox checkout URL for the open payment order, shown as a QR code so a sighted
          * companion can scan it and pay from their own phone. Blank until the order exists.
          */
-        val checkoutUrl: String = ""
+        val checkoutUrl: String = "",
+        /** Metres the trip covered, as the server measured (or estimated) it. */
+        val distanceMeters: Int = 0,
+        /** "GPS" or "ESTIMATE" (straight line — no GPS reached the server); "" = unknown. */
+        val distanceSource: String = "",
+        /** True once the driver's feedback about the passenger has been saved. */
+        val riderFeedbackSent: Boolean = false
     ) : DriverState
 }
 

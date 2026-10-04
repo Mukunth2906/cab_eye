@@ -168,7 +168,9 @@ sealed interface RiderState {
     data class Done(
         val destination: String,
         val fareRupees: Int,
-        val durationMinutes: Int
+        val durationMinutes: Int,
+        /** Metres the trip covered, as the server measured it. 0 = not known. */
+        val distanceMeters: Int = 0
     ) : RiderState
 
     /**

@@ -45,6 +45,9 @@ public class Account {
         public String emergencyContactPhone;
         /** Whether the memory agent may suggest destinations from past trips. */
         public boolean memoryEnabled = true;
+        /** Server-maintained from drivers' ratings of this rider; never settable by the app. */
+        public double ratingAverage;
+        public int ratingCount;
 
         public RiderProfile() {}
     }

@@ -83,7 +83,18 @@ public enum RideEventType {
      * while its payment settles. Payload: {@code status}, {@code paymentRef},
      * {@code fareRupees}, and {@code reason} on failure.
      */
-    PAYMENT_UPDATED;
+    PAYMENT_UPDATED,
+
+    /**
+     * The trip meter moved: distance measured so far from the driver phone's GPS, and the fare
+     * that distance and time would cost if the trip ended now. Payload: {@code distanceMeters},
+     * {@code fareRupees}, {@code minutes}. Published about every 100 m, not on every GPS fix.
+     *
+     * <p>Silent on the rider's phone — "silence means all is fine" — the rider hears these
+     * numbers only when they ask ("status", "how far") and once more at the end. Not a phase
+     * change, so it sits after the lifecycle events like {@link #PAYMENT_UPDATED}.
+     */
+    TRIP_PROGRESS;
 
     /** @return true when {@code name} is a member of this enum, case-sensitively. */
     public static boolean isLifecycleType(String name) {

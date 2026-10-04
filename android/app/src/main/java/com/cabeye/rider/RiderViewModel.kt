@@ -374,6 +374,13 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     /** The ride currently on this device, or null. One socket, one ride. */
     private var activeRideId: String? = null
 
+    /**
+     * The trip meter, from the server's TRIP_PROGRESS events: metres so far and the fare if the
+     * trip ended now. Never spoken on its own — only when the rider asks ("status", "how far").
+     */
+    private var tripMeters = 0
+    private var tripFareSoFar = 0
+
     /** The boarding code the server issued, which the driver will read aloud. */
     private var expectedCode: String = ""
 
@@ -776,6 +783,8 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
 
             RideEventType.TRIP_STARTED -> {
                 stopCamera("TRIP_STARTED")
+                tripMeters = 0
+                tripFareSoFar = 0
                 val destination = event.string("destination", lastBooking?.first ?: "your destination")
                 val eta = event.int("etaMinutes", 12)
                 val driver = currentDriver() ?: driverFrom(event)
@@ -797,10 +806,14 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                 val destination = event.string("destination", lastBooking?.first ?: "your destination")
                 val fare = event.int("fareRupees", 0)
                 val minutes = event.int("durationMinutes", 0)
+                // The server measured (GPS) or estimated (straight line) the distance and priced
+                // the trip from it. Say which, so a rider is never told a guess as a measurement.
+                val metres = event.int("distanceMeters", 0)
+                val distance = spokenDistance(metres, estimate = event.string("distanceSource") == "ESTIMATE")
                 engine.heartbeat(false)
                 lastDriverName = currentDriver()?.name.orEmpty()
-                transition(RiderState.Done(destination, fare, minutes), announce = false)
-                narrate(event, "You've arrived. $fare rupees.")
+                transition(RiderState.Done(destination, fare, minutes, distanceMeters = metres), announce = false)
+                narrate(event, if (distance.isEmpty()) "You've arrived. $fare rupees." else "You've arrived. $distance, $fare rupees.")
                 lastSpokenPhase = RidePhase.COMPLETED
                 endRide("completed")
                 // The server has just recorded this trip as a visit; pull the updated places so
@@ -839,6 +852,13 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             RideEventType.REQUEST_TAKEN,
             RideEventType.PONG,
             RideEventType.ERROR,
+            // The trip meter moved. Silent by design — kept for when the rider asks.
+            RideEventType.TRIP_PROGRESS -> {
+                tripMeters = maxOf(tripMeters, event.int("distanceMeters", 0))
+                val fare = event.int("fareRupees", 0)
+                if (fare > 0) tripFareSoFar = fare
+            }
+
             // The rider learns the payment outcome from the order it is watching.
             RideEventType.PAYMENT_UPDATED,
             RideEventType.UNKNOWN -> Unit
@@ -3910,6 +3930,16 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /** Closes the socket for a finished ride and forgets its state. */
+    /**
+     * "5.6 kilometres" / "about 5.2 kilometres", or "" when nothing was measured. One decimal,
+     * written with a dot so every TTS voice reads it as "five point six".
+     */
+    private fun spokenDistance(metres: Int, estimate: Boolean): String {
+        if (metres <= 0) return ""
+        val km = "%.1f".format(java.util.Locale.ROOT, metres / 1000.0)
+        return (if (estimate) "about " else "") + "$km kilometres"
+    }
+
     private fun endRide(reason: String) {
         stopCamera("RIDE_ENDED")
         socket.unsubscribe(reason)
@@ -4088,7 +4118,13 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             is RiderState.Arrived ->
                 if (codeVerified) "Your driver is here and the code is confirmed."
                 else "Your driver is here, waiting for you to check the code."
-            is RiderState.InTrip -> "On the way to ${ride.destination}."
+            // The meter is only mentioned once the server has measured something; before that,
+            // "zero kilometres" would be a number that means "not known yet".
+            is RiderState.InTrip ->
+                if (tripMeters > 0) {
+                    "On the way to ${ride.destination}. ${spokenDistance(tripMeters, estimate = false)} so far" +
+                        (if (tripFareSoFar > 0) ", about $tripFareSoFar rupees." else ".")
+                } else "On the way to ${ride.destination}."
             is RiderState.Done -> "That ride is finished."
             is RiderState.Feedback -> "I'm asking about your last ride. Say skip to move on."
             is RiderState.NextJourney -> "Say book now, schedule, or done."
@@ -4258,11 +4294,15 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             RidePhase.ARRIVED -> RiderState.Arrived(
                 driver, expectedCode, Headphones.connected(getApplication())
             )
-            RidePhase.SEATED, RidePhase.IN_TRIP -> RiderState.InTrip(
-                snapshot.destination, snapshot.etaMinutes, driver
-            )
+            RidePhase.SEATED, RidePhase.IN_TRIP -> {
+                // Back after a dropped connection: pick the meter up from the server.
+                tripMeters = maxOf(tripMeters, snapshot.tripDistanceMeters)
+                if (snapshot.liveFareRupees > 0) tripFareSoFar = snapshot.liveFareRupees
+                RiderState.InTrip(snapshot.destination, snapshot.etaMinutes, driver)
+            }
             RidePhase.COMPLETED -> RiderState.Done(
-                snapshot.destination, snapshot.fareRupees, snapshot.durationMinutes
+                snapshot.destination, snapshot.fareRupees, snapshot.durationMinutes,
+                distanceMeters = snapshot.tripDistanceMeters
             )
             RidePhase.CANCELLED -> RiderState.Idle
             RidePhase.UNKNOWN -> return

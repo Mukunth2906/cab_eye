@@ -319,10 +319,24 @@ class RideApi(private val settings: AppSettings, private val auth: AuthStore) {
     suspend fun startTrip(rideId: String, etaMinutes: Int): ApiResult<RideSnapshot> =
         postForSnapshot("${base()}/rides/$rideId/start", JSONObject().put("etaMinutes", etaMinutes))
 
-    suspend fun complete(rideId: String, fareRupees: Int, durationMinutes: Int): ApiResult<RideSnapshot> =
+    /**
+     * Ends the trip. The server prices it from the distance it measured and the trip's time,
+     * so the app sends no fare — a fare a phone names could be anything.
+     */
+    suspend fun complete(rideId: String): ApiResult<RideSnapshot> =
+        postForSnapshot("${base()}/rides/$rideId/complete", JSONObject())
+
+    /**
+     * One GPS fix from the driver's phone during the trip. The server adds up the distance
+     * (ignoring jitter and glitches) and answers with the live km and fare.
+     *
+     * @param atMillis when the phone took the fix, so fixes sent together after a signal gap
+     *   are still timed correctly on the server
+     */
+    suspend fun tripLocation(rideId: String, lat: Double, lng: Double, atMillis: Long): ApiResult<RideSnapshot> =
         postForSnapshot(
-            "${base()}/rides/$rideId/complete",
-            JSONObject().put("fareRupees", fareRupees).put("durationMinutes", durationMinutes)
+            "${base()}/rides/$rideId/trip-location",
+            JSONObject().put("lat", lat).put("lng", lng).put("at", atMillis)
         )
 
     // ===================================================================================
@@ -399,6 +413,21 @@ class RideApi(private val settings: AppSettings, private val auth: AuthStore) {
         if (!category.isNullOrBlank()) body.put("category", category)
         if (!text.isNullOrBlank()) body.put("text", text)
         return when (val result = call(post("${base()}/rides/$rideId/feedback", body))) {
+            is ApiResult.Ok -> result
+            is ApiResult.Failed -> result.preferServerSentence()
+        }
+    }
+
+    /**
+     * The DRIVER's feedback about the passenger. Category: SAFETY, BEHAVIOUR, PICKUP, PAYMENT or
+     * OTHER. Any of the three may be null; the server refuses all-null.
+     */
+    suspend fun submitRiderFeedback(rideId: String, rating: Int?, category: String?, text: String?): ApiResult<String> {
+        val body = JSONObject()
+        if (rating != null) body.put("rating", rating)
+        if (!category.isNullOrBlank()) body.put("category", category)
+        if (!text.isNullOrBlank()) body.put("text", text)
+        return when (val result = call(post("${base()}/rides/$rideId/rider-feedback", body))) {
             is ApiResult.Ok -> result
             is ApiResult.Failed -> result.preferServerSentence()
         }

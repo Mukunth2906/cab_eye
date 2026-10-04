@@ -4,6 +4,7 @@ import com.cabeye.backend.account.Account;
 import com.cabeye.backend.account.AccountService;
 import com.cabeye.backend.feedback.FeedbackRecord;
 import com.cabeye.backend.feedback.FeedbackService;
+import com.cabeye.backend.feedback.RiderFeedbackRecord;
 import com.cabeye.backend.model.Ride;
 import com.cabeye.backend.persistence.RidePersistence;
 import com.cabeye.backend.service.RideService;
@@ -56,10 +57,56 @@ public class CaseService {
         }
         if (copied > 0) log.info("ADMIN inbox: copied {} earlier feedback item(s)", copied);
         feedback.onSubmitted(f -> fromFeedback(f, true));
+
+        for (RiderFeedbackRecord f : feedback.driverQueue()) {
+            if (worthACase(f) && cases.get(caseId(f)).isEmpty()) fromDriverReport(f, false);
+        }
+        feedback.onDriverSubmitted(f -> {
+            if (worthACase(f)) fromDriverReport(f, true);
+        });
     }
 
     static String caseId(FeedbackRecord f) {
         return "fb-" + f.rideId;
+    }
+
+    static String caseId(RiderFeedbackRecord f) {
+        return "dr-" + f.rideId;
+    }
+
+    /**
+     * A driver's 4- or 5-star rating alone is not something support needs to read; a low
+     * rating, a written note or a safety concern is.
+     */
+    static boolean worthACase(RiderFeedbackRecord f) {
+        return f.urgent || (f.rating != null && f.rating <= 2) || (f.text != null && !f.text.isBlank());
+    }
+
+    /** Creates or refreshes the case for one ride's driver report about the passenger. */
+    AdminCase fromDriverReport(RiderFeedbackRecord f, boolean alert) {
+        String id = caseId(f);
+        AdminCase existing = cases.get(id).orElse(null);
+        boolean becameUrgent = f.urgent && (existing == null || !existing.urgent);
+        long now = System.currentTimeMillis();
+
+        AdminCase c = existing != null ? existing : new AdminCase();
+        c.id = id;
+        c.kind = AdminCase.Kind.DRIVER_REPORT;
+        c.rideId = f.rideId;
+        c.rating = f.rating;
+        c.category = f.category;
+        c.text = f.text;
+        c.urgent = f.urgent;
+        if (c.createdAt == 0) c.createdAt = f.createdAt == 0 ? now : f.createdAt;
+        c.updatedAt = now;
+        if (existing != null && existing.status == AdminCase.Status.RESOLVED && alert) {
+            c.status = AdminCase.Status.NEW;
+        }
+        fillPeople(c, f.riderId, f.driverId);
+        cases.put(id, c);
+
+        if (alert && becameUrgent) sendAlert(c);
+        return c;
     }
 
     /** Creates or refreshes the case for one ride's feedback. */
@@ -98,6 +145,13 @@ public class CaseService {
             c.driverPhone = blankToNull(ride.driverPhone());
             c.vehicle = ride.vehicleModel();
             c.vehiclePlate = ride.vehiclePlate();
+            // What the trip measured, so a fare or route complaint can be checked against it.
+            if (ride.phase() == com.cabeye.backend.model.RidePhase.COMPLETED) {
+                c.distanceMeters = ride.tripDistanceMeters();
+                c.distanceSource = ride.distanceSource() == null || ride.distanceSource().isEmpty() ? null : ride.distanceSource();
+                c.fareRupees = ride.fareRupees();
+                c.durationMinutes = ride.durationMinutes();
+            }
         }
         c.riderId = riderId;
         c.driverId = driverId;
@@ -165,8 +219,16 @@ public class CaseService {
 
     /** Low ratings and urgent reports against one driver, for the drivers page. */
     public long complaintsAgainst(String driverId) {
+        // A driver's own report about a passenger carries that driver's id too, but it is not
+        // a complaint against them.
         return cases.where(c -> driverId.equals(c.driverId)
+                && c.kind != AdminCase.Kind.DRIVER_REPORT
                 && (c.urgent || (c.rating != null && c.rating <= 2))).size();
+    }
+
+    /** Drivers' reports about this rider that became cases (low rating, note or safety). */
+    public long reportsAbout(String riderId) {
+        return cases.where(c -> riderId.equals(c.riderId) && c.kind == AdminCase.Kind.DRIVER_REPORT).size();
     }
 
     public long openCount() {

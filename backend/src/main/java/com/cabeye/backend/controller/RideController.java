@@ -332,15 +332,61 @@ public class RideController {
                 });
     }
 
-    /** Journey finished. Body: {@code {"fareRupees":148,"durationMinutes":12}} */
+    /**
+     * One GPS fix from the driver's phone during the trip. Body: {@code {"lat":11.02,"lng":76.96}}
+     *
+     * <p>Optional {@code "at"}: when the phone took the fix (epoch ms, from its GPS), so fixes
+     * sent together after a signal gap are still timed correctly.
+     *
+     * <p>The server adds up the distance (ignoring GPS jitter and glitches) and publishes
+     * TRIP_PROGRESS with the km and live fare. 409 when the ride is not in a trip. A signed-in
+     * account that is not this ride's driver is refused, so nobody else can move the meter.
+     */
+    @PostMapping("/{rideId}/trip-location")
+    public ResponseEntity<?> tripLocation(
+            @PathVariable String rideId,
+            @RequestHeader(value = "X-User-Id", required = false, defaultValue = "driver-1") String headerDriverId,
+            @RequestBody(required = false) Map<String, Object> body,
+            HttpServletRequest request) {
+        Map<String, Object> b = body == null ? Map.of() : body;
+        Double lat = decimal(b.get("lat"));
+        Double lng = decimal(b.get("lng"));
+        if (lat == null || lng == null) {
+            return ResponseEntity.badRequest().body(Map.of("error", "A position needs lat and lng."));
+        }
+        Ride ride = rides.find(rideId).orElse(null);
+        if (ride == null) {
+            return ResponseEntity.notFound().build();
+        }
+        Account signedIn = CurrentAccount.of(request).orElse(null);
+        if (signedIn != null && ride.driverId() != null && !ride.driverId().equals(signedIn.id)) {
+            log.warn("TRIP_LOCATION_REFUSED ride={} by={} (not this ride's driver)", rideId, signedIn.id);
+            return ResponseEntity.status(403).body(Map.of("error", "That isn't your ride."));
+        }
+        String driverId = signedIn == null ? headerDriverId : signedIn.id;
+        Object at = b.get("at");
+        Long atMillis = at instanceof Number n ? Long.valueOf(n.longValue()) : null;
+        return rides.tripLocation(rideId, driverId, lat, lng, atMillis)
+                .<ResponseEntity<?>>map(r -> ResponseEntity.ok(r.snapshot()))
+                .orElseGet(() -> ResponseEntity.status(409).body(Map.of("error", "The trip hasn't started.")));
+    }
+
+    /**
+     * Journey finished. The server prices it from the measured distance and time; any
+     * {@code fareRupees} / {@code durationMinutes} in the body (sent by older app builds) is
+     * ignored, because a fare must never be whatever a phone says it is.
+     */
     @PostMapping("/{rideId}/complete")
     public ResponseEntity<Ride.Snapshot> complete(
             @PathVariable String rideId,
-            @RequestHeader(value = "X-User-Id", required = false, defaultValue = "driver-1") String driverId,
-            @RequestBody(required = false) Map<String, Object> body) {
-        Map<String, Object> b = body == null ? Map.of() : body;
-        return respond(rides.complete(rideId, driverId,
-                num(b.get("fareRupees"), 0), num(b.get("durationMinutes"), 0)));
+            @RequestHeader(value = "X-User-Id", required = false, defaultValue = "driver-1") String headerDriverId,
+            @RequestBody(required = false) Map<String, Object> body,
+            HttpServletRequest request) {
+        if (body != null && body.containsKey("fareRupees")) {
+            log.info("COMPLETE ride={} ignoring client fare {} (fare is computed on the server)",
+                    rideId, body.get("fareRupees"));
+        }
+        return respond(rides.completeTrip(rideId, CurrentAccount.idOr(request, headerDriverId)));
     }
 
     /** Cancel, from either side. */

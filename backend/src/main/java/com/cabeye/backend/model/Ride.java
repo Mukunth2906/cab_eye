@@ -1,5 +1,6 @@
 package com.cabeye.backend.model;
 
+import com.cabeye.backend.fare.TripDistanceTracker;
 import com.fasterxml.jackson.annotation.JsonInclude;
 
 import java.time.Instant;
@@ -111,6 +112,20 @@ public class Ride {
     private volatile int fareRupees;
     private volatile int durationMinutes;
 
+    // ---- Trip meter: real distance and a live fare (see RideService.tripLocation) ----------
+    /** When the trip started (epoch ms), or null before it has. Used for the fare's minutes. */
+    private volatile Long tripStartedAt;
+    /** Metres the trip covered. Live during IN_TRIP, final once COMPLETED. */
+    private volatile int tripDistanceMeters;
+    /** Where {@link #tripDistanceMeters} came from: "GPS", "ESTIMATE" (straight line), or "". */
+    private volatile String distanceSource = "";
+    /** The fare the trip would cost if it ended now. Updated with each TRIP_PROGRESS. */
+    private volatile int liveFareRupees;
+    /** Distance at the last TRIP_PROGRESS, so progress is published every ~100 m, not every fix. */
+    private volatile int lastProgressMeters;
+    /** Adds up GPS fixes. Its state is saved with the ride, so a restart mid-trip loses nothing. */
+    private volatile TripDistanceTracker tripMeter = new TripDistanceTracker();
+
     public Ride(String rideId,
                 String riderId,
                 String destination,
@@ -177,6 +192,17 @@ public class Ride {
         r.codeConfirmed = codeConfirmed;
         r.fareRupees = fareRupees;
         r.durationMinutes = durationMinutes;
+        r.tripStartedAt = tripStartedAt;
+        r.tripDistanceMeters = tripDistanceMeters;
+        r.distanceSource = distanceSource;
+        r.liveFareRupees = liveFareRupees;
+        r.lastProgressMeters = lastProgressMeters;
+        TripDistanceTracker.State meter = tripMeter.state();
+        r.meterHasAnchor = meter.hasAnchor();
+        r.meterAnchorLat = meter.anchorLat();
+        r.meterAnchorLng = meter.anchorLng();
+        r.meterAnchorAt = meter.anchorAtMillis();
+        r.meterMeters = meter.meters();
         r.paymentStatus = paymentStatus.name();
         r.paymentRef = paymentRef;
         r.lastSeq = sequence.get();
@@ -205,7 +231,15 @@ public class Ride {
             ride.codeConfirmed = r.codeConfirmed;
             ride.fareRupees = r.fareRupees;
             ride.durationMinutes = r.durationMinutes;
-            ride.paymentStatus = r.paymentStatus == null ? PaymentStatus.NONE : PaymentStatus.valueOf(r.paymentStatus);
+            // Rides saved before the trip meter existed simply have none of these: zero / blank.
+            ride.tripStartedAt = r.tripStartedAt;
+            ride.tripDistanceMeters = r.tripDistanceMeters;
+            ride.distanceSource = r.distanceSource == null ? "" : r.distanceSource;
+            ride.liveFareRupees = r.liveFareRupees;
+            ride.lastProgressMeters = r.lastProgressMeters;
+            ride.tripMeter = TripDistanceTracker.from(new TripDistanceTracker.State(
+                    r.meterHasAnchor, r.meterAnchorLat, r.meterAnchorLng, r.meterAnchorAt, r.meterMeters));
+            ride.paymentStatus =r.paymentStatus == null ? PaymentStatus.NONE : PaymentStatus.valueOf(r.paymentStatus);
             ride.paymentRef = r.paymentRef == null ? "" : r.paymentRef;
             long maxSeq = r.lastSeq;
             if (r.events != null) {
@@ -322,7 +356,11 @@ public class Ride {
             String paymentStatus,
             String paymentRef,
             long lastSeq,
-            Instant createdAt
+            Instant createdAt,
+            // Trip meter. Appended last so every existing reader keeps working unchanged.
+            int tripDistanceMeters,
+            String distanceSource,
+            int liveFareRupees
     ) {}
 
     public synchronized Snapshot snapshot() {
@@ -334,7 +372,8 @@ public class Ride {
                 etaMinutes, distanceMeters, bearingDeg, codeConfirmed,
                 fareRupees, durationMinutes,
                 paymentStatus.name(), paymentRef,
-                sequence.get(), createdAt);
+                sequence.get(), createdAt,
+                tripDistanceMeters, distanceSource.isEmpty() ? null : distanceSource, liveFareRupees);
     }
 
     // -----------------------------------------------------------------------------------
@@ -380,6 +419,50 @@ public class Ride {
     public void fare(int rupees)               { this.fareRupees = rupees; }
     public int fareRupees()                    { return fareRupees; }
     public void durationMinutes(int minutes)   { this.durationMinutes = minutes; }
+
+    // ---- Trip meter ---------------------------------------------------------------------
+
+    /** Starts measuring from zero. Called once, when the trip starts. */
+    public synchronized void startTripMeter(long nowMillis) {
+        this.tripStartedAt = nowMillis;
+        this.tripMeter = new TripDistanceTracker();
+        this.tripDistanceMeters = 0;
+        this.distanceSource = "";
+        this.liveFareRupees = 0;
+        this.lastProgressMeters = 0;
+    }
+
+    /**
+     * Feeds one GPS fix from the driver's phone into the meter.
+     *
+     * @return true when the measured distance grew
+     */
+    public synchronized boolean addTripFix(double lat, double lng, long atMillis) {
+        boolean grew = tripMeter.add(lat, lng, atMillis);
+        if (grew) {
+            this.tripDistanceMeters = tripMeter.meters();
+            this.distanceSource = "GPS";
+        }
+        return grew;
+    }
+
+    /** Metres measured from GPS alone (0 when no usable fixes arrived). */
+    public synchronized int gpsMeters()          { return tripMeter.meters(); }
+    public Long tripStartedAt()                  { return tripStartedAt; }
+    public int tripDistanceMeters()              { return tripDistanceMeters; }
+    public String distanceSource()               { return distanceSource; }
+    public int liveFareRupees()                  { return liveFareRupees; }
+    public int lastProgressMeters()              { return lastProgressMeters; }
+    public void liveFare(int rupees, int atMeters) {
+        this.liveFareRupees = rupees;
+        this.lastProgressMeters = atMeters;
+    }
+
+    /** The final distance, fixed when the trip completes. */
+    public synchronized void tripDistance(int metres, String source) {
+        this.tripDistanceMeters = Math.max(0, metres);
+        this.distanceSource = source == null ? "" : source;
+    }
 
     public void assignDriver(String id, String name, String model, String plate, String phone, int eta) {
         this.driverId = id;
