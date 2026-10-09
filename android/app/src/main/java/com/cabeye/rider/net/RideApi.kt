@@ -510,6 +510,16 @@ class RideApi(private val settings: AppSettings, private val auth: AuthStore) {
         is ApiResult.Failed -> result.preferServerSentence()
     }
 
+    /** "Save this as Monday errands." */
+    suspend fun saveRoute(route: com.cabeye.rider.memory.SavedRoute): ApiResult<String> =
+        when (val r = call(post("${base()}/me/memory/routes", route.toJson()))) {
+            is ApiResult.Ok -> r
+            is ApiResult.Failed -> r.preferServerSentence()
+        }
+
+    suspend fun routeUsed(name: String): ApiResult<String> =
+        call(post("${base()}/me/memory/routes/used?name=" + java.net.URLEncoder.encode(name, "UTF-8"), JSONObject()))
+
     suspend fun forgetMemory(): ApiResult<String> =
         call(Request.Builder().url("${base()}/me/memory").delete().build())
 

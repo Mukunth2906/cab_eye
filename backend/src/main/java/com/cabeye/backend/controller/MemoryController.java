@@ -3,6 +3,9 @@ package com.cabeye.backend.controller;
 import com.cabeye.backend.account.Account;
 import com.cabeye.backend.auth.CurrentAccount;
 import com.cabeye.backend.memory.MemoryService;
+import com.cabeye.backend.memory.SavedRoute;
+import com.cabeye.backend.memory.SimulatedTrip;
+import org.springframework.beans.factory.annotation.Value;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.CrossOrigin;
@@ -34,8 +37,12 @@ public class MemoryController {
 
     private final MemoryService memory;
 
-    public MemoryController(MemoryService memory) {
+    private final boolean simulatorEnabled;
+
+    public MemoryController(MemoryService memory,
+                            @Value("${cabeye.dev.memory-simulator:false}") boolean simulatorEnabled) {
         this.memory = memory;
+        this.simulatorEnabled = simulatorEnabled;
     }
 
     @GetMapping
@@ -46,7 +53,53 @@ public class MemoryController {
         out.put("places", memory.places(a.id));
         out.put("trips", memory.trips(a.id, Math.max(1, Math.min(trips, 300))));
         out.put("stats", memory.stats(a.id));
+        out.put("routes", memory.savedRoutes(a.id));
         return ResponseEntity.ok(out);
+    }
+
+    /** "Save this as Monday errands." Body: a {@link SavedRoute} (name, stops, destination, rideType). */
+    @PostMapping("/routes")
+    public ResponseEntity<?> saveRoute(HttpServletRequest request, @RequestBody SavedRoute body) {
+        Account a = CurrentAccount.of(request).orElseThrow();
+        try {
+            return ResponseEntity.ok(memory.saveRoute(a.id, body));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        }
+    }
+
+    /** The rider booked a saved route by name. */
+    @PostMapping("/routes/used")
+    public ResponseEntity<Map<String, Object>> routeUsed(HttpServletRequest request, @RequestParam("name") String name) {
+        Account a = CurrentAccount.of(request).orElseThrow();
+        return ResponseEntity.ok(Map.of("found", memory.routeUsed(a.id, name).isPresent()));
+    }
+
+    @DeleteMapping("/routes")
+    public ResponseEntity<Map<String, Object>> forgetRoute(HttpServletRequest request, @RequestParam("name") String name) {
+        Account a = CurrentAccount.of(request).orElseThrow();
+        return ResponseEntity.ok(Map.of("forgotten", memory.forgetRoute(a.id, name)));
+    }
+
+    /**
+     * Dev only — "be the user": feeds a described ride history into this rider's memory, so
+     * the phone's suggestions can be demonstrated without weeks of real rides. Off unless
+     * {@code cabeye.dev.memory-simulator=true}; answers 404 otherwise, like any unknown path.
+     * Body: {@code {"trips":[{"at":…,"destination":{…},"stops":[{…,"kind":"WAIT"}]}]}}.
+     */
+    @PostMapping("/simulate")
+    public ResponseEntity<?> simulate(HttpServletRequest request, @RequestBody SimulateRequest body) {
+        if (!simulatorEnabled) return ResponseEntity.notFound().build();
+        Account a = CurrentAccount.of(request).orElseThrow();
+        try {
+            return ResponseEntity.ok(Map.of("recorded", memory.simulate(a.id, body == null ? null : body.trips)));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        }
+    }
+
+    public static class SimulateRequest {
+        public java.util.List<SimulatedTrip> trips;
     }
 
     @PostMapping("/outcome")

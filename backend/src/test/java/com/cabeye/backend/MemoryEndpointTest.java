@@ -132,4 +132,13 @@ class MemoryEndpointTest {
         JsonNode memory = body(mvc.perform(get("/me/memory").header("Authorization", "Bearer " + rider)));
         assertEquals(0, memory.get("places").size());
     }
+
+    @Test
+    @DisplayName("the history simulator is off unless a developer turns it on")
+    void simulatorOffByDefault() throws Exception {
+        String rider = "Bearer " + signIn("RIDER");
+        mvc.perform(post("/me/memory/simulate").header("Authorization", rider).contentType("application/json")
+                        .content("{\"trips\":[{\"at\":1,\"destination\":{\"name\":\"Home\"}}]}"))
+                .andExpect(status().isNotFound());
+    }
 }

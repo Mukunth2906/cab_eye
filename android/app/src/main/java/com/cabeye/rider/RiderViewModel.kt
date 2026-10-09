@@ -64,6 +64,9 @@ import com.cabeye.rider.memory.SuggestionKind
 import com.cabeye.rider.memory.VisitedPlace
 import java.time.ZoneId
 import kotlinx.coroutines.Dispatchers
+import com.cabeye.rider.memory.RouteLeg
+import com.cabeye.rider.memory.RoutineAgent
+import com.cabeye.rider.memory.SavedRoute
 import com.cabeye.rider.net.StopInfo
 import com.cabeye.rider.net.stopsJson
 import com.cabeye.rider.trip.PlannedLeg
@@ -1978,6 +1981,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             engine.stopSpeaking()
             if (stt?.isListening == true) stt?.cancel()
             when {
+                pendingRoutine != null -> openMic(MicPurpose.MEMORY_ANSWER)
                 planStage == PlanStage.REVIEW -> openMic(MicPurpose.PLAN_REVIEW)
                 planStage == PlanStage.KINDS -> openMic(MicPurpose.STOP_KIND)
                 planStage == PlanStage.COLLECTING -> openMic(MicPurpose.PLAN_LEG)
@@ -2080,6 +2084,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     fun onCancel() {
         resetPlan()
         bookingPlan = null
+        pendingRoutine = null
         pendingTripAction = null
         addingStopMidTrip = null
         cancelWindowJob?.cancel()
@@ -2240,6 +2245,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                 Log.i(TAG, "SILENCE timeoutMs=${RecoveryLadder.SILENCE_TIMEOUT_MS} action=REST")
                 silenceRepromptUsed = false
                 resetPlan()
+                pendingRoutine = null
                 transition(RiderState.Idle, announce = false)
                 speak(RecoveryLadder.SILENCE_REST, NarrationTier.QUEUED)
             }
@@ -3023,6 +3029,8 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             planBack()
             return
         }
+        pendingRoutine?.let { rejectedRoutines += it.signature }
+        pendingRoutine = null
 
         pendingOptions = null
         pendingNearMiss = null
@@ -3113,9 +3121,16 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             val moment = memoryMoment()
             val suggestion = PreferenceMemoryAgent.proactive(
                 app.memory.current, moment, memoryThresholds(), rejectedMemoryKeys
-) ?: return@launch
+            )
+            val routine = RoutineAgent.proactive(app.memory.current, moment, memoryThresholds(), rejectedRoutines)
             // Re-check: the rider may have started talking while the location was fetched.
             if (uiState.ride !is RiderState.Idle || uiState.micOpen || activeRideId != null) return@launch
+            if (RoutineAgent.preferRoutine(routine, suggestion)) {
+                lastProactiveAt = System.currentTimeMillis()
+                askRoutine(routine!!, moment)
+                return@launch
+            }
+            if (suggestion == null) return@launch
 
             lastProactiveAt = System.currentTimeMillis()
             Log.i(TAG, "MEMORY proactive trigger=$trigger place=\"${suggestion.place.name}\" " +
@@ -3142,6 +3157,22 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun resolveMemoryAnswer(classification: Classification, raw: String) {
+        val routine = pendingRoutine
+        if (routine != null) {
+            when (classification.intent) {
+                is RiderIntent.Yes -> acceptRoutine()
+                is RiderIntent.No -> rejectRoutine()
+                else -> {
+                    // Another place entirely: an implicit no to the route, and a new request.
+                    pendingRoutine = null
+                    rejectedRoutines += routine.signature
+                    proactiveDeclines++
+                    app.memory.reportOutcome(routine.destinationKey, SuggestionKind.PROACTIVE, accepted = false, heard = "")
+                    if (!handlePlanEntry(raw)) resolveSlotAnswer(classification, raw)
+                }
+            }
+            return
+        }
         when (classification.intent) {
             is RiderIntent.Yes -> acceptMemory()
             is RiderIntent.No -> rejectMemory()
@@ -3285,6 +3316,8 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     private var collectingDestination = false
     /** The confirmed plan, between "yes" and the server accepting it. */
     private var bookingPlan: TripPlan? = null
+    /** Set when the plan came from a saved route, so its use is counted. */
+    private var planFromRoute: SavedRoute? = null
 
     /** The ride's stops as the server last reported them. */
     private var activeStops: List<StopInfo> = emptyList()
@@ -3293,6 +3326,9 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     private var pendingTripAction: TripAction? = null
     /** Mid-ride "add a stop": the place is found, its kind is being asked. */
     private var addingStopMidTrip: PlannedLeg? = null
+
+    private var pendingRoutine: RoutineAgent.Routine? = null
+    private val rejectedRoutines = mutableSetOf<String>()
 
     private fun planPurpose(p: MicPurpose) =
         p == MicPurpose.PLAN_LEG || p == MicPurpose.STOP_KIND || p == MicPurpose.PLAN_REVIEW
@@ -3335,6 +3371,9 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     private fun handlePlanEntry(text: String): Boolean {
         if (micPurpose != MicPurpose.BOOKING && micPurpose != MicPurpose.SLOT_ANSWER) return false
         if (activeRideId != null || planStage != null || uiState.ride is RiderState.Confirming) return false
+        if (app.memory.enabled) {
+            RoutineAgent.named(text, app.memory.current.routes)?.let { startPlanFromRoute(it); return true }
+        }
         if (StopPlanParser.tooManyStops(text)) {
             engine.earcon(Earcon.NOT_UNDERSTOOD)
             speak("A ride can have up to ${TripPlan.MAX_STOPS} stops before the destination. " +
@@ -3404,7 +3443,9 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     // ---- Resolving each place, then the kinds, then the read-back ------------------------
 
     private fun startPlan(p: TripPlan, rideType: RideType, intro: String? = null) {
+        val keepRoute = planFromRoute
         resetPlan()
+        planFromRoute = keepRoute
         plan = p
         planRideType = rideType
         planStage = PlanStage.RESOLVING
@@ -3484,7 +3525,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         planMisses = 0
         val hint = if (!planHintsGiven) {
             planHintsGiven = true
-            " Say yes to book it. Or change it: remove stop two, swap one and two, or add a stop."
+            " Say yes to book it. Or change it: remove stop two, swap one and two, add a stop, or save it with a name."
         } else " Shall I book it?"
         showPlan("Book this trip?")
         speak("$lead${p.readBack()}$hint", NarrationTier.QUEUED) { openMic(MicPurpose.PLAN_REVIEW) }
@@ -3524,8 +3565,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             }
             is StopPlanParser.PlanEdit.Add -> applyEdit(p.add(edit.leg, edit.afterStop?.let { resolveN(it, p) }))
             is StopPlanParser.PlanEdit.ChangeDestination -> applyEdit(TripPlan.Edit.Ok(p.copy(destination = edit.leg), ""))
-            is StopPlanParser.PlanEdit.SaveAs ->
-                speak("I can't save routes yet. Shall I book it?", NarrationTier.QUEUED) { openMic(MicPurpose.PLAN_REVIEW) }
+            is StopPlanParser.PlanEdit.SaveAs -> saveRouteFromPlan(edit.name)
             StopPlanParser.PlanEdit.ReadAgain -> reviewPlan()
         }
     }
@@ -3553,8 +3593,10 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         val dest = p.destination.place ?: run { resolveNextLeg(); return }
         if (!p.isComplete) { resolveNextLeg(); return }
         val type = planRideType
+        val route = planFromRoute
         bookingPlan = p
         resetPlan()
+        route?.let { app.memory.routeUsed(it.name) }
         pendingSpokenAs = p.destination.spoken
         Log.i(TAG, "PLAN book stops=${p.stops.size} destination=\"${dest.name}\"")
         beginOptimisticBooking(dest, type)
@@ -3588,6 +3630,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         planMisses = 0
         collectedLegs.clear()
         collectingDestination = false
+        planFromRoute = null
     }
 
     private fun showPlan(prompt: String) {
@@ -3599,6 +3642,93 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             else -> collectedLegs.mapIndexed { i, s -> "${i + 1}. ${s.name}" }
         }
         transition(RiderState.Planning(lines, prompt), announce = false)
+    }
+
+    // ---- Saved routes and learned routines ----------------------------------------------
+
+    private fun startPlanFromRoute(route: SavedRoute) {
+        fun leg(r: RouteLeg) = PlannedLeg(
+            query = r.name, spoken = r.name,
+            kind = r.kind.takeIf { it.isNotBlank() }?.let { StopKind.parse(it) },
+            note = r.note,
+            place = if (r.latitude != null && r.longitude != null)
+                PlaceOption(r.name, r.latitude, r.longitude, 1f, coversWholeToken = true,
+                    formattedAddress = r.address, placeId = r.placeId) else null
+        )
+        val p = TripPlan(route.stops.map(::leg), leg(route.destination).copy(kind = null))
+        planFromRoute = route
+        Log.i(TAG, "MEMORY named route \"${route.name}\"")
+        startPlan(p, runCatching { RideType.valueOf(route.rideType) }.getOrDefault(preferredRideType()), intro = "${route.name}.")
+    }
+
+    private fun saveRouteFromPlan(name: String) {
+        val p = plan ?: return
+        if (!app.memory.enabled) {
+            speak("I can only save routes when you're signed in. Shall I book it?", NarrationTier.QUEUED) { openMic(MicPurpose.PLAN_REVIEW) }
+            return
+        }
+        if (!p.isComplete) {
+            speak("Let's finish the plan first.", NarrationTier.QUEUED) { resolveNextLeg() }
+            return
+        }
+        fun leg(l: PlannedLeg, kind: StopKind?) = RouteLeg(
+            name = l.name, address = l.place?.formattedAddress.orEmpty(),
+            latitude = l.place?.latitude, longitude = l.place?.longitude, placeId = l.place?.placeId.orEmpty(),
+            kind = kind?.name.orEmpty(), note = l.note
+        )
+        val route = SavedRoute(
+            name = name, key = TripPlan.norm(name),
+            stops = p.stops.map { leg(it, it.kind) }, destination = leg(p.destination, null),
+            rideType = planRideType.name
+        )
+        app.memory.saveRoute(route) { refused ->
+            onMain {
+                speak(refused ?: "Saved as $name. Next time just say book $name. Shall I book it now?", NarrationTier.QUEUED) {
+                    openMic(MicPurpose.PLAN_REVIEW)
+                }
+            }
+        }
+    }
+
+    /** "It's 8 40 AM. Your usual route, like most Monday mornings: the pharmacy, then college." */
+    private fun askRoutine(r: RoutineAgent.Routine, moment: PreferenceMemoryAgent.Moment) {
+        pendingRoutine = r
+        pendingMemory = null
+        engine.earcon(Earcon.UNDERSTOOD)
+        Log.i(TAG, "MEMORY routine \"${r.spokenRoute()}\" support=${r.support} confidence=${r.confidence}")
+        transition(RiderState.Planning(r.stops.mapIndexed { i, s -> "${i + 1}. ${s.name}" } + "Then ${r.destinationName}",
+            "Your usual route?"), announce = false)
+        speak(
+            "It's ${PreferenceMemoryAgent.spokenTime(moment)}. Your usual route, ${r.reason}: ${r.spokenRoute()}. " +
+                "Shall I plan it? Say yes, or tell me another place.",
+            NarrationTier.QUEUED
+        ) { openMic(MicPurpose.MEMORY_ANSWER) }
+    }
+
+    private fun acceptRoutine() {
+        val r = pendingRoutine ?: return
+        pendingRoutine = null
+        app.memory.reportOutcome(r.destinationKey, SuggestionKind.PROACTIVE, accepted = true, heard = "")
+        val places = app.memory.current.places
+        fun leg(key: String, name: String, kind: StopKind?) = PlannedLeg(
+            query = name, spoken = name, kind = kind,
+            place = places.firstOrNull { it.placeKey == key }?.toOption()
+        )
+        val p = TripPlan(
+            stops = r.stops.map { leg(it.placeKey, it.name, StopKind.parse(it.kind)) },
+            destination = leg(r.destinationKey, r.destinationName, null)
+        )
+        startPlan(p, heldRideType ?: preferredRideType(), intro = "Okay.")
+    }
+
+    private fun rejectRoutine() {
+        val r = pendingRoutine ?: return
+        pendingRoutine = null
+        rejectedRoutines += r.signature
+        proactiveDeclines++
+        app.memory.reportOutcome(r.destinationKey, SuggestionKind.PROACTIVE, accepted = false, heard = "")
+        engine.earcon(Earcon.NOT_UNDERSTOOD)
+        askDestinationAgain("Okay. Where would you like to go?")
     }
 
     // ---- During the ride ----------------------------------------------------------------
@@ -4244,8 +4374,12 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                     listenForStopCode("Welcome back. Ask the driver to say the code.")
                 }
             }
-            "plan-yes" -> if (planStage == PlanStage.REVIEW) bookPlan()
+            "plan-yes" -> when {
+                pendingRoutine != null -> acceptRoutine()
+                planStage == PlanStage.REVIEW -> bookPlan()
+            }
             "plan-no" -> when {
+                pendingRoutine != null -> rejectRoutine()
                 planStage == PlanStage.REVIEW -> {
                     showPlan("What would you like to change?")
                     speak("What would you like to change? Say remove, swap, add a stop, or cancel.", NarrationTier.QUEUED) {
@@ -4895,6 +5029,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         if (consecutiveSpeechErrors > MAX_CONSECUTIVE_ERRORS) {
             consecutiveSpeechErrors = 0
             resetPlan()
+            pendingRoutine = null
             pendingOptions = null
             pendingNearMiss = null
             engine.earcon(Earcon.ERROR)
@@ -4968,6 +5103,13 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             MicPurpose.TRIP_COMMAND, MicPurpose.STOP_CONFIRM -> return
 
             MicPurpose.MEMORY_ANSWER -> {
+                val routine = pendingRoutine
+                if (routine != null) {
+                    speak("Sorry. ${routine.spokenRoute()}? Yes or no.", NarrationTier.QUEUED) {
+                        openMic(MicPurpose.MEMORY_ANSWER)
+                    }
+                    return
+                }
                 val pending = pendingMemory
                 if (pending != null) {
                     speak("Sorry. ${pending.place.name}? Yes or no.", NarrationTier.QUEUED) {

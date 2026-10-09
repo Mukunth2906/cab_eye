@@ -2,6 +2,7 @@ package com.cabeye.backend.memory;
 
 import com.cabeye.backend.account.AccountService;
 import com.cabeye.backend.model.Ride;
+import com.cabeye.backend.model.RideStop;
 import com.cabeye.backend.service.RideService;
 import com.cabeye.backend.store.DataDirectory;
 import com.cabeye.backend.store.Table;
@@ -41,10 +42,12 @@ public class MemoryService {
     static final int MAX_TRIPS_PER_RIDER = 300;
     /** Spoken aliases kept per place. */
     static final int MAX_ALIASES = 8;
+    static final int MAX_SAVED_ROUTES = 10;
 
     private final Table<VisitedPlace> places;
     private final Table<TripRecord> trips;
     private final Table<MemoryStats> stats;
+    private final Table<SavedRoute> routes;
     private final AccountService accounts;
     private final ZoneId zone;
 
@@ -55,6 +58,7 @@ public class MemoryService {
         this.places = data.table("visited_places", VisitedPlace.class);
         this.trips = data.table("trips", TripRecord.class);
         this.stats = data.table("memory_stats", MemoryStats.class);
+        this.routes = data.table("saved_routes", SavedRoute.class);
         this.accounts = accounts;
         this.zone = ZoneId.of(zone);
         rides.onCompleted(this::recordCompleted);
@@ -87,33 +91,184 @@ public class MemoryService {
         t.dayOfWeek = booked.getDayOfWeek().getValue();
         t.fareRupees = ride.fareRupees();
         t.durationMinutes = ride.durationMinutes();
+
+        // Multi-stop: every stop the rider actually reached is a place they went to, at the
+        // time they reached it. Skipped stops were never visited and are not remembered.
+        List<TripRecord.TripStop> visited = new ArrayList<>();
+        for (RideStop stop : ride.copyStops()) {
+            if (stop.status != RideStop.Status.DONE || stop.name == null || stop.name.isBlank()) continue;
+            String stopKey = placeKey(stop.placeId, stop.name);
+            visited.add(new TripRecord.TripStop(stopKey, stop.name, stop.kind.name()));
+            ZonedDateTime at = stop.arrivedAt > 0
+                    ? ZonedDateTime.ofInstant(Instant.ofEpochMilli(stop.arrivedAt), zone) : booked;
+            recordVisit(ride.riderId(), stopKey, stop.name, stop.address, stop.latitude, stop.longitude,
+                    stop.placeId, stop.spokenAs, at);
+        }
+        if (!visited.isEmpty()) t.stops = visited;
         trips.put(t.rideId, t);
         trimTrips(ride.riderId());
 
-        String rowKey = rowKey(ride.riderId(), key);
+        VisitedPlace p = recordVisit(ride.riderId(), key, ride.destination(), ride.destinationAddress(),
+                ride.destinationLatitude(), ride.destinationLongitude(), ride.destinationPlaceId(),
+                ride.spokenAs(), booked);
+        log.info("MEMORY visit rider={} place=\"{}\" visits={} hour={} spokenAs=\"{}\" stops={}",
+                ride.riderId(), p.name, p.visitCount, t.hour, t.spokenAs, visited.size());
+    }
+
+    /** Oldest history the simulator accepts — older trips would only age out of the scores anyway. */
+    static final long SIMULATE_MAX_AGE_MS = 120L * 24 * 3600 * 1000;
+    static final int SIMULATE_MAX_TRIPS = MAX_TRIPS_PER_RIDER;
+
+    /**
+     * Dev only — "be the user": folds a described history into the rider's memory exactly as
+     * completed rides would be (same trip record, same visits, same aliases), with the
+     * timestamps the demo needs. Real rides cannot be backdated, and a habit is only visible
+     * across weeks, so this is the honest way to show the memory agent working today.
+     *
+     * @return trips recorded
+     * @throws IllegalArgumentException with a sentence, when the history is unusable
+     */
+    public int simulate(String riderId, List<SimulatedTrip> history) {
+        if (history == null || history.isEmpty()) throw new IllegalArgumentException("No trips to simulate.");
+        if (history.size() > SIMULATE_MAX_TRIPS) {
+            throw new IllegalArgumentException("At most " + SIMULATE_MAX_TRIPS + " trips at a time.");
+        }
+        long now = System.currentTimeMillis();
+        for (SimulatedTrip t : history) {
+            if (t == null || t.destination == null || t.destination.name == null || t.destination.name.isBlank()) {
+                throw new IllegalArgumentException("Every trip needs a destination name.");
+            }
+            if (t.at <= 0 || t.at > now || now - t.at > SIMULATE_MAX_AGE_MS) {
+                throw new IllegalArgumentException("Trip times must be in the last 120 days.");
+            }
+            if (t.stops != null && t.stops.size() > 3) {
+                throw new IllegalArgumentException("A ride can have up to 3 stops before the destination.");
+            }
+        }
+        int n = 0;
+        List<SimulatedTrip> ordered = new ArrayList<>(history);
+        ordered.sort(Comparator.comparingLong(t -> t.at));
+        for (SimulatedTrip s : ordered) {
+            ZonedDateTime booked = ZonedDateTime.ofInstant(Instant.ofEpochMilli(s.at), zone);
+            SimulatedTrip.Place d = s.destination;
+            String key = placeKey(d.placeId, d.name);
+
+            TripRecord t = new TripRecord();
+            t.rideId = "sim-" + Long.toString(s.at, 36) + "-" + n;
+            t.riderId = riderId;
+            t.placeKey = key;
+            t.destination = d.name;
+            t.spokenAs = d.spokenAs;
+            t.pickupLatitude = s.pickupLatitude;
+            t.pickupLongitude = s.pickupLongitude;
+            t.rideType = s.rideType == null ? "AUTO" : s.rideType;
+            t.bookedAt = s.at;
+            t.hour = booked.getHour();
+            t.dayOfWeek = booked.getDayOfWeek().getValue();
+
+            List<TripRecord.TripStop> visited = new ArrayList<>();
+            if (s.stops != null) {
+                for (SimulatedTrip.Place stop : s.stops) {
+                    if (stop == null || stop.name == null || stop.name.isBlank()) continue;
+                    String stopKey = placeKey(stop.placeId, stop.name);
+                    visited.add(new TripRecord.TripStop(stopKey, stop.name, RideStop.Kind.parse(stop.kind).name()));
+                    recordVisit(riderId, stopKey, stop.name, stop.address, stop.latitude, stop.longitude,
+                            stop.placeId, stop.spokenAs, booked);
+                }
+            }
+            if (!visited.isEmpty()) t.stops = visited;
+            trips.put(t.rideId, t);
+            recordVisit(riderId, key, d.name, d.address, d.latitude, d.longitude, d.placeId, d.spokenAs, booked);
+            n++;
+        }
+        trimTrips(riderId);
+        log.info("MEMORY simulated rider={} trips={}", riderId, n);
+        return n;
+    }
+
+    /** One visit to one place: count, hour, weekday/weekend, and the rider's words as an alias. */
+    private VisitedPlace recordVisit(String riderId, String key, String name, String address,
+                                     Double latitude, Double longitude, String placeId,
+                                     String spokenAs, ZonedDateTime when) {
+        String rowKey = rowKey(riderId, key);
+        long at = when.toInstant().toEpochMilli();
         VisitedPlace p = places.get(rowKey).orElseGet(() -> {
             VisitedPlace fresh = new VisitedPlace();
-            fresh.riderId = ride.riderId();
+            fresh.riderId = riderId;
             fresh.placeKey = key;
-            fresh.firstVisitedAt = t.bookedAt;
+            fresh.firstVisitedAt = at;
             return fresh;
         });
-        p.name = ride.destination();
-        if (ride.destinationAddress() != null && !ride.destinationAddress().isBlank()) p.address = ride.destinationAddress();
-        if (ride.destinationLatitude() != null) p.latitude = ride.destinationLatitude();
-        if (ride.destinationLongitude() != null) p.longitude = ride.destinationLongitude();
-        if (ride.destinationPlaceId() != null && !ride.destinationPlaceId().isBlank()) p.placeId = ride.destinationPlaceId();
+        p.name = name;
+        if (address != null && !address.isBlank()) p.address = address;
+        if (latitude != null) p.latitude = latitude;
+        if (longitude != null) p.longitude = longitude;
+        if (placeId != null && !placeId.isBlank()) p.placeId = placeId;
         p.visitCount++;
-        p.lastVisitedAt = t.bookedAt;
+        p.lastVisitedAt = at;
         if (p.hourCounts == null || p.hourCounts.length != 24) p.hourCounts = new int[24];
-        p.hourCounts[t.hour]++;
-        boolean weekend = booked.getDayOfWeek() == DayOfWeek.SATURDAY || booked.getDayOfWeek() == DayOfWeek.SUNDAY;
+        p.hourCounts[when.getHour()]++;
+        boolean weekend = when.getDayOfWeek() == DayOfWeek.SATURDAY || when.getDayOfWeek() == DayOfWeek.SUNDAY;
         if (weekend) p.weekendVisits++; else p.weekdayVisits++;
-        addAlias(p, ride.spokenAs());
+        addAlias(p, spokenAs);
         places.put(rowKey, p);
+        return p;
+    }
 
-        log.info("MEMORY visit rider={} place=\"{}\" visits={} hour={} spokenAs=\"{}\"",
-                ride.riderId(), p.name, p.visitCount, t.hour, t.spokenAs);
+    // ===================================================================================
+    //  Saved routes — "save this as Monday errands" / "book Monday errands"
+    // ===================================================================================
+
+    /**
+     * Saves (or replaces) a named route.
+     *
+     * @throws IllegalArgumentException with a speakable sentence when refused
+     */
+    public SavedRoute saveRoute(String riderId, SavedRoute in) {
+        String name = in.name == null ? "" : in.name.trim();
+        String key = normalise(name);
+        if (key.isEmpty() || key.length() > 40) throw new IllegalArgumentException("Give the route a short name.");
+        if (in.destination == null || in.destination.name == null || in.destination.name.isBlank()) {
+            throw new IllegalArgumentException("A saved route needs a destination.");
+        }
+        if (in.stops != null && in.stops.size() > 3) throw new IllegalArgumentException("A route can have up to 3 stops.");
+        String rowKey = rowKey(riderId, key);
+        boolean exists = routes.get(rowKey).isPresent();
+        if (!exists && savedRoutes(riderId).size() >= MAX_SAVED_ROUTES) {
+            throw new IllegalArgumentException("You already have " + MAX_SAVED_ROUTES + " saved routes. Forget one first.");
+        }
+        long now = System.currentTimeMillis();
+        SavedRoute r = routes.get(rowKey).orElseGet(SavedRoute::new);
+        r.riderId = riderId;
+        r.name = name;
+        r.key = key;
+        r.stops = in.stops == null ? new ArrayList<>() : new ArrayList<>(in.stops);
+        r.destination = in.destination;
+        r.rideType = in.rideType == null || in.rideType.isBlank() ? "AUTO" : in.rideType;
+        if (r.createdAt == 0) r.createdAt = now;
+        routes.put(rowKey, r);
+        log.info("MEMORY route saved rider={} name=\"{}\" stops={}", riderId, name, r.stops.size());
+        return r;
+    }
+
+    /** The rider booked a saved route: counted, so "my routes" can list the used ones first. */
+    public Optional<SavedRoute> routeUsed(String riderId, String name) {
+        return routes.update(rowKey(riderId, normalise(name)), r -> {
+            r.useCount++;
+            r.lastUsedAt = System.currentTimeMillis();
+            return r;
+        });
+    }
+
+    public boolean forgetRoute(String riderId, String name) {
+        return routes.remove(rowKey(riderId, normalise(name)));
+    }
+
+    public List<SavedRoute> savedRoutes(String riderId) {
+        List<SavedRoute> out = routes.where(r -> riderId.equals(r.riderId));
+        out.sort(Comparator.comparingInt((SavedRoute r) -> r.useCount).reversed()
+                .thenComparing(Comparator.comparingLong((SavedRoute r) -> r.createdAt).reversed()));
+        return out;
     }
 
     /**
@@ -155,6 +310,7 @@ public class MemoryService {
     public int forgetAll(String riderId) {
         int removed = places.removeWhere(p -> riderId.equals(p.riderId));
         removed += trips.removeWhere(t -> riderId.equals(t.riderId));
+        removed += routes.removeWhere(r -> riderId.equals(r.riderId));
         stats.remove(riderId);
         log.info("MEMORY forget-all rider={} rows={}", riderId, removed);
         return removed;

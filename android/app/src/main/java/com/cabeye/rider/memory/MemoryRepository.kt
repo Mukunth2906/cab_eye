@@ -83,6 +83,31 @@ class MemoryRepository(context: Context, private val api: RideApi, private val s
     }
 
     /** "Forget my history". Clears the phone at once and the server behind it. */
+    /**
+     * Saves a named route ("Monday errands"). Kept locally at once, so "book Monday errands"
+     * works on the very next request; the server copy follows.
+     *
+     * @param onDone null on success, or the sentence to say when the server refused
+     */
+    fun saveRoute(route: SavedRoute, onDone: (String?) -> Unit) {
+        if (accountId == null) { onDone("I can only save routes when you're signed in."); return }
+        current = current.copy(routes = current.routes.filterNot { it.key == route.key } + route)
+        scope.launch {
+            when (val r = api.saveRoute(route)) {
+                is ApiResult.Ok -> onDone(null)
+                is ApiResult.Failed -> {
+                    current = current.copy(routes = current.routes.filterNot { it.key == route.key })
+                    onDone(r.spoken)
+                }
+            }
+        }
+    }
+
+    fun routeUsed(name: String) {
+        if (accountId == null) return
+        scope.launch { api.routeUsed(name) }
+    }
+
     fun forgetAll(onDone: (Boolean) -> Unit) {
         val id = accountId ?: run { onDone(false); return }
         current = RiderMemory.EMPTY

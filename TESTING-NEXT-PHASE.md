@@ -9,9 +9,9 @@ and the next journey (book now / schedule / done).
 
 ```powershell
 cd backend
-.\gradlew.bat test          # AuthEndpointTest, MemoryEndpointTest, FeedbackEndpointTest, MultiStopEndpointTest + existing
+.\gradlew.bat test          # AuthEndpointTest, MemoryEndpointTest, FeedbackEndpointTest, MultiStopEndpointTest, MultiStopMemoryTest + existing
 cd ..\android
-.\gradlew.bat testDebugUnitTest   # AuthLogicTest, DialogueFlowTest, MemoryAgentTest, PostRideTest, TripPlanTest + existing
+.\gradlew.bat testDebugUnitTest   # AuthLogicTest, DialogueFlowTest, MemoryAgentTest, PostRideTest, TripPlanTest, RoutineAgentTest + existing
 .\gradlew.bat assembleDebug
 ```
 
@@ -119,8 +119,10 @@ Two phones (rider + driver), both signed in. Every booking still goes through th
 | "I have a few stops" | "Where is your first stop?" → place → "Next stop? Or say that's all." → "that's all" → "And where do you finish?" |
 | Four stops in one breath | "A ride can have up to 3 stops before the destination…" |
 | At the read-back: "remove stop two" / "swap one and two" / "add a stop at the ATM after stop one" / "change stop one to MedPlus" / "make stop two a wait" / "change the destination to home" / "read it again" | Each edit is said back, then the new read-back |
+| "save this as Monday errands" | "Saved as Monday errands. Next time just say book Monday errands…" |
 | "yes" | "Booking auto to PSG College, with 2 stops: Apollo Pharmacy, then Gandhipuram. Say cancel to stop." |
 | "go back" during the cancel window | Back to the read-back, not to the start |
+| Later: "book Monday errands" | The saved route, read back for a yes |
 | Kind question unclear twice | "I'll ask the driver to wait for you there." (never the unsafe guess) |
 
 **During the ride**
@@ -139,3 +141,27 @@ Two phones (rider + driver), both signed in. Every booking still goes through th
 | "what are my stops" | Remaining stops read out |
 | "add a stop at the ATM" → kind → "yes" | Added (max 3 counting finished ones); driver banner "Passenger changed the stops" |
 | "cancel" while adding a stop mid-ride | "Okay, no change." — the ride is never cancelled from here |
+
+## 7. Memory agent with routes — "be the user"
+
+Habits need weeks of rides, so seed them (LOCAL backend only):
+
+```powershell
+$env:CABEYE_OTP_EXPOSE="true"; $env:CABEYE_MEMORY_SIMULATOR="true"
+cd backend; .\gradlew bootRun          # leave running; open a new terminal at the repo root for the next line
+python scripts\seed_history.py --phone <your rider number> --demo-now --live-ride
+```
+
+Then reopen the rider app (signed in with that number), stay idle at home:
+
+| When | Expected |
+|---|---|
+| Now (with `--demo-now`) | "It's … Your usual route, like most <today> <part of day>: Apollo Pharmacy, then PSG College of Technology. Shall I plan it?" → "yes" → kinds already known → read-back → yes → cancel window |
+| Turn it down | Not offered again this session; "Where would you like to go?" |
+| Monday ~8:40 | The pharmacy-then-college route |
+| Tue–Fri ~8:40 | Just "Going to PSG College of Technology, like most weekday mornings?" — the Monday route is NOT offered |
+| Wednesday ~18:00 from college | "…like most Wednesday evenings: Race Course, then Home" |
+| "take me to the medical shop" | Books Apollo Pharmacy (learned alias), with the cancel window |
+| "my places" / "forget my history" | Lists / clears places, trips and saved routes |
+
+The simulator answers 404 unless `CABEYE_MEMORY_SIMULATOR=true`; it is pinned off in `application-prod.properties`.
