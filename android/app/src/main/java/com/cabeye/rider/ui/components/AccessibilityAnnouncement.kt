@@ -62,6 +62,10 @@ fun announcementFor(uiState: RiderUiState): String {
             }
         }
 
+        is RiderState.Walking ->
+            (if (ride.recording) "Recording your walk. " else "Guiding your walk. ") + ride.prompt +
+                ". Press anywhere to speak."
+
         is RiderState.Planning ->
             "Planning your stops. ${ride.lines.joinToString(". ")}. ${ride.prompt}"
 
@@ -207,6 +211,17 @@ fun buildCustomActions(
                 actions += CustomAccessibilityAction("Schedule it") { onPostRideAction("confirm"); true }
             }
             actions += CustomAccessibilityAction("Done") { onPostRideAction("done"); true }
+        }
+        is RiderState.Walking -> {
+            if (ride.recording) {
+                actions += CustomAccessibilityAction("Mark a landmark") { onPostRideAction("walk-mark"); true }
+                actions += CustomAccessibilityAction("Turning left") { onPostRideAction("walk-left"); true }
+                actions += CustomAccessibilityAction("Turning right") { onPostRideAction("walk-right"); true }
+            } else {
+                actions += CustomAccessibilityAction("Next part") { onPostRideAction("walk-next"); true }
+                actions += CustomAccessibilityAction("Repeat") { onPostRideAction("walk-repeat"); true }
+            }
+            actions += CustomAccessibilityAction("I'm there") { onPostRideAction("walk-done"); true }
         }
         is RiderState.Planning -> {
             actions += CustomAccessibilityAction("Book this trip") { onPostRideAction("plan-yes"); true }

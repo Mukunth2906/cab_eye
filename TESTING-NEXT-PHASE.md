@@ -11,7 +11,7 @@ and the next journey (book now / schedule / done).
 cd backend
 .\gradlew.bat test          # AuthEndpointTest, MemoryEndpointTest, FeedbackEndpointTest, MultiStopEndpointTest, MultiStopMemoryTest + existing
 cd ..\android
-.\gradlew.bat testDebugUnitTest   # AuthLogicTest, DialogueFlowTest, MemoryAgentTest, PostRideTest, TripPlanTest, RoutineAgentTest + existing
+.\gradlew.bat testDebugUnitTest   # AuthLogicTest, DialogueFlowTest, MemoryAgentTest, PostRideTest, TripPlanTest, RoutineAgentTest, WalkRouteTest + existing
 .\gradlew.bat assembleDebug
 ```
 
@@ -165,3 +165,22 @@ Then reopen the rider app (signed in with that number), stay idle at home:
 | "my places" / "forget my history" | Lists / clears places, trips and saved routes |
 
 The simulator answers 404 unless `CABEYE_MEMORY_SIMULATOR=true`; it is pinned off in `application-prod.properties`.
+
+## 8. Walking routes — from the cab to the door (on-phone only)
+
+Outdoors first (GPS + steps), then try a corridor indoors (steps + compass only). Keep location permission on.
+
+| Do / say | Expected |
+|---|---|
+| "record my walk to the clinic door" (first time) | Consent question: steps, direction and position kept on this phone only → "yes" → "Recording. Walk as you normally would…"; notification "Recording your walk" |
+| Walk; press and say "kerb here", "bakery smell on my left", "turning left" | "Noted: the kerb." / "Noted: the bakery smell on your left." / "Turn left." |
+| Press and say "the big yellow sign" | Refused: "I'll only keep things you can feel, hear or smell…" |
+| "I'm there" | Saved, with the cue line read back ("Right at the kerb, left …, then the glass door") |
+| "how do I get to the clinic" | Whole route in O&M style, distances in metres and your steps, ends with "I can't tell whether the way is clear." — never books a cab |
+| "guide me to the clinic" | Part 1 read; press + "next" at each turn; "repeat", "more detail", "less detail", "previous", "I'm there", "stop" |
+| Walk the route 3 times, then ask again | Shorter (BRIEF); from the 6th walk just the landmarks; asking "repeat" / "more detail" holds it back |
+| Walk it with a deliberate detour (take a longer way) | "This walk was different from the route I saved. Part 1 was about 45 metres this time; I had about 20. Shall I update the saved route?" |
+| After a walk where a landmark is 2+ weeks old | "Was the bakery smell still there?" → "no" twice removes it; "the bakery smell is the cue for the left turn" moves it |
+| Book a cab to the place the walk was recorded from, finish the ride | "I have your walk from here to the clinic door. Say guide me when you're ready." |
+| In the cab, press and say "tell me the walk" | Preview of the walk, no guidance until you're out |
+| "my walking routes" / "forget the route to the clinic" / "export my walking log" | List / delete / share sheet with a CSV |

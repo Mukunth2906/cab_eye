@@ -25,6 +25,12 @@
     <!-- Bearing-panned earcons need the magnetometer; driver proximity needs location. -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- Walking-route recording: a location foreground service (steps + compass only, as
+         dataSync, when location is not granted) and a wake lock so the sensors keep reporting
+         with the screen off. Both are normal permissions: no prompt. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!-- "call driver" global voice command. -->
     <uses-permission android:name="android.permission.CALL_PHONE" />
@@ -117,6 +123,11 @@
             android:name=".service.NarrationService"
             android:exported="false"
             android:foregroundServiceType="mediaPlayback" />
+
+        <service
+            android:name=".walk.WalkRecordingService"
+            android:exported="false"
+            android:foregroundServiceType="location|dataSync" />
 
     </application>
 

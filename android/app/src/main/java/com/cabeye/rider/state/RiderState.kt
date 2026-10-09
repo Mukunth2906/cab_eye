@@ -180,6 +180,17 @@ sealed interface RiderState {
         val prompt: String
     ) : RiderState
 
+    /**
+     * Recording or being guided along a walking route (drop-off to door). [lines] are the
+     * route's parts, the current one marked, so a sighted helper can follow along.
+     */
+    data class Walking(
+        val prompt: String,
+        val lines: List<String>,
+        val recording: Boolean,
+        val guiding: Boolean
+    ) : RiderState
+
     /** Ride complete. */
     data class Done(
         val destination: String,

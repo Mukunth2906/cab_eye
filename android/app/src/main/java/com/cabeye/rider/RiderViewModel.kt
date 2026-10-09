@@ -73,6 +73,20 @@ import com.cabeye.rider.trip.PlannedLeg
 import com.cabeye.rider.trip.StopKind
 import com.cabeye.rider.trip.StopPlanParser
 import com.cabeye.rider.trip.TripPlan
+import com.cabeye.rider.walk.DetailLevel
+import com.cabeye.rider.walk.Landmark
+import com.cabeye.rider.walk.RouteBuilder
+import com.cabeye.rider.walk.RouteMemory
+import com.cabeye.rider.walk.Side
+import com.cabeye.rider.walk.TurnDirection
+import com.cabeye.rider.walk.WalkCommands
+import com.cabeye.rider.walk.WalkEvent
+import com.cabeye.rider.walk.WalkLogEntry
+import com.cabeye.rider.walk.WalkNarrator
+import com.cabeye.rider.walk.WalkRecorder
+import com.cabeye.rider.walk.WalkRecordingService
+import com.cabeye.rider.walk.WalkRoute
+import com.cabeye.rider.walk.WalkStore
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -174,7 +188,13 @@ private enum class MicPurpose {
     TRIP_COMMAND,
 
     /** During a ride: yes or no to a stop change just read back. */
-    STOP_CONFIRM
+    STOP_CONFIRM,
+
+    /**
+     * The walking-route agent: consent, a landmark while recording, a route's name, "next" while
+     * being guided, or "was it still there?". What it means depends on the walk's mode.
+     */
+    WALK
 }
 
 /**
@@ -832,6 +852,14 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                 transition(RiderState.Done(destination, fare, minutes), announce = false)
                 narrate(event, "You've arrived. $fare rupees.")
                 lastSpokenPhase = RidePhase.COMPLETED
+                lastRidePlace = lastBookingPlace
+                lastRideEndedAt = System.currentTimeMillis()
+                // A saved walk from this drop-off: say so once, without getting in the way of paying.
+                lastRidePlace?.let { place ->
+                    RouteMemory.forPlace(walkStore.routes(), RouteMemory.placeKey(place.placeId, place.name))?.let { walk ->
+                        speak("I have your walk from here to ${walk.name}. Say guide me when you're ready.", NarrationTier.QUEUED)
+                    }
+                }
                 endRide("completed")
                 // The server has just recorded this trip as a visit; pull the updated places so
                 // the very next booking can already use them.
@@ -1976,6 +2004,14 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
+        // Walking: a press is "let me tell you something" — a landmark, next, I'm there.
+        if (uiState.ride is RiderState.Walking || walkMode != WalkMode.NONE) {
+            engine.stopSpeaking()
+            if (stt?.isListening == true) stt?.cancel()
+            openMic(MicPurpose.WALK)
+            return
+        }
+
         // Planning a route: a press answers the question on screen.
         if (uiState.ride is RiderState.Planning) {
             engine.stopSpeaking()
@@ -2082,6 +2118,11 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun onCancel() {
+        if (walkMode == WalkMode.RECORDING || guideRecording) {
+            WalkRecordingService.stop(getApplication())
+            WalkRecorder.finish()
+        }
+        resetWalk()
         resetPlan()
         bookingPlan = null
         pendingRoutine = null
@@ -2165,7 +2206,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         if (purpose != MicPurpose.CANCEL_WINDOW && purpose != MicPurpose.CODE_VERIFY &&
             purpose != MicPurpose.FEEDBACK && purpose != MicPurpose.NEXT_JOURNEY &&
             purpose != MicPurpose.CAMERA && purpose != MicPurpose.TRIP_COMMAND &&
-            purpose != MicPurpose.STOP_CONFIRM && !planPurpose(purpose)
+            purpose != MicPurpose.STOP_CONFIRM && purpose != MicPurpose.WALK && !planPurpose(purpose)
         ) {
             transition(
                 RiderState.Listening(isFollowUp = purpose != MicPurpose.BOOKING),
@@ -2219,6 +2260,10 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             if (purpose == MicPurpose.NEXT_JOURNEY) {
                 Log.i(TAG, "SILENCE on next journey — finishing")
                 endPostRide("I'll wait. Hold anywhere when you need a ride.")
+                return@launch
+            }
+            if (purpose == MicPurpose.WALK) {
+                onWalkNoAnswer()
                 return@launch
             }
             // Mid-ride stop words: silence changes nothing, and the ride screen stays.
@@ -2342,6 +2387,12 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             micPurpose == MicPurpose.PLAN_REVIEW ->
                 alternatives.firstOrNull { StopPlanParser.planEdit(it) != null }
 
+            micPurpose == MicPurpose.WALK && walkMode == WalkMode.RECORDING ->
+                alternatives.firstOrNull { WalkCommands.record(it) != null }
+
+            micPurpose == MicPurpose.WALK && walkMode == WalkMode.GUIDING ->
+                alternatives.firstOrNull { WalkCommands.guide(it) != null }
+
             micPurpose == MicPurpose.FEEDBACK -> when ((uiState.ride as? RiderState.Feedback)?.step) {
                 FeedbackStep.RATING -> alternatives.firstOrNull { FeedbackParser.intentOf(it) != FeedbackParser.Intent.NONE }
                 FeedbackStep.RATING_CHECK -> alternatives.firstOrNull { yesNo(it) || FeedbackParser.rating(it) != null }
@@ -2405,6 +2456,9 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             if (!handlePaymentSpeech(text)) speak("Say pay to confirm, or decline.", NarrationTier.QUEUED)
             return
         }
+
+        // Walking routes: "how do I get to the clinic", "record my walk", answers while walking.
+        if (handleWalkSpeech(text)) return
 
         val rideActive = uiState.ride !is RiderState.Idle
         val classification = Classifier.classify(text, rideActive)
@@ -2501,7 +2555,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             MicPurpose.CODE_VERIFY -> return // handled above
             MicPurpose.CAMERA -> return // handled above
             MicPurpose.PLAN_LEG, MicPurpose.STOP_KIND, MicPurpose.PLAN_REVIEW,
-            MicPurpose.TRIP_COMMAND, MicPurpose.STOP_CONFIRM -> return // handled above
+            MicPurpose.TRIP_COMMAND, MicPurpose.STOP_CONFIRM, MicPurpose.WALK -> return // handled above
             MicPurpose.BOOKING -> Unit
         }
 
@@ -3810,7 +3864,8 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             }
             StopPlanParser.TripCommand.ReadStops -> speak(remainingStopsLine(), NarrationTier.QUEUED)
             is StopPlanParser.TripCommand.AddStop -> addStopMidTrip(cmd.leg)
-            null -> speakStatus()
+            // In the car: "tell me the walk" previews the walk from the drop-off.
+            null -> if (!handleWalkCommand(text)) speakStatus()
         }
     }
 
@@ -3900,6 +3955,547 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         val all = candidates.ifEmpty { Gazetteer.score(leg.query) }
         return (MatchGate.evaluate(leg.spoken, all) as? MatchGate.Decision.Proceed)?.top
     }
+
+    // =================================================================================
+    //  Walking routes — "the last hundred metres"
+    //
+    //  The cab gets the rider to the kerb; this gets them from the kerb to the door.
+    //
+    //   "record my walk to the clinic door" ─▶ consent (once) ─▶ steps, compass and GPS
+    //       recorded on this phone; the rider presses and says what they notice ("kerb here",
+    //       "bakery smell on my left", "turning left") ─▶ "I'm there" ─▶ O&M-style stretches,
+    //       read back and saved under a name
+    //   "how do I get to the clinic" ─▶ the whole route, at the detail familiarity allows
+    //   "guide me to the clinic"     ─▶ one part at a time: next / repeat / more or less detail
+    //       / I'm there; the walk is re-recorded silently, so a changed route is noticed and
+    //       the rider is asked about a landmark that may be gone ("was the bakery smell still
+    //       there?")
+    //   In the cab: "tell me the walk" previews it before getting out. After the ride the app
+    //   says when it has a walk from this drop-off.
+    //
+    //  Everything stays on the phone (WalkStore). It never says the way is clear.
+    // =================================================================================
+
+    private enum class WalkMode { NONE, CONSENT, RECORDING, NAMING, UPDATE_CONFIRM, GUIDING, VERIFY }
+
+    private val walkStore by lazy { WalkStore(getApplication()) }
+    private var walkMode = WalkMode.NONE
+    private var walkName = ""
+    /** The cab destination a new walk is linked to (recorded soon after a ride there). */
+    private var walkPlace: Pair<String, String>? = null
+    private var walkBuilt: RouteBuilder.Built? = null
+    private var walkOld: WalkRoute? = null
+    private var guideRoute: WalkRoute? = null
+    private var guidePart = 0
+    private var guideHelp = 0
+    private var guideRecording = false
+    private var verifyRoute: WalkRoute? = null
+    private var verifyLandmark: Landmark? = null
+    private var lastRideEndedAt = 0L
+    private var lastRidePlace: PlaceOption? = null
+
+    private fun walkLog(routeId: String, event: String, detail: String = "") =
+        walkStore.log(WalkLogEntry(System.currentTimeMillis(), routeId, event, detail))
+
+    /**
+     * Walking-route words. @return true when handled. Called before the cab classifier, so
+     * "how do I get to the clinic" is never booked as a ride.
+     */
+    private fun handleWalkSpeech(text: String): Boolean {
+        if (micPurpose == MicPurpose.WALK) {
+            handleWalkAnswer(text)
+            return true
+        }
+        // "Guide me" answers the after-ride question too: the walk to the door comes first.
+        if (micPurpose == MicPurpose.NEXT_JOURNEY && WalkCommands.parse(text) != null) {
+            endPostRide(null)
+            return handleWalkCommand(text)
+        }
+        if (micPurpose != MicPurpose.BOOKING && micPurpose != MicPurpose.SLOT_ANSWER) return false
+        if (uiState.ride is RiderState.Confirming || planStage != null) return false
+        return handleWalkCommand(text)
+    }
+
+    private fun handleWalkCommand(text: String): Boolean {
+        val cmd = WalkCommands.parse(text) ?: return false
+        val inCar = activeRideId != null
+        engine.earcon(Earcon.UNDERSTOOD)
+        when (cmd) {
+            is WalkCommands.Command.Record -> when {
+                inCar -> speak("I'll record your walk once you're out of the car. Say record my walk then.", NarrationTier.QUEUED)
+                !walkStore.profile().consentGiven -> {
+                    walkMode = WalkMode.CONSENT
+                    walkName = cmd.name
+                    speak(
+                        "I'll record this walk's steps, direction and position on this phone only, to build a route " +
+                            "you can ask for later. Nothing leaves the phone. Shall I start?",
+                        NarrationTier.QUEUED
+                    ) { openMic(MicPurpose.WALK) }
+                }
+                else -> startWalkRecording(cmd.name)
+            }
+            is WalkCommands.Command.Recall -> recallWalk(cmd.name, cmd.guided)
+            WalkCommands.Command.List -> {
+                val names = walkStore.routes().map { it.name }
+                speak(
+                    when (names.size) {
+                        0 -> "You haven't saved a walking route yet. When you're at the start, say record my walk."
+                        1 -> "You have one walking route: ${names[0]}."
+                        else -> "You have ${names.size} walking routes: ${names.joinToString(", ")}."
+                    },
+                    NarrationTier.QUEUED
+                )
+            }
+            is WalkCommands.Command.Forget -> {
+                val r = RouteMemory.find(walkStore.routes(), cmd.name)
+                if (r == null) speak("I don't have a walking route called ${cmd.name}.", NarrationTier.QUEUED)
+                else {
+                    walkStore.delete(r.id)
+                    walkLog(r.id, "FORGET")
+                    speak("Done. I've forgotten the route to ${r.name}.", NarrationTier.QUEUED)
+                }
+            }
+            WalkCommands.Command.ForgetAll -> {
+                walkStore.clear()
+                speak("Done. I've forgotten all your walking routes.", NarrationTier.QUEUED)
+            }
+            WalkCommands.Command.Export -> exportWalkLog()
+        }
+        return true
+    }
+
+    // ---- recording ----------------------------------------------------------------------
+
+    private fun startWalkRecording(name: String) {
+        val now = System.currentTimeMillis()
+        walkName = name
+        // Recorded within half an hour of a ride: this is the walk from that drop-off.
+        walkPlace = lastRidePlace?.takeIf { now - lastRideEndedAt < 30 * 60_000L }
+            ?.let { RouteMemory.placeKey(it.placeId, it.name) to it.name }
+        WalkRecorder.begin(now)
+        val started = WalkRecordingService.start(getApplication())
+        if (!started) {
+            WalkRecorder.finish()
+            speak("I couldn't start recording on this phone.", NarrationTier.QUEUED)
+            return
+        }
+        walkMode = WalkMode.RECORDING
+        walkLog("", "RECORD_START", name)
+        showWalk(recording = true, prompt = "Recording your walk")
+        speak(
+            "Recording. Walk as you normally would. Press the screen and tell me what you notice: a kerb, a smell, " +
+                "a sound, a door — or say turning left. Say I'm there at the end.",
+            NarrationTier.QUEUED
+        )
+    }
+
+    private fun finishWalkRecording() {
+        WalkRecordingService.stop(getApplication())
+        val events = WalkRecorder.finish()
+        val now = System.currentTimeMillis()
+        val built = RouteBuilder.build(events, now, idPrefix = "lm${now.toString(36)}")
+        if (built.segments.isEmpty() || built.segments.sumOf { it.metres } < 3.0) {
+            resetWalk()
+            transition(RiderState.Idle, announce = false)
+            speak("I didn't get enough of the walk to save it. Keep the phone with you and try again.", NarrationTier.QUEUED)
+            return
+        }
+        walkBuilt = built
+        val routes = walkStore.routes()
+        val existing = (if (walkName.isNotBlank()) RouteMemory.find(routes, walkName) else null)
+            ?: walkPlace?.let { RouteMemory.forPlace(routes, it.first) }
+        if (existing != null) {
+            compareWithStored(existing, built, help = 0)
+            return
+        }
+        if (walkName.isBlank()) {
+            walkMode = WalkMode.NAMING
+            val draft = draftRoute("this route", built, now)
+            speak("${WalkNarrator.narrate(draft, DetailLevel.BRIEF, now)} What should I call this route?", NarrationTier.QUEUED) {
+                openMic(MicPurpose.WALK)
+            }
+        } else {
+            saveNewWalk(walkName)
+        }
+    }
+
+    private fun draftRoute(name: String, built: RouteBuilder.Built, now: Long) = WalkRoute(
+        id = "walk-${now.toString(36)}",
+        name = name,
+        placeKey = walkPlace?.first.orEmpty(),
+        placeName = walkPlace?.second.orEmpty(),
+        start = if (walkPlace != null) "where the cab stops" else "where you started",
+        segments = built.segments,
+        createdAt = now,
+        updatedAt = now,
+        lastWalkedAt = now,
+        walks = 1,
+        indoor = built.indoor
+    )
+
+    private fun saveNewWalk(name: String) {
+        val built = walkBuilt ?: return
+        val now = System.currentTimeMillis()
+        val route = draftRoute(name, built, now)
+        walkStore.save(route)
+        walkLog(route.id, "RECORD_SAVED", "segments=${route.segments.size} metres=${route.totalMetres.toInt()} indoor=${route.indoor}")
+        resetWalk()
+        transition(RiderState.Idle, announce = false)
+        engine.earcon(Earcon.BOOKING_CONFIRMED)
+        speak(
+            "Saved as $name. ${WalkNarrator.cueLine(route).replaceFirstChar { it.uppercase() }}. " +
+                "Ask me how do I get to $name, or say guide me to $name, whenever you need it.",
+            NarrationTier.QUEUED
+        )
+    }
+
+    /** A walk along a stored route just ended (recorded or guided): same, or changed? */
+    private fun compareWithStored(stored: WalkRoute, built: RouteBuilder.Built, help: Int) {
+        val now = System.currentTimeMillis()
+        when (val c = RouteMemory.compare(stored, built.segments)) {
+            RouteMemory.Comparison.Same -> {
+                var r = RouteMemory.rewalked(stored, built.segments, now)
+                if (help > 0) r = r.copy(helpRequests = minOf(stored.helpRequests + help, 3))
+                walkStore.save(r)
+                walkLog(r.id, "WALK_DONE", "help=$help same=true")
+                resetWalk()
+                afterWalk(r, "That matched your route to ${r.name}.")
+            }
+            is RouteMemory.Comparison.Changed -> {
+                walkOld = RouteMemory.walked(stored, help, now)
+                walkBuilt = built
+                walkMode = WalkMode.UPDATE_CONFIRM
+                walkLog(stored.id, "CHANGE_DETECTED", c.sentence)
+                speak("This walk was different from the route I saved. ${c.sentence} Shall I update the saved route?",
+                    NarrationTier.QUEUED) { openMic(MicPurpose.WALK) }
+            }
+        }
+    }
+
+    /** After a walk: one landmark worth checking, else done. */
+    private fun afterWalk(route: WalkRoute, lead: String) {
+        val now = System.currentTimeMillis()
+        val ask = RouteMemory.toVerify(route, now)
+        transition(RiderState.Idle, announce = false)
+        if (ask == null) {
+            speak(lead, NarrationTier.QUEUED)
+            return
+        }
+        walkMode = WalkMode.VERIFY
+        verifyRoute = route
+        verifyLandmark = ask
+        speak("$lead One question: was ${WalkNarrator.phrase(ask)} still there? Say yes, no, or tell me what's there now.",
+            NarrationTier.QUEUED) { openMic(MicPurpose.WALK) }
+    }
+
+    // ---- recall and guidance ------------------------------------------------------------
+
+    private fun walkForContext(): WalkRoute? {
+        val routes = walkStore.routes()
+        val place = (if (activeRideId != null) lastBookingPlace else lastRidePlace)
+        return place?.let { RouteMemory.forPlace(routes, RouteMemory.placeKey(it.placeId, it.name)) }
+            ?: routes.singleOrNull()
+    }
+
+    private fun recallWalk(name: String, guided: Boolean) {
+        val routes = walkStore.routes()
+        val route = if (name.isBlank()) walkForContext() else RouteMemory.find(routes, name)
+        if (route == null) {
+            speak(
+                when {
+                    routes.isEmpty() -> "You haven't saved a walking route yet. When you're at the start, say record my walk."
+                    name.isBlank() -> "Which route? You have ${routes.joinToString(", ") { it.name }}."
+                    else -> "I don't have a walking route to $name. When you're there, say record my walk to $name."
+                },
+                NarrationTier.QUEUED
+            )
+            return
+        }
+        val now = System.currentTimeMillis()
+        val level = WalkNarrator.levelFor(route, walkStore.profile())
+        if (!guided || activeRideId != null) {
+            walkLog(route.id, if (activeRideId != null) "PREVIEW" else "RECALL", "level=$level")
+            val tail = when {
+                activeRideId != null -> " Say guide me after you get out, and I'll take you one part at a time."
+                else -> " Say guide me to go one part at a time."
+            }
+            speak(WalkNarrator.narrate(route, level, now) + tail, NarrationTier.QUEUED)
+            return
+        }
+        // Guided: one part at a time, re-recording silently when the rider has agreed to recording.
+        guideRoute = route
+        guidePart = 0
+        guideHelp = 0
+        guideRecording = walkStore.profile().consentGiven && WalkRecordingService.start(getApplication())
+        if (guideRecording) WalkRecorder.begin(now)
+        walkMode = WalkMode.GUIDING
+        walkLog(route.id, "GUIDE_START", "level=$level recording=$guideRecording")
+        showWalk(recording = false, prompt = "Part 1 of ${route.segments.size}")
+        speak(
+            "Guiding you to ${route.name}, ${route.segments.size} ${if (route.segments.size == 1) "part" else "parts"}. " +
+                "Press the screen and say next at each turn, repeat, more detail, or I'm there. " +
+                WalkNarrator.segment(route, 0, level, now),
+            NarrationTier.QUEUED
+        )
+    }
+
+    private fun speakGuidePart(lead: String = "") {
+        val route = guideRoute ?: return
+        val now = System.currentTimeMillis()
+        val level = WalkNarrator.levelFor(route.copy(helpRequests = route.helpRequests + guideHelp), walkStore.profile())
+        showWalk(recording = false, prompt = "Part ${guidePart + 1} of ${route.segments.size}")
+        speak(lead + WalkNarrator.segment(route, guidePart, level, now), NarrationTier.QUEUED)
+    }
+
+    private fun finishGuide(stopped: Boolean) {
+        val route = guideRoute ?: return
+        val events = if (guideRecording) { WalkRecordingService.stop(getApplication()); WalkRecorder.finish() } else emptyList()
+        val now = System.currentTimeMillis()
+        if (stopped) {
+            walkLog(route.id, "GUIDE_STOPPED", "part=${guidePart + 1} help=$guideHelp")
+            resetWalk()
+            transition(RiderState.Idle, announce = false)
+            speak("Okay, I've stopped guiding.", NarrationTier.QUEUED)
+            return
+        }
+        val built = if (events.isNotEmpty()) RouteBuilder.build(events, now, idPrefix = "lm${now.toString(36)}") else null
+        val help = guideHelp
+        resetWalk()
+        if (built != null && built.segments.isNotEmpty() && built.segments.sumOf { it.metres } >= 3.0) {
+            compareWithStored(route, built, help)
+        } else {
+            val r = RouteMemory.walked(route, help, now)
+            walkStore.save(r)
+            walkLog(r.id, "WALK_DONE", "help=$help recorded=false")
+            afterWalk(r, "You're at ${route.name}.")
+        }
+    }
+
+    // ---- answers ------------------------------------------------------------------------
+
+    private fun handleWalkAnswer(text: String) {
+        val yesNo = Classifier.classify(text, false).intent
+        val shortCancel = com.cabeye.rider.intent.IntentParser.CANCEL.containsMatchIn(text) &&
+            text.trim().split(Regex("\\s+")).size <= 3
+        when (walkMode) {
+            WalkMode.CONSENT -> when {
+                yesNo is RiderIntent.Yes -> {
+                    walkStore.saveProfile(walkStore.profile().copy(consentGiven = true))
+                    walkLog("", "CONSENT", "yes")
+                    startWalkRecording(walkName)
+                }
+                else -> { resetWalk(); speak("Okay, I won't record.", NarrationTier.QUEUED) }
+            }
+            WalkMode.RECORDING -> when (val input = WalkCommands.record(text)) {
+                WalkCommands.RecordInput.Finish -> finishWalkRecording()
+                WalkCommands.RecordInput.Cancel -> {
+                    WalkRecordingService.stop(getApplication()); WalkRecorder.finish()
+                    resetWalk(); transition(RiderState.Idle, announce = false)
+                    speak("Okay, I've discarded that walk.", NarrationTier.QUEUED)
+                }
+                is WalkCommands.RecordInput.Turn -> {
+                    WalkRecorder.add(WalkEvent.Turn(System.currentTimeMillis(), input.direction))
+                    speak("${input.direction.spoken.replaceFirstChar { it.uppercase() }}.", NarrationTier.QUEUED)
+                }
+                is WalkCommands.RecordInput.Mark -> {
+                    WalkRecorder.add(WalkEvent.Mark(System.currentTimeMillis(), input.spoken))
+                    val r = input.result
+                    speak("Noted: the ${r.text}${if (r.side != Side.NONE) " ${r.side.spoken}" else ""}.", NarrationTier.QUEUED)
+                }
+                is WalkCommands.RecordInput.Visual -> {
+                    walkLog("", "VISUAL_REFUSED", input.text)
+                    speak("I'll only keep things you can feel, hear or smell — a sign or a colour won't help when you " +
+                        "walk it. What can you feel, hear or smell here?", NarrationTier.QUEUED) { openMic(MicPurpose.WALK) }
+                }
+                null -> speak("Tell me what you notice — a kerb, a smell, a sound — or say turning left, or I'm there.",
+                    NarrationTier.QUEUED)
+            }
+            WalkMode.NAMING -> {
+                val name = text.lowercase()
+                    .replace(Regex("^(?:call it|name it|save it as|it'?s|the|my)\\s+"), "")
+                    .replace(Regex("[^a-z0-9' ]"), " ").replace(Regex("\\s+"), " ").trim()
+                if (shortCancel) { resetWalk(); transition(RiderState.Idle, announce = false); speak("Okay, not saved.", NarrationTier.QUEUED) }
+                else if (name.isBlank()) speak("Say a short name, like clinic door.", NarrationTier.QUEUED) { openMic(MicPurpose.WALK) }
+                else saveNewWalk(name)
+            }
+            WalkMode.UPDATE_CONFIRM -> {
+                val old = walkOld ?: return
+                val built = walkBuilt ?: return
+                val now = System.currentTimeMillis()
+                resetWalk()
+                if (yesNo is RiderIntent.Yes) {
+                    val r = RouteMemory.replaced(old, built.segments, now)
+                    walkStore.save(r)
+                    walkLog(r.id, "ROUTE_UPDATED")
+                    transition(RiderState.Idle, announce = false)
+                    speak("Updated. ${WalkNarrator.cueLine(r).replaceFirstChar { it.uppercase() }}.", NarrationTier.QUEUED)
+                } else {
+                    walkStore.save(old)
+                    walkLog(old.id, "ROUTE_KEPT")
+                    transition(RiderState.Idle, announce = false)
+                    speak("Okay, I kept the saved route.", NarrationTier.QUEUED)
+                }
+            }
+            WalkMode.GUIDING -> {
+                val route = guideRoute ?: return
+                when (WalkCommands.guide(text)) {
+                    WalkCommands.Guide.NEXT -> {
+                        walkLog(route.id, "NEXT", "part=${guidePart + 1}")
+                        // "Next" is said at the turn: record it, so the re-walk keeps the turn the
+                        // compass may have smoothed over.
+                        val turn = route.segments[guidePart].turn
+                        if (guideRecording && turn != TurnDirection.NONE) {
+                            WalkRecorder.add(WalkEvent.Turn(System.currentTimeMillis(), turn))
+                        }
+                        if (guidePart + 1 < route.segments.size) { guidePart++; speakGuidePart() } else finishGuide(stopped = false)
+                    }
+                    WalkCommands.Guide.REPEAT -> { guideHelp++; walkLog(route.id, "REPEAT", "part=${guidePart + 1}"); speakGuidePart() }
+                    WalkCommands.Guide.PREVIOUS -> { guidePart = (guidePart - 1).coerceAtLeast(0); speakGuidePart() }
+                    WalkCommands.Guide.MORE_DETAIL -> {
+                        guideHelp++
+                        val p = walkStore.profile()
+                        walkStore.saveProfile(p.copy(detailBias = (p.detailBias + 1).coerceAtMost(2)))
+                        walkLog(route.id, "MORE_DETAIL")
+                        speakGuidePart("More detail. ")
+                    }
+                    WalkCommands.Guide.LESS_DETAIL -> {
+                        val p = walkStore.profile()
+                        walkStore.saveProfile(p.copy(detailBias = (p.detailBias - 1).coerceAtLeast(-2)))
+                        walkLog(route.id, "LESS_DETAIL")
+                        speakGuidePart("Less detail. ")
+                    }
+                    WalkCommands.Guide.ARRIVED -> finishGuide(stopped = false)
+                    WalkCommands.Guide.STOP -> finishGuide(stopped = true)
+                    null -> {
+                        // A correction or a new landmark said mid-walk.
+                        val now = System.currentTimeMillis()
+                        val fixed = RouteMemory.correct(route, text, null, now, "lm${now.toString(36)}")
+                        when {
+                            fixed != null -> {
+                                guideRoute = fixed.first
+                                walkStore.save(fixed.first)
+                                walkLog(route.id, "CORRECTION", text)
+                                speak(fixed.second, NarrationTier.QUEUED)
+                            }
+                            guideRecording && WalkCommands.record(text) is WalkCommands.RecordInput.Mark -> {
+                                WalkRecorder.add(WalkEvent.Mark(now, text))
+                                speak("Noted.", NarrationTier.QUEUED)
+                            }
+                            else -> speak("Say next, repeat, more detail, or I'm there.", NarrationTier.QUEUED)
+                        }
+                    }
+                }
+            }
+            WalkMode.VERIFY -> {
+                val route = verifyRoute ?: return
+                val l = verifyLandmark ?: return
+                val now = System.currentTimeMillis()
+                resetWalk()
+                when {
+                    yesNo is RiderIntent.Yes -> {
+                        walkStore.save(RouteMemory.confirm(route, l.id, now))
+                        walkLog(route.id, "VERIFY_YES", l.text)
+                        speak("Thanks, noted.", NarrationTier.QUEUED)
+                    }
+                    yesNo is RiderIntent.No || Regex("\\b(gone|not there|wasn'?t there|isn'?t there|missing|removed|closed)\\b")
+                        .containsMatchIn(text.lowercase()) -> {
+                        val (r, removed) = RouteMemory.miss(route, l.id, now)
+                        walkStore.save(r)
+                        walkLog(route.id, "VERIFY_NO", l.text)
+                        speak(if (removed) "I've taken ${WalkNarrator.phrase(l, withSide = false)} off the route."
+                        else "Okay. I'll say it may be gone, and ask again next time.", NarrationTier.QUEUED)
+                    }
+                    else -> {
+                        val fixed = RouteMemory.correct(route, text, l, now, "lm${now.toString(36)}")
+                        if (fixed != null) {
+                            walkStore.save(fixed.first)
+                            walkLog(route.id, "CORRECTION", text)
+                            speak(fixed.second, NarrationTier.QUEUED)
+                        } else speak("Okay.", NarrationTier.QUEUED)
+                    }
+                }
+            }
+            WalkMode.NONE -> speak("Say record my walk, or how do I get to a place.", NarrationTier.QUEUED)
+        }
+    }
+
+    /** Silence or a recognition error while the walk mic was open. */
+    private fun onWalkNoAnswer() {
+        when (walkMode) {
+            WalkMode.CONSENT -> { resetWalk(); speak("Okay, I won't record.", NarrationTier.QUEUED) }
+            WalkMode.NAMING -> saveNewWalk(walkPlace?.second?.lowercase() ?: "walk ${walkStore.routes().size + 1}")
+            WalkMode.UPDATE_CONFIRM -> handleWalkAnswer("no")
+            WalkMode.VERIFY -> resetWalk()
+            // Recording and guidance go on: the rider presses again when they need to.
+            WalkMode.RECORDING, WalkMode.GUIDING, WalkMode.NONE -> Unit
+        }
+    }
+
+    /** Screen buttons on the walking screen, for a helper or a TalkBack user. */
+    private fun onWalkAction(action: String) {
+        when (action) {
+            "walk-mark" -> openMic(MicPurpose.WALK)
+            "walk-left" -> if (walkMode == WalkMode.RECORDING) handleWalkAnswer("turning left")
+            "walk-right" -> if (walkMode == WalkMode.RECORDING) handleWalkAnswer("turning right")
+            "walk-done" -> when (walkMode) {
+                WalkMode.RECORDING -> finishWalkRecording()
+                WalkMode.GUIDING -> finishGuide(stopped = false)
+                else -> Unit
+            }
+            "walk-next" -> if (walkMode == WalkMode.GUIDING) handleWalkAnswer("next")
+            "walk-repeat" -> if (walkMode == WalkMode.GUIDING) handleWalkAnswer("repeat")
+            "walk-stop" -> when (walkMode) {
+                WalkMode.RECORDING -> handleWalkAnswer("cancel recording")
+                WalkMode.GUIDING -> finishGuide(stopped = true)
+                else -> Unit
+            }
+        }
+    }
+
+    private fun showWalk(recording: Boolean, prompt: String) {
+        val route = guideRoute
+        val lines = if (route != null) route.segments.mapIndexed { i, s ->
+            (if (i == guidePart) "▶ " else "") + "${i + 1}. about ${WalkNarrator.roundMetres(s.metres)} m" +
+                (if (s.turn != TurnDirection.NONE) ", then ${s.turn.spoken.removePrefix("turn ")}" else "") +
+                (s.landmarks.firstOrNull()?.let { " · ${it.text}" } ?: "")
+        } else listOf("Steps so far: ${WalkRecorder.steps()}")
+        transition(RiderState.Walking(prompt, lines, recording, guiding = route != null), announce = false)
+    }
+
+    private fun resetWalk() {
+        walkMode = WalkMode.NONE
+        walkName = ""
+        walkPlace = null
+        walkBuilt = null
+        walkOld = null
+        guideRoute = null
+        guidePart = 0
+        guideHelp = 0
+        guideRecording = false
+        verifyRoute = null
+        verifyLandmark = null
+    }
+
+    /** "export my walking log": the field-study measures, as CSV, through the share sheet. */
+    private fun exportWalkLog() {
+        val entries = walkStore.logEntries()
+        if (entries.isEmpty()) {
+            speak("There's nothing in the walking log yet.", NarrationTier.QUEUED)
+            return
+        }
+        val send = android.content.Intent(android.content.Intent.ACTION_SEND)
+            .setType("text/csv")
+            .putExtra(android.content.Intent.EXTRA_SUBJECT, "Cab Eye walking log")
+            .putExtra(android.content.Intent.EXTRA_TEXT, RouteMemory.csv(entries))
+        runCatching {
+            getApplication<android.app.Application>().startActivity(
+                android.content.Intent.createChooser(send, "Share walking log")
+                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        }
+        speak("The walking log has ${entries.size} entries. Choose where to send it.", NarrationTier.QUEUED)
+    }
+
 
     // =================================================================================
     //  After the ride: optional feedback, then the next journey
@@ -4367,6 +4963,8 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             "schedule" -> startScheduling(fromIdle = false)
             "confirm" -> if (ride is RiderState.NextJourney && ride.step == NextStep.CONFIRM) saveSchedule()
             "done" -> endPostRide("Okay. Hold anywhere when you need a ride.")
+            // Walking-route buttons.
+            "walk-mark", "walk-left", "walk-right", "walk-done", "walk-next", "walk-repeat", "walk-stop" -> onWalkAction(action)
             // Multi-stop buttons, for a sighted helper.
             "im-back" -> {
                 val stop = currentStop()
@@ -4974,6 +5572,10 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun handleSpeechError(error: SpeechError) {
+        if (micPurpose == MicPurpose.WALK) {
+            onWalkNoAnswer()
+            return
+        }
         // Mid-ride stop words: never a reason to leave the ride screen.
         if (micPurpose == MicPurpose.TRIP_COMMAND || micPurpose == MicPurpose.STOP_CONFIRM ||
             (micPurpose == MicPurpose.STOP_KIND && addingStopMidTrip != null) ||
@@ -5100,7 +5702,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                 return
             }
 
-            MicPurpose.TRIP_COMMAND, MicPurpose.STOP_CONFIRM -> return
+            MicPurpose.TRIP_COMMAND, MicPurpose.STOP_CONFIRM, MicPurpose.WALK -> return
 
             MicPurpose.MEMORY_ANSWER -> {
                 val routine = pendingRoutine

@@ -655,6 +655,43 @@ fun RiderSurface(
                     }
 
                     // -----------------------------------------------------------------
+                    // Walking route: recording it, or being guided along it
+                    // -----------------------------------------------------------------
+                    is RiderState.Walking -> {
+                        StatusIndicator(
+                            label = if (ride.recording) "RECORDING WALK" else "GUIDING",
+                            icon = if (ride.recording) "●" else "➜",
+                            accent = if (ride.recording) palette.danger else palette.listening
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.md))
+                        StateHeadline(text = ride.prompt, color = palette.onBackground)
+                        Spacer(Modifier.height(CabEyeSpacing.md))
+                        SupportingText(text = ride.lines.joinToString("\n"), color = palette.listening)
+                        Spacer(Modifier.height(CabEyeSpacing.xl))
+                        if (ride.recording) {
+                            PrimaryAction(label = "MARK A LANDMARK", onClick = { onPostRideAction("walk-mark") })
+                            Spacer(Modifier.height(CabEyeSpacing.sm))
+                            SecondaryAction(label = "TURNING LEFT", onClick = { onPostRideAction("walk-left") })
+                            Spacer(Modifier.height(CabEyeSpacing.sm))
+                            SecondaryAction(label = "TURNING RIGHT", onClick = { onPostRideAction("walk-right") })
+                            Spacer(Modifier.height(CabEyeSpacing.sm))
+                            PrimaryAction(label = "I'M THERE", onClick = { onPostRideAction("walk-done") })
+                        } else {
+                            PrimaryAction(label = "NEXT", onClick = { onPostRideAction("walk-next") })
+                            Spacer(Modifier.height(CabEyeSpacing.sm))
+                            SecondaryAction(label = "REPEAT", onClick = { onPostRideAction("walk-repeat") })
+                            Spacer(Modifier.height(CabEyeSpacing.sm))
+                            PrimaryAction(label = "I'M THERE", onClick = { onPostRideAction("walk-done") })
+                        }
+                        Spacer(Modifier.height(CabEyeSpacing.sm))
+                        SecondaryAction(
+                            label = if (ride.recording) "DISCARD" else "STOP GUIDING",
+                            onClick = { onPostRideAction("walk-stop") },
+                            accentColor = palette.danger
+                        )
+                    }
+
+                    // -----------------------------------------------------------------
                     // Multi-stop planning: the route as read back, for a sighted helper
                     // -----------------------------------------------------------------
                     is RiderState.Planning -> {
@@ -1208,5 +1245,6 @@ private fun hapticFor(uiState: RiderUiState): HapticPattern {
         is RiderState.Feedback -> HapticPattern.CLARIFY
         is RiderState.NextJourney -> HapticPattern.CLARIFY
         is RiderState.Planning -> HapticPattern.CLARIFY
+        is RiderState.Walking -> HapticPattern.LISTENING_END
     }
 }
