@@ -9,9 +9,9 @@ and the next journey (book now / schedule / done).
 
 ```powershell
 cd backend
-.\gradlew.bat test          # AuthEndpointTest, MemoryEndpointTest, FeedbackEndpointTest + existing
+.\gradlew.bat test          # AuthEndpointTest, MemoryEndpointTest, FeedbackEndpointTest, MultiStopEndpointTest + existing
 cd ..\android
-.\gradlew.bat testDebugUnitTest   # AuthLogicTest, DialogueFlowTest, MemoryAgentTest, PostRideTest + existing
+.\gradlew.bat testDebugUnitTest   # AuthLogicTest, DialogueFlowTest, MemoryAgentTest, PostRideTest, TripPlanTest + existing
 .\gradlew.bat assembleDebug
 ```
 
@@ -105,3 +105,37 @@ Logs: `adb logcat -s CabEye.Dialogue CabEye.Memory` — look for `MEMORY proacti
 | "give feedback" later from idle | Feedback for the last finished ride |
 
 Quick scheduling test: say "schedule a ride" → "in 2 minutes" → a place → "yes", then wait.
+
+## 6. Multi-stop rides (Uber/Rapido style) — up to 3 stops, then the destination
+
+Two phones (rider + driver), both signed in. Every booking still goes through the 5-second cancel window.
+
+**Planning by voice (rider)**
+
+| Say / do | Expected |
+|---|---|
+| "Take me to PSG College via Apollo Pharmacy" | "1 stop, then PSG College." → looks up each place (same clarify / did-you-mean questions as always) → "At Apollo Pharmacy, will you get out and come back, so the driver waits? Or are you dropping someone off, or picking someone up?" |
+| "wait for me at the pharmacy, then drop my friend at Gandhipuram, then college" | Kinds taken from the words — no kind questions; read-back "Stop one, Apollo Pharmacy, the driver waits for you. Stop two, Gandhipuram, dropping someone off, my friend. Then PSG College." |
+| "I have a few stops" | "Where is your first stop?" → place → "Next stop? Or say that's all." → "that's all" → "And where do you finish?" |
+| Four stops in one breath | "A ride can have up to 3 stops before the destination…" |
+| At the read-back: "remove stop two" / "swap one and two" / "add a stop at the ATM after stop one" / "change stop one to MedPlus" / "make stop two a wait" / "change the destination to home" / "read it again" | Each edit is said back, then the new read-back |
+| "yes" | "Booking auto to PSG College, with 2 stops: Apollo Pharmacy, then Gandhipuram. Say cancel to stop." |
+| "go back" during the cancel window | Back to the read-back, not to the start |
+| Kind question unclear twice | "I'll ask the driver to wait for you there." (never the unsafe guess) |
+
+**During the ride**
+
+| Do | Expected |
+|---|---|
+| Trip starts | "On the way. First stop, Apollo Pharmacy. Then PSG College." |
+| Driver taps ARRIVED AT STOP (WAIT stop) | Rider: "Stop one, Apollo Pharmacy. Your driver will wait up to 10 minutes…"; driver's DONE is locked |
+| Rider presses the screen (or I'M BACK), driver says the code | "That's the right code. Welcome back." → driver banner "Passenger is back…", DONE unlocks |
+| Driver tries DONE before that / COMPLETE TRIP with a stop open | Refused by the server with the sentence on the banner |
+| Wrong code heard at the stop | "That is not the right code. Do not get in…"; DONE stays locked |
+| Rider waits past half-time / last minute | "N minutes left…" / "One minute left…" |
+| Rider not back after 10 min (`cabeye.stops.wait-minutes`) | Rider phone told support was alerted; admin page gets an urgent "Rider not back at a stop" case with the stop's location; Telegram/email alert |
+| DROP / PICKUP stop | "Stop two, Gandhipuram. My friend can get out here." → driver DROPPED — CONTINUE |
+| Press during the ride, say "skip the next stop" → "yes" | Skipped, next leg announced; skipping the stop you're standing at is refused |
+| "what are my stops" | Remaining stops read out |
+| "add a stop at the ATM" → kind → "yes" | Added (max 3 counting finished ones); driver banner "Passenger changed the stops" |
+| "cancel" while adding a stop mid-ride | "Okay, no change." — the ride is never cancelled from here |

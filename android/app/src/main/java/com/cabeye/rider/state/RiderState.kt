@@ -163,7 +163,21 @@ sealed interface RiderState {
     data class InTrip(
         val destination: String,
         val etaMinutes: Int,
-        val driver: DriverInfo
+        val driver: DriverInfo,
+        /** Multi-stop: every stop with its status. Empty for an A-to-B ride. */
+        val stops: List<com.cabeye.rider.net.StopInfo> = emptyList()
+    ) : RiderState {
+        /** The stop the car is heading to or standing at, if any. */
+        val currentStop: com.cabeye.rider.net.StopInfo? get() = stops.firstOrNull { it.isOpen }
+    }
+
+    /**
+     * A multi-stop trip being planned by voice, shown so a sighted helper can follow it.
+     * [lines] is the numbered read-back, one line per stop, then the destination.
+     */
+    data class Planning(
+        val lines: List<String>,
+        val prompt: String
     ) : RiderState
 
     /** Ride complete. */

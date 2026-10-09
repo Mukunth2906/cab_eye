@@ -7,6 +7,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Function;
 
 /**
  * One ride, held entirely in memory.
@@ -98,6 +99,12 @@ public class Ride {
     private final AtomicLong sequence = new AtomicLong(0);
     private final List<RideEvent> log = new ArrayList<>();
 
+    /**
+     * Intermediate stops, in visiting order. Empty for an ordinary A-to-B ride. The final
+     * destination is never in here — see {@link RideStop}.
+     */
+    private final List<RideStop> stops = new ArrayList<>();
+
     private volatile RidePhase phase = RidePhase.REQUESTED;
     private volatile String driverId;
     private volatile String driverName;
@@ -181,6 +188,7 @@ public class Ride {
         r.paymentRef = paymentRef;
         r.lastSeq = sequence.get();
         r.events = new ArrayList<>(log);
+        r.stops = copyStops();
         return r;
     }
 
@@ -215,6 +223,9 @@ public class Ride {
                 }
             }
             ride.sequence.set(maxSeq);
+            if (r.stops != null) {
+                for (RideStop s : r.stops) ride.stops.add(s.copy());
+            }
         }
         return ride;
     }
@@ -322,7 +333,11 @@ public class Ride {
             String paymentStatus,
             String paymentRef,
             long lastSeq,
-            Instant createdAt
+            Instant createdAt,
+            // Multi-stop: every stop with its status, and the 1-based index of the stop the
+            // car is heading to or standing at (null once all stops are behind it).
+            List<RideStop> stops,
+            Integer currentStop
     ) {}
 
     public synchronized Snapshot snapshot() {
@@ -334,7 +349,46 @@ public class Ride {
                 etaMinutes, distanceMeters, bearingDeg, codeConfirmed,
                 fareRupees, durationMinutes,
                 paymentStatus.name(), paymentRef,
-                sequence.get(), createdAt);
+                sequence.get(), createdAt,
+                copyStops(), currentStopIndex());
+    }
+
+    // -----------------------------------------------------------------------------------
+    //  Stops
+    // -----------------------------------------------------------------------------------
+
+    /** A copy of every stop, safe to serialise or hand to another thread. */
+    public synchronized List<RideStop> copyStops() {
+        List<RideStop> out = new ArrayList<>(stops.size());
+        for (RideStop s : stops) out.add(s.copy());
+        return out;
+    }
+
+    public synchronized boolean hasStops() {
+        return !stops.isEmpty();
+    }
+
+    /** True while any stop is still to be visited, or is being visited. */
+    public synchronized boolean hasOpenStops() {
+        for (RideStop s : stops) if (s.status.isOpen()) return true;
+        return false;
+    }
+
+    /** 1-based index of the first open stop, or null when there is none. */
+    public synchronized Integer currentStopIndex() {
+        for (RideStop s : stops) if (s.status.isOpen()) return s.index;
+        return null;
+    }
+
+    /**
+     * Runs {@code change} against the live stop list under this ride's lock, then renumbers.
+     * The single way stop state is mutated, so the list, its numbering and the snapshot can
+     * never be observed half-changed.
+     */
+    public synchronized <T> T withStops(Function<List<RideStop>, T> change) {
+        T result = change.apply(stops);
+        for (int i = 0; i < stops.size(); i++) stops.get(i).index = i + 1;
+        return result;
     }
 
     // -----------------------------------------------------------------------------------

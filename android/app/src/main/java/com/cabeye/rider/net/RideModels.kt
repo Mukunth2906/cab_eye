@@ -134,6 +134,18 @@ enum class RideEventType(
      */
     PAYMENT_UPDATED(NarrationTier.EARCON_ONLY),
 
+    // ---- Multi-stop rides -----------------------------------------------------------
+    // Outside [isRideLifecycle] on purpose: the phase stays IN_TRIP throughout; these say
+    // where in the route the car is. The rider's view model speaks its own sentences.
+
+    STOP_ARRIVED(NarrationTier.INTERRUPT, Earcon.ARRIVED),
+    RIDER_RETURNED(NarrationTier.QUEUED, Earcon.UNDERSTOOD),
+    STOP_DONE(NarrationTier.QUEUED, Earcon.BOOKING_CONFIRMED),
+    STOP_SKIPPED(NarrationTier.QUEUED, Earcon.UNDERSTOOD),
+    STOPS_CHANGED(NarrationTier.QUEUED, Earcon.UNDERSTOOD),
+    WAIT_WARNING(NarrationTier.QUEUED),
+    WAIT_OVERDUE(NarrationTier.INTERRUPT, Earcon.ERROR),
+
     // ---- The live camera ------------------------------------------------------------
     // "Help me find my passenger". Not phase changes, so they sit outside [isRideLifecycle],
     // and they are never replayed: the server broadcasts them without logging them, so a
@@ -241,7 +253,11 @@ data class RideSnapshot(
     // first as if it were the second.
     val paymentStatus: String = "NONE",
     val paymentRef: String = "",
-    val lastSeq: Long
+    val lastSeq: Long,
+    /** Multi-stop: every stop with its status, in order. Empty for an A-to-B ride. */
+    val stops: List<StopInfo> = emptyList(),
+    /** 1-based index of the stop being headed to or visited; null once all are behind. */
+    val currentStop: Int? = null
 ) {
     companion object {
         fun parse(json: String): RideSnapshot? = runCatching {
@@ -273,8 +289,54 @@ data class RideSnapshot(
                 durationMinutes = o.optInt("durationMinutes", 0),
                 paymentStatus = o.optString("paymentStatus", "NONE"),
                 paymentRef = o.optString("paymentRef"),
-                lastSeq = o.optLong("lastSeq", 0L)
+                lastSeq = o.optLong("lastSeq", 0L),
+                stops = StopInfo.parseList(o.optJSONArray("stops")),
+                currentStop = if (o.has("currentStop") && !o.isNull("currentStop")) o.optInt("currentStop") else null
             )
         }.getOrNull()
+    }
+}
+
+/**
+ * One stop of a multi-stop ride, as the server reports it (snapshot, or an event payload).
+ *
+ * @param kind DROP, PICKUP or WAIT — see `com.cabeye.rider.trip.StopKind`
+ * @param status PENDING, ARRIVED, WAITING, DONE or SKIPPED
+ */
+data class StopInfo(
+    val stopId: String,
+    val index: Int,
+    val kind: String,
+    val status: String,
+    val name: String,
+    val address: String = "",
+    val latitude: Double? = null,
+    val longitude: Double? = null,
+    val note: String = "",
+    val waitLimitSeconds: Int = 0,
+    val waitStartedAt: Long = 0,
+    val riderBack: Boolean = false
+) {
+    val isOpen: Boolean get() = status == "PENDING" || status == "ARRIVED" || status == "WAITING"
+    val isWait: Boolean get() = kind == "WAIT"
+
+    companion object {
+        fun parse(o: JSONObject): StopInfo = StopInfo(
+            stopId = o.optString("stopId"),
+            index = o.optInt("index", 0),
+            kind = o.optString("kind", "DROP"),
+            status = o.optString("status", "PENDING"),
+            name = o.optString("name"),
+            address = o.optString("address"),
+            latitude = o.optDoubleNullable("latitude"),
+            longitude = o.optDoubleNullable("longitude"),
+            note = o.optString("note"),
+            waitLimitSeconds = o.optInt("waitLimitSeconds", 0),
+            waitStartedAt = o.optLong("waitStartedAt", 0),
+            riderBack = o.optBoolean("riderBack", false)
+        )
+
+        fun parseList(a: org.json.JSONArray?): List<StopInfo> =
+            if (a == null) emptyList() else (0 until a.length()).mapNotNull { a.optJSONObject(it)?.let(::parse) }
     }
 }

@@ -214,7 +214,9 @@ class MainActivity : FragmentActivity() {
                             onProfile = accountVm::editProfile,
                             cameraFrame = driverVm.cameraFrame,
                             onRequestCamera = driverVm::requestCamera,
-                            onStopCamera = driverVm::stopCamera
+                            onStopCamera = driverVm::stopCamera,
+                            onStopArrived = driverVm::arrivedAtStop,
+                            onStopDone = driverVm::finishStop
                         )
                         }
                     }

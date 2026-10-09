@@ -15,6 +15,7 @@ import com.cabeye.rider.net.RideEvent
 import com.cabeye.rider.net.RideEventType
 import com.cabeye.rider.net.RidePhase
 import com.cabeye.rider.net.RideSnapshot
+import com.cabeye.rider.net.StopInfo
 import com.cabeye.rider.net.PaymentOrder
 import com.cabeye.rider.net.PaymentOrderStatus
 import com.cabeye.rider.telemetry.Telemetry
@@ -244,7 +245,8 @@ class DriverViewModel(application: Application) : AndroidViewModel(application) 
                 pickupLongitude = snapshot.pickupLongitude,
                 contactName = snapshot.contactName,
                 contactPhone = snapshot.contactPhone,
-                dropNote = snapshot.dropNote
+                dropNote = snapshot.dropNote,
+                stops = snapshot.stops
             )
         )
     }
@@ -479,7 +481,8 @@ class DriverViewModel(application: Application) : AndroidViewModel(application) 
                             destinationAddress = result.value.destinationAddress,
                             contactName = result.value.contactName,
                             contactPhone = result.value.contactPhone,
-                            dropNote = result.value.dropNote
+                            dropNote = result.value.dropNote,
+                            stops = result.value.stops
                         ),
                         banner = ""
                     )
@@ -511,8 +514,47 @@ class DriverViewModel(application: Application) : AndroidViewModel(application) 
                     )
                     watchPayment(id)
                 }
+                // "There's still a stop on this ride…" — the server's own sentence.
+                is ApiResult.Failed -> showBanner(result.preferServerSentence().spoken)
+            }
+        }
+    }
+
+    // =================================================================================
+    //  6b — Stops (multi-stop rides)
+    //
+    //  ARRIVED AT STOP → the rider's phone announces it.
+    //    DROP / PICKUP: DONE as soon as the person is out / in.
+    //    WAIT: the passenger gets out; DONE stays locked until their phone hears the boarding
+    //    code again (RIDER_RETURNED). The server enforces this; the button only reflects it.
+    // =================================================================================
+
+    fun arrivedAtStop() = stopAction("STOP_ARRIVED") { id, stop -> api.stopArrived(id, stop.stopId) }
+
+    fun finishStop() = stopAction("STOP_DONE") { id, stop -> api.stopDone(id, stop.stopId) }
+
+    private fun stopAction(label: String, call: suspend (String, StopInfo) -> ApiResult<RideSnapshot>) {
+        val trip = uiState.state as? DriverState.InTrip ?: return
+        val stop = trip.currentStop ?: return
+        Telemetry.logDriverAction(label, trip.rideId, "stop=${stop.index}")
+        viewModelScope.launch {
+            when (val result = call(trip.rideId, stop)) {
+                is ApiResult.Ok -> applyStops(result.value.stops)
                 is ApiResult.Failed -> showBanner(result.spoken)
             }
+        }
+    }
+
+    private fun applyStops(stops: List<StopInfo>) {
+        val trip = uiState.state as? DriverState.InTrip ?: return
+        uiState = uiState.copy(state = trip.copy(stops = stops))
+    }
+
+    private fun refreshStops() {
+        val id = rideId ?: return
+        viewModelScope.launch {
+            val result = api.snapshot(id)
+            if (result is ApiResult.Ok) applyStops(result.value.stops)
         }
     }
 
@@ -674,6 +716,30 @@ class DriverViewModel(application: Application) : AndroidViewModel(application) 
             // The fare's payment moved on the server — paid, failed, or reported by the rider.
             RideEventType.PAYMENT_UPDATED ->
                 applyPayment(event.rideId, event.string("status"), event.string("paymentRef"))
+
+            // Multi-stop: keep the stop list current and tell the driver what changed.
+            RideEventType.RIDER_RETURNED -> if (event.rideId == rideId) {
+                refreshStops()
+                showBanner(
+                    if (event.bool("matched", false)) "Passenger is back and confirmed the code. Tap DONE to continue."
+                    else "Passenger's phone says the code does NOT match. Do not continue — check with them."
+                )
+            }
+            RideEventType.STOP_SKIPPED, RideEventType.STOPS_CHANGED -> if (event.rideId == rideId) {
+                refreshStops()
+                showBanner(
+                    if (event.type == RideEventType.STOP_SKIPPED) "Passenger skipped ${event.string("name", "a stop")}."
+                    else "Passenger changed the stops. Check the list."
+                )
+            }
+            RideEventType.STOP_ARRIVED, RideEventType.STOP_DONE -> if (event.rideId == rideId) refreshStops()
+            RideEventType.WAIT_WARNING -> if (event.rideId == rideId) {
+                val left = event.int("secondsLeft", 60)
+                showBanner("Waiting at ${event.string("name", "the stop")}: about ${(left + 59) / 60} min of the wait left.")
+            }
+            RideEventType.WAIT_OVERDUE -> if (event.rideId == rideId) {
+                showBanner("Passenger is overdue. Support has been told and will call them. Keep waiting safely.")
+            }
 
             else -> Unit
         }

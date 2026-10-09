@@ -64,6 +64,12 @@ import com.cabeye.rider.memory.SuggestionKind
 import com.cabeye.rider.memory.VisitedPlace
 import java.time.ZoneId
 import kotlinx.coroutines.Dispatchers
+import com.cabeye.rider.net.StopInfo
+import com.cabeye.rider.net.stopsJson
+import com.cabeye.rider.trip.PlannedLeg
+import com.cabeye.rider.trip.StopKind
+import com.cabeye.rider.trip.StopPlanParser
+import com.cabeye.rider.trip.TripPlan
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -147,7 +153,25 @@ private enum class MicPurpose {
      * "stop camera". Only camera words mean anything here. Nothing heard under this purpose
      * can book, cancel or change the ride.
      */
-    CAMERA
+    CAMERA,
+
+    /** Multi-stop planning: naming the next stop ("next stop? or say that's all"). */
+    PLAN_LEG,
+
+    /** Multi-stop: what happens at a stop — the driver waits, a drop-off, or a pick-up. */
+    STOP_KIND,
+
+    /** Multi-stop: the numbered read-back — yes, or an edit ("remove stop two"). */
+    PLAN_REVIEW,
+
+    /**
+     * During a multi-stop ride: only stop words mean anything ("I'm back", "skip the next
+     * stop", "what are my stops", "add a stop at …"). Nothing heard here can cancel the ride.
+     */
+    TRIP_COMMAND,
+
+    /** During a ride: yes or no to a stop change just read back. */
+    STOP_CONFIRM
 }
 
 /**
@@ -779,10 +803,13 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                 val destination = event.string("destination", lastBooking?.first ?: "your destination")
                 val eta = event.int("etaMinutes", 12)
                 val driver = currentDriver() ?: driverFrom(event)
-                transition(RiderState.InTrip(destination, eta, driver), announce = false)
+                transition(RiderState.InTrip(destination, eta, driver, activeStops), announce = false)
                 // Destination only — see the note on RIDE_ASSIGNED. The driver's own message
                 // is the channel for "about ten minutes, traffic at Avinashi Road".
-                narrate(event, "On the way to $destination.")
+                val first = currentStop()
+                narrate(event, if (first == null) "On the way to $destination."
+                else "On the way. First stop, ${first.name}. Then $destination.")
+                activeRideId?.let(::refreshStops)
                 lastSpokenPhase = RidePhase.IN_TRIP
                 engine.heartbeat(true)
             }
@@ -821,6 +848,15 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
 
             RideEventType.CODE_CONFIRMED,
             RideEventType.RIDE_CREATED -> Unit
+
+            // Multi-stop — see "Multi-stop rides" below.
+            RideEventType.STOP_ARRIVED,
+            RideEventType.RIDER_RETURNED,
+            RideEventType.STOP_DONE,
+            RideEventType.STOP_SKIPPED,
+            RideEventType.STOPS_CHANGED,
+            RideEventType.WAIT_WARNING,
+            RideEventType.WAIT_OVERDUE -> onStopEvent(event)
 
             // The live camera — see "Live camera" below.
             RideEventType.CAMERA_REQUESTED -> onCameraRequested(event)
@@ -961,6 +997,8 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             }
             return
         }
+        // Back at the car at a stop: the same check, and a wrong code means the same thing.
+        if (codeForStop && !heardDigits.contains(expectedDigits)) codeForStop = false
 
         if (heardDigits.contains(expectedDigits)) {
             // Settle the code BEFORE speaking. Everything that could ask again — the bounded
@@ -968,7 +1006,10 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             settleBoardingCode()
 
             engine.earcon(Earcon.UNDERSTOOD)
-            speak("That's the right code. This is your car.", NarrationTier.INTERRUPT)
+            val backAtStop = codeForStop
+            codeForStop = false
+            speak(if (backAtStop) "That's the right code. Welcome back." else "That's the right code. This is your car.",
+                NarrationTier.INTERRUPT)
             activeRideId?.let { rideId ->
                 viewModelScope.launch { api.confirmCode(rideId, matched = true) }
             }
@@ -1837,7 +1878,9 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         stt?.cancel()
         closeMic()
         engine.earcon(Earcon.UNDERSTOOD)
-        speak("Confirmed. Have a good trip.", NarrationTier.QUEUED)
+        val backAtStop = codeForStop || uiState.ride is RiderState.InTrip
+        codeForStop = false
+        speak(if (backAtStop) "Confirmed. Welcome back." else "Confirmed. Have a good trip.", NarrationTier.QUEUED)
         activeRideId?.let { rideId ->
             viewModelScope.launch { api.confirmCode(rideId, matched = true) }
         }
@@ -1906,11 +1949,40 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
+        // A multi-stop ride: a press is "I'm back" at a WAIT stop, otherwise it opens the
+        // microphone for stop words only — never for a new booking.
+        val trip = uiState.ride as? RiderState.InTrip
+        if (trip != null && activeStops.isNotEmpty()) {
+            trace?.tapCount = (trace?.tapCount ?: 0) + 1
+            engine.stopSpeaking()
+            if (stt?.isListening == true) stt?.cancel()
+            val stop = currentStop()
+            if (stop != null && stop.status == "WAITING" && !stop.riderBack) {
+                listenForStopCode("Welcome back. Ask the driver to say the code.")
+            } else {
+                openMic(MicPurpose.TRIP_COMMAND)
+            }
+            return
+        }
+
         if (isRideUnderway(uiState.ride)) {
             trace?.tapCount = (trace?.tapCount ?: 0) + 1
             engine.stopSpeaking()
             engine.earcon(Earcon.UNDERSTOOD)
             speakStatus()
+            return
+        }
+
+        // Planning a route: a press answers the question on screen.
+        if (uiState.ride is RiderState.Planning) {
+            engine.stopSpeaking()
+            if (stt?.isListening == true) stt?.cancel()
+            when {
+                planStage == PlanStage.REVIEW -> openMic(MicPurpose.PLAN_REVIEW)
+                planStage == PlanStage.KINDS -> openMic(MicPurpose.STOP_KIND)
+                planStage == PlanStage.COLLECTING -> openMic(MicPurpose.PLAN_LEG)
+                else -> openMic(MicPurpose.SLOT_ANSWER)
+            }
             return
         }
 
@@ -2006,6 +2078,10 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun onCancel() {
+        resetPlan()
+        bookingPlan = null
+        pendingTripAction = null
+        addingStopMidTrip = null
         cancelWindowJob?.cancel()
         silenceJob?.cancel()
         demoRideJob?.cancel()
@@ -2083,7 +2159,8 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         // The post-ride questions stay on screen too: their step lives in the state itself.
         if (purpose != MicPurpose.CANCEL_WINDOW && purpose != MicPurpose.CODE_VERIFY &&
             purpose != MicPurpose.FEEDBACK && purpose != MicPurpose.NEXT_JOURNEY &&
-            purpose != MicPurpose.CAMERA
+            purpose != MicPurpose.CAMERA && purpose != MicPurpose.TRIP_COMMAND &&
+            purpose != MicPurpose.STOP_CONFIRM && !planPurpose(purpose)
         ) {
             transition(
                 RiderState.Listening(isFollowUp = purpose != MicPurpose.BOOKING),
@@ -2139,6 +2216,14 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                 endPostRide("I'll wait. Hold anywhere when you need a ride.")
                 return@launch
             }
+            // Mid-ride stop words: silence changes nothing, and the ride screen stays.
+            if (purpose == MicPurpose.TRIP_COMMAND || purpose == MicPurpose.STOP_CONFIRM ||
+                (purpose == MicPurpose.STOP_KIND && addingStopMidTrip != null)
+            ) {
+                pendingTripAction = null
+                addingStopMidTrip = null
+                return@launch
+            }
             // Silence to the camera question is a no; silence while it is on means nothing.
             if (purpose == MicPurpose.CAMERA) {
                 if (uiState.camera == CameraShare.ASKING) declineCamera("NO_ANSWER")
@@ -2154,6 +2239,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             } else {
                 Log.i(TAG, "SILENCE timeoutMs=${RecoveryLadder.SILENCE_TIMEOUT_MS} action=REST")
                 silenceRepromptUsed = false
+                resetPlan()
                 transition(RiderState.Idle, announce = false)
                 speak(RecoveryLadder.SILENCE_REST, NarrationTier.QUEUED)
             }
@@ -2241,6 +2327,15 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             micPurpose == MicPurpose.CAMERA ->
                 alternatives.firstOrNull { CameraConsent.answer(it) != null }
 
+            micPurpose == MicPurpose.STOP_KIND ->
+                alternatives.firstOrNull { StopPlanParser.kindAnswer(it) != null }
+
+            micPurpose == MicPurpose.TRIP_COMMAND ->
+                alternatives.firstOrNull { StopPlanParser.tripCommand(it) != null }
+
+            micPurpose == MicPurpose.PLAN_REVIEW ->
+                alternatives.firstOrNull { StopPlanParser.planEdit(it) != null }
+
             micPurpose == MicPurpose.FEEDBACK -> when ((uiState.ride as? RiderState.Feedback)?.step) {
                 FeedbackStep.RATING -> alternatives.firstOrNull { FeedbackParser.intentOf(it) != FeedbackParser.Intent.NONE }
                 FeedbackStep.RATING_CHECK -> alternatives.firstOrNull { yesNo(it) || FeedbackParser.rating(it) != null }
@@ -2291,6 +2386,10 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
+        // Multi-stop answers and in-ride stop words, before the classifier: "cancel stop two"
+        // must change a stop, never cancel the ride.
+        if (handleStopSpeech(text)) return
+
         // Held from the Done screen, "pay" means pay — not a destination called Pay. The mic
         // moved the screen to Listening, so the finished ride is restored before paying.
         val doneScreen = doneBeforeListening
@@ -2330,6 +2429,10 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             goBack()
             return
         }
+
+        // A route rather than a place: "pharmacy, then college", "I have a few stops",
+        // or a saved route by name.
+        if (handlePlanEntry(text)) return
 
         when (micPurpose) {
             MicPurpose.CANCEL_WINDOW -> {
@@ -2391,6 +2494,8 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
 
             MicPurpose.CODE_VERIFY -> return // handled above
             MicPurpose.CAMERA -> return // handled above
+            MicPurpose.PLAN_LEG, MicPurpose.STOP_KIND, MicPurpose.PLAN_REVIEW,
+            MicPurpose.TRIP_COMMAND, MicPurpose.STOP_CONFIRM -> return // handled above
             MicPurpose.BOOKING -> Unit
         }
 
@@ -2580,7 +2685,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         // A road is not an address. Before booking a five-kilometre stretch of Thadagam Road,
         // find out who is meeting the rider there — the one person who can wave the car down
         // on their behalf. Buildings skip this entirely, so an ordinary booking is unchanged.
-        if (top.isVague && chosenContact == null && chosenDropNote.isBlank()) {
+        if (top.isVague && chosenContact == null && chosenDropNote.isBlank() && planStage == null) {
             startMeetingLadder(top, rideType)
             return
         }
@@ -2900,6 +3005,25 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         cancelWindowJob?.cancel()
         if (wasBooking != null) heldRideType = wasBooking.rideType
 
+        // A route: back to its read-back, not to the start.
+        val confirmedPlan = bookingPlan
+        if (wasBooking != null && confirmedPlan != null) {
+            bookingPlan = null
+            plan = confirmedPlan
+            planRideType = wasBooking.rideType
+            engine.earcon(Earcon.UNDERSTOOD)
+            reviewPlan("Okay, not booking yet. ")
+            return
+        }
+        // Mid-plan, inside one of the place questions: one step back within the plan.
+        if (planStage != null) {
+            pendingOptions = null
+            pendingNearMiss = null
+            pendingMemory = null
+            planBack()
+            return
+        }
+
         pendingOptions = null
         pendingNearMiss = null
         pendingMemory?.let { rejectedMemoryKeys += it.place.placeKey }
@@ -2989,7 +3113,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             val moment = memoryMoment()
             val suggestion = PreferenceMemoryAgent.proactive(
                 app.memory.current, moment, memoryThresholds(), rejectedMemoryKeys
-            ) ?: return@launch
+) ?: return@launch
             // Re-check: the rider may have started talking while the location was fetched.
             if (uiState.ride !is RiderState.Idle || uiState.micOpen || activeRideId != null) return@launch
 
@@ -3127,6 +3251,524 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             formattedAddress = address,
             placeId = placeId
         )
+    }
+
+    // =================================================================================
+    //  Multi-stop rides — planned by voice, Uber/Rapido style
+    //
+    //   "pharmacy, then Gandhipuram, then home"  ─▶ each place looked up in turn, through the
+    //        same resolver, clarify and memory-repair questions as any booking
+    //   ─▶ "At the pharmacy, will you get out and come back, or…?"  (only where not said)
+    //   ─▶ numbered read-back ─▶ edits ("remove stop two", "swap one and two", "add a stop",
+    //        "save this as Monday errands") ─▶ yes ─▶ the normal booking and cancel window
+    //
+    //  During the ride every stop is announced; at a WAIT stop the rider presses (or says
+    //  "I'm back") and the phone hears the boarding code again — the car cannot leave until
+    //  it does. "Skip the next stop", "what are my stops", "add a stop at …" work mid-ride.
+    // =================================================================================
+
+    private enum class PlanStage { COLLECTING, RESOLVING, KINDS, REVIEW }
+
+    /** Something said mid-ride that needs a yes before it happens. */
+    private sealed interface TripAction {
+        data class Skip(val stop: StopInfo) : TripAction
+        data class Add(val leg: PlannedLeg) : TripAction
+    }
+
+    private var plan: TripPlan? = null
+    private var planStage: PlanStage? = null
+    private var planLegIndex = 0
+    private var planRideType: RideType = RideType.AUTO
+    private var planMisses = 0
+    private var planHintsGiven = false
+    private val collectedLegs = mutableListOf<PlannedLeg>()
+    private var collectingDestination = false
+    /** The confirmed plan, between "yes" and the server accepting it. */
+    private var bookingPlan: TripPlan? = null
+
+    /** The ride's stops as the server last reported them. */
+    private var activeStops: List<StopInfo> = emptyList()
+    /** The boarding-code listen is for a rider getting back in at a WAIT stop. */
+    private var codeForStop = false
+    private var pendingTripAction: TripAction? = null
+    /** Mid-ride "add a stop": the place is found, its kind is being asked. */
+    private var addingStopMidTrip: PlannedLeg? = null
+
+    private fun planPurpose(p: MicPurpose) =
+        p == MicPurpose.PLAN_LEG || p == MicPurpose.STOP_KIND || p == MicPurpose.PLAN_REVIEW
+
+    /**
+     * Multi-stop speech that must be heard before the classifier: answers to the planning
+     * questions, and stop commands during the ride. @return true when the words were handled.
+     */
+    private fun handleStopSpeech(text: String): Boolean {
+        val shortCancel = com.cabeye.rider.intent.IntentParser.CANCEL.containsMatchIn(text) && text.trim().split(Regex("\\s+")).size <= 2
+        when (micPurpose) {
+            MicPurpose.PLAN_LEG, MicPurpose.STOP_KIND, MicPurpose.PLAN_REVIEW -> {
+                if (addingStopMidTrip != null && (shortCancel ||
+                        Classifier.classify(text, true).intent is RiderIntent.Back)
+                ) {
+                    // Mid-ride: "cancel" drops the stop being added, never the ride.
+                    addingStopMidTrip = null
+                    speak("Okay, no change.", NarrationTier.QUEUED)
+                    return true
+                }
+                if (shortCancel) { onCancel(); return true }
+                if (Classifier.classify(text, false).intent is RiderIntent.Back) { planBack(); return true }
+                when (micPurpose) {
+                    MicPurpose.PLAN_LEG -> resolveCollect(text)
+                    MicPurpose.STOP_KIND -> if (addingStopMidTrip != null) resolveMidTripKind(text) else resolveStopKind(text)
+                    else -> resolvePlanReview(text)
+                }
+                return true
+            }
+            MicPurpose.TRIP_COMMAND -> { handleTripCommand(text); return true }
+            MicPurpose.STOP_CONFIRM -> { resolveTripAction(text); return true }
+            else -> return false
+        }
+    }
+
+    /**
+     * A new booking that is really a route: a saved route by name, several places in one
+     * breath, or "I have a few stops". @return true when it started a plan.
+     */
+    private fun handlePlanEntry(text: String): Boolean {
+        if (micPurpose != MicPurpose.BOOKING && micPurpose != MicPurpose.SLOT_ANSWER) return false
+        if (activeRideId != null || planStage != null || uiState.ride is RiderState.Confirming) return false
+        if (StopPlanParser.tooManyStops(text)) {
+            engine.earcon(Earcon.NOT_UNDERSTOOD)
+            speak("A ride can have up to ${TripPlan.MAX_STOPS} stops before the destination. " +
+                "Say your stops again, then where you finish.", NarrationTier.QUEUED) { openMic(MicPurpose.BOOKING) }
+            return true
+        }
+        StopPlanParser.parseTrip(text)?.let { parsed ->
+            val type = if (parsed.rideTypeWasExplicit) parsed.rideType else heldRideType ?: preferredRideType()
+            startPlan(parsed.toPlan(), type)
+            return true
+        }
+        if (StopPlanParser.isPlanStart(text)) {
+            startCollecting()
+            return true
+        }
+        return false
+    }
+
+    // ---- Step by step: "I have a few stops" ---------------------------------------------
+
+    private fun startCollecting() {
+        resetPlan()
+        planStage = PlanStage.COLLECTING
+        planRideType = heldRideType ?: preferredRideType()
+        engine.earcon(Earcon.UNDERSTOOD)
+        showPlan("Where is your first stop?")
+        speak("Okay. Where is your first stop?", NarrationTier.QUEUED) { openMic(MicPurpose.PLAN_LEG) }
+    }
+
+    private fun resolveCollect(text: String) {
+        if (StopPlanParser.isDoneAdding(text) && !collectingDestination) {
+            if (collectedLegs.isEmpty()) {
+                speak("You haven't said a stop yet. Where is your first stop?", NarrationTier.QUEUED) { openMic(MicPurpose.PLAN_LEG) }
+            } else {
+                collectingDestination = true
+                showPlan("Where do you finish?")
+                speak("And where do you finish?", NarrationTier.QUEUED) { openMic(MicPurpose.PLAN_LEG) }
+            }
+            return
+        }
+        val leg = StopPlanParser.parseLeg(text)
+        if (leg == null) {
+            planMisses++
+            if (planMisses >= 3) { resetPlan(); runLadder(unrecognised = ""); return }
+            speak("I didn't catch a place. Say it again.", NarrationTier.QUEUED) { openMic(MicPurpose.PLAN_LEG) }
+            return
+        }
+        planMisses = 0
+        engine.earcon(Earcon.UNDERSTOOD)
+        if (collectingDestination) {
+            startPlan(TripPlan(collectedLegs.toList(), leg.copy(kind = null)), planRideType, intro = "Got it.")
+            return
+        }
+        collectedLegs += leg
+        if (collectedLegs.size >= TripPlan.MAX_STOPS) {
+            collectingDestination = true
+            showPlan("Where do you finish?")
+            speak("That's ${TripPlan.MAX_STOPS} stops, the most a ride can have. Where do you finish?", NarrationTier.QUEUED) {
+                openMic(MicPurpose.PLAN_LEG)
+            }
+        } else {
+            showPlan("Next stop, or say that's all.")
+            speak("Next stop? Or say that's all.", NarrationTier.QUEUED) { openMic(MicPurpose.PLAN_LEG) }
+        }
+    }
+
+    // ---- Resolving each place, then the kinds, then the read-back ------------------------
+
+    private fun startPlan(p: TripPlan, rideType: RideType, intro: String? = null) {
+        resetPlan()
+        plan = p
+        planRideType = rideType
+        planStage = PlanStage.RESOLVING
+        engine.earcon(Earcon.UNDERSTOOD)
+        Log.i(TAG, "PLAN start stops=${p.stops.size} destination=\"${p.destination.query}\"")
+        val n = p.stops.size
+        val line = intro ?: "$n ${if (n == 1) "stop" else "stops"}, then ${p.destination.name}."
+        speak(line, NarrationTier.QUEUED) { resolveNextLeg() }
+    }
+
+    private fun resolveNextLeg() {
+        val p = plan ?: return
+        val idx = p.nextUnresolved
+        if (idx == null) { askNextKind(); return }
+        planLegIndex = idx
+        planStage = PlanStage.RESOLVING
+        val leg = p.legs[idx]
+        resolveDestination(leg.query, leg.spoken, planRideType)
+    }
+
+    private fun legLabel(idx: Int, p: TripPlan) =
+        if (idx < p.stops.size) "Stop ${TripPlan.ordinalWord(idx + 1)}" else "Destination"
+
+    /** Called instead of booking while a plan is being resolved: the place belongs to a leg. */
+    private fun onPlanLegResolved(place: PlaceOption) {
+        val p = plan ?: return
+        val idx = planLegIndex.coerceIn(0, p.legs.size - 1)
+        val leg = p.legs[idx]
+        plan = p.withLeg(idx, leg.copy(place = place, spoken = pendingSpokenAs.ifBlank { leg.spoken }))
+        pendingSpokenAs = ""
+        failureCount = 0
+        pendingMemory = null
+        engine.earcon(Earcon.UNDERSTOOD)
+        showPlan("${legLabel(idx, p)}: ${place.name}")
+        speak("${legLabel(idx, p)}: ${place.name}.", NarrationTier.QUEUED) { resolveNextLeg() }
+    }
+
+    private fun askNextKind() {
+        val p = plan ?: return
+        val i = p.nextWithoutKind
+        if (i == null) { reviewPlan(); return }
+        planStage = PlanStage.KINDS
+        planLegIndex = i
+        showPlan("At ${p.stops[i].name}: wait, drop off, or pick up?")
+        speak(
+            "At ${p.stops[i].name}, will you get out and come back, so the driver waits? " +
+                "Or are you dropping someone off, or picking someone up?",
+            NarrationTier.QUEUED
+        ) { openMic(MicPurpose.STOP_KIND) }
+    }
+
+    private fun resolveStopKind(text: String) {
+        val p = plan ?: return
+        val i = p.nextWithoutKind ?: run { reviewPlan(); return }
+        var kind = StopPlanParser.kindAnswer(text)
+        var said = ""
+        if (kind == null) {
+            planMisses++
+            if (planMisses < 2) {
+                speak("Say wait, drop off, or pick up.", NarrationTier.QUEUED) { openMic(MicPurpose.STOP_KIND) }
+                return
+            }
+            // Never guessed in the unsafe direction: a WAIT stop keeps the car until the rider's
+            // phone hears the code again, so nobody can be left behind.
+            kind = StopKind.WAIT
+            said = "I'll ask the driver to wait for you there. "
+        }
+        planMisses = 0
+        plan = p.withLeg(i, p.stops[i].copy(kind = kind))
+        engine.earcon(Earcon.UNDERSTOOD)
+        if (said.isNotEmpty()) speak(said, NarrationTier.QUEUED) { askNextKind() } else askNextKind()
+    }
+
+    private fun reviewPlan(lead: String = "") {
+        val p = plan ?: return
+        planStage = PlanStage.REVIEW
+        planMisses = 0
+        val hint = if (!planHintsGiven) {
+            planHintsGiven = true
+            " Say yes to book it. Or change it: remove stop two, swap one and two, or add a stop."
+        } else " Shall I book it?"
+        showPlan("Book this trip?")
+        speak("$lead${p.readBack()}$hint", NarrationTier.QUEUED) { openMic(MicPurpose.PLAN_REVIEW) }
+    }
+
+    private fun resolvePlanReview(text: String) {
+        val p = plan ?: return
+        when (val edit = StopPlanParser.planEdit(text)) {
+            null -> when (Classifier.classify(text, false).intent) {
+                is RiderIntent.Yes -> bookPlan()
+                is RiderIntent.No -> {
+                    showPlan("What would you like to change?")
+                    speak("What would you like to change? Say remove, swap, add a stop, or cancel.", NarrationTier.QUEUED) {
+                        openMic(MicPurpose.PLAN_REVIEW)
+                    }
+                }
+                else -> {
+                    planMisses++
+                    if (planMisses >= 3) { onCancel(); return }
+                    speak("Say yes to book it, or tell me what to change.", NarrationTier.QUEUED) { openMic(MicPurpose.PLAN_REVIEW) }
+                }
+            }
+            is StopPlanParser.PlanEdit.Remove -> {
+                val n = when {
+                    edit.stop == -1 -> p.stops.size
+                    edit.stop != null -> edit.stop
+                    else -> p.stopNamed(edit.words) ?: -99
+                }
+                applyEdit(if (n == -99) TripPlan.Edit.Refused("I couldn't tell which stop. Say remove stop one, two or three.") else p.remove(n))
+            }
+            is StopPlanParser.PlanEdit.Swap -> applyEdit(p.swap(resolveN(edit.a, p), resolveN(edit.b, p)))
+            is StopPlanParser.PlanEdit.SetKind -> applyEdit(p.setKind(resolveN(edit.stop, p), edit.kind))
+            is StopPlanParser.PlanEdit.Change -> {
+                val n = resolveN(edit.stop, p)
+                if (n !in 1..p.stops.size) applyEdit(p.remove(n))
+                else applyEdit(TripPlan.Edit.Ok(p.withLeg(n - 1, edit.leg.copy(kind = edit.leg.kind ?: p.stops[n - 1].kind, note = edit.leg.note.ifBlank { p.stops[n - 1].note })), ""))
+            }
+            is StopPlanParser.PlanEdit.Add -> applyEdit(p.add(edit.leg, edit.afterStop?.let { resolveN(it, p) }))
+            is StopPlanParser.PlanEdit.ChangeDestination -> applyEdit(TripPlan.Edit.Ok(p.copy(destination = edit.leg), ""))
+            is StopPlanParser.PlanEdit.SaveAs ->
+                speak("I can't save routes yet. Shall I book it?", NarrationTier.QUEUED) { openMic(MicPurpose.PLAN_REVIEW) }
+            StopPlanParser.PlanEdit.ReadAgain -> reviewPlan()
+        }
+    }
+
+    private fun resolveN(n: Int, p: TripPlan) = if (n == -1) p.stops.size else n
+
+    private fun applyEdit(result: TripPlan.Edit) {
+        when (result) {
+            is TripPlan.Edit.Refused -> speak(result.sentence, NarrationTier.QUEUED) { openMic(MicPurpose.PLAN_REVIEW) }
+            is TripPlan.Edit.Ok -> {
+                plan = result.plan
+                engine.earcon(Earcon.UNDERSTOOD)
+                val lead = if (result.said.isNotBlank()) result.said + " " else ""
+                when {
+                    result.plan.nextUnresolved != null -> speak(lead.ifBlank { "Okay." }, NarrationTier.QUEUED) { resolveNextLeg() }
+                    result.plan.nextWithoutKind != null -> speak(lead.ifBlank { "Okay." }, NarrationTier.QUEUED) { askNextKind() }
+                    else -> reviewPlan(lead)
+                }
+            }
+        }
+    }
+
+    private fun bookPlan() {
+        val p = plan ?: return
+        val dest = p.destination.place ?: run { resolveNextLeg(); return }
+        if (!p.isComplete) { resolveNextLeg(); return }
+        val type = planRideType
+        bookingPlan = p
+        resetPlan()
+        pendingSpokenAs = p.destination.spoken
+        Log.i(TAG, "PLAN book stops=${p.stops.size} destination=\"${dest.name}\"")
+        beginOptimisticBooking(dest, type)
+    }
+
+    /** "Go back" while planning: one step, never the whole plan. */
+    private fun planBack() {
+        val p = plan
+        when {
+            planStage == PlanStage.COLLECTING -> {
+                if (collectingDestination) collectingDestination = false
+                else if (collectedLegs.isNotEmpty()) collectedLegs.removeAt(collectedLegs.size - 1)
+                speak(if (collectedLegs.isEmpty()) "Okay. Where is your first stop?" else "Okay. Next stop, or say that's all.",
+                    NarrationTier.QUEUED) { openMic(MicPurpose.PLAN_LEG) }
+            }
+            p != null && planStage == PlanStage.RESOLVING -> {
+                speak("Okay. Say ${legLabel(planLegIndex, p).lowercase()} again.", NarrationTier.QUEUED) {
+                    openMic(MicPurpose.SLOT_ANSWER)
+                }
+            }
+            p != null && p.isComplete -> reviewPlan()
+            else -> { resetPlan(); askDestinationAgain("Okay. Where would you like to go?") }
+        }
+    }
+
+    /** Forgets the plan being built (not a booking already confirmed). */
+    private fun resetPlan() {
+        plan = null
+        planStage = null
+        planLegIndex = 0
+        planMisses = 0
+        collectedLegs.clear()
+        collectingDestination = false
+    }
+
+    private fun showPlan(prompt: String) {
+        val p = plan
+        val lines = when {
+            p != null -> p.stops.mapIndexed { i, s ->
+                "${i + 1}. ${s.name}" + (s.kind?.let { " — ${it.driverLabel}" } ?: "")
+            } + "Then ${p.destination.name}"
+            else -> collectedLegs.mapIndexed { i, s -> "${i + 1}. ${s.name}" }
+        }
+        transition(RiderState.Planning(lines, prompt), announce = false)
+    }
+
+    // ---- During the ride ----------------------------------------------------------------
+
+    private fun refreshStops(rideId: String) {
+        viewModelScope.launch {
+            val result = api.snapshot(rideId)
+            if (result is ApiResult.Ok && rideId == activeRideId) setStops(result.value.stops)
+        }
+    }
+
+    private fun setStops(stops: List<StopInfo>) {
+        activeStops = stops
+        val ride = uiState.ride
+        if (ride is RiderState.InTrip) uiState = uiState.copy(ride = ride.copy(stops = stops))
+    }
+
+    private fun currentStop(): StopInfo? = activeStops.firstOrNull { it.isOpen }
+
+    private fun nextLegLine(event: RideEvent): String {
+        val next = event.payload.optJSONObject("next") ?: return ""
+        val name = next.optString("name")
+        return if (next.optString("type") == "STOP")
+            "Next, stop ${TripPlan.ordinalWord(next.optInt("index"))}, $name."
+        else "Next, $name."
+    }
+
+    private fun onStopEvent(event: RideEvent) {
+        val name = event.string("name", "the stop")
+        val index = TripPlan.ordinalWord(event.int("index", 1))
+        val note = event.string("note")
+        activeRideId?.let(::refreshStops)
+        when (event.type) {
+            RideEventType.STOP_ARRIVED -> when (event.string("kind")) {
+                "WAIT" -> {
+                    val minutes = (event.int("waitLimitSeconds", 600) + 59) / 60
+                    narrate(event, "Stop $index, $name. Your driver will wait up to $minutes minutes. " +
+                        "When you're back at the car, press the screen and let the driver say the code.")
+                }
+                "PICKUP" -> narrate(event, "Stop $index, $name. Picking up ${note.ifBlank { "your companion" }}.")
+                else -> narrate(event, "Stop $index, $name. ${note.ifBlank { "Your companion" }.replaceFirstChar { it.uppercase() }} can get out here.")
+            }
+            RideEventType.STOP_DONE -> narrate(event, "Leaving $name. ${nextLegLine(event)}")
+            RideEventType.STOP_SKIPPED -> narrate(event, "Skipped $name. ${nextLegLine(event)}")
+            RideEventType.STOPS_CHANGED -> narrate(event, "Your stops are updated. ${nextLegLine(event)}")
+            RideEventType.WAIT_WARNING -> {
+                if (currentStop()?.riderBack == true) return
+                val left = event.int("secondsLeft", 60)
+                narrate(event, if (left <= 60) "One minute left. Your driver is waiting at $name."
+                else "${(left + 59) / 60} minutes left before your driver needs you back at $name.")
+            }
+            RideEventType.WAIT_OVERDUE -> narrate(event,
+                "Your driver has been waiting a long time at $name. Cab Eye support has been told and may call you. " +
+                    "If you need help, press S O S.")
+            // This phone's own confirmation; already spoken when the code was heard.
+            else -> Unit
+        }
+    }
+
+    /** Mid-ride words: only stop commands mean anything; anything else answers "where are we". */
+    private fun handleTripCommand(text: String) {
+        when (val cmd = StopPlanParser.tripCommand(text)) {
+            StopPlanParser.TripCommand.ImBack -> {
+                val stop = currentStop()
+                if (stop?.status == "WAITING" && !stop.riderBack) listenForStopCode("Welcome back. Ask the driver to say the code.")
+                else speak("You're already on the way.", NarrationTier.QUEUED)
+            }
+            is StopPlanParser.TripCommand.Skip -> {
+                val target = if (cmd.stop == null) currentStop()
+                else activeStops.firstOrNull { it.index == (if (cmd.stop == -1) activeStops.lastOrNull { s -> s.isOpen }?.index else cmd.stop) && it.isOpen }
+                when {
+                    target == null -> speak("There are no more stops on this ride.", NarrationTier.QUEUED)
+                    target.status == "WAITING" -> speak("You're at that stop now. Get back in and the driver will move on.", NarrationTier.QUEUED)
+                    else -> {
+                        pendingTripAction = TripAction.Skip(target)
+                        speak("Skip ${target.name}? Say yes or no.", NarrationTier.QUEUED) { openMic(MicPurpose.STOP_CONFIRM) }
+                    }
+                }
+            }
+            StopPlanParser.TripCommand.ReadStops -> speak(remainingStopsLine(), NarrationTier.QUEUED)
+            is StopPlanParser.TripCommand.AddStop -> addStopMidTrip(cmd.leg)
+            null -> speakStatus()
+        }
+    }
+
+    private fun remainingStopsLine(): String {
+        val open = activeStops.filter { it.isOpen }
+        val dest = (uiState.ride as? RiderState.InTrip)?.destination ?: lastBooking?.first ?: "your destination"
+        if (open.isEmpty()) return "No more stops. Next, $dest."
+        return open.joinToString(" ") { s ->
+            "Stop ${TripPlan.ordinalWord(s.index)}, ${s.name}, ${StopKind.parse(s.kind).spoken}."
+        } + " Then $dest."
+    }
+
+    private fun listenForStopCode(prompt: String) {
+        codeForStop = true
+        codeVerified = false
+        speak(prompt, NarrationTier.QUEUED) { openMic(MicPurpose.CODE_VERIFY) }
+    }
+
+    private fun addStopMidTrip(leg: PlannedLeg) {
+        val used = activeStops.count { it.status != "SKIPPED" }
+        if (used >= TripPlan.MAX_STOPS) {
+            speak("This ride already has ${TripPlan.MAX_STOPS} stops, which is the most it can have.", NarrationTier.QUEUED)
+            return
+        }
+        viewModelScope.launch {
+            val place = findPlaceQuietly(leg)
+            onMain {
+                if (place == null) {
+                    speak("I couldn't find ${leg.query}. Try again with a nearby landmark.", NarrationTier.QUEUED)
+                } else {
+                    addingStopMidTrip = leg.copy(place = place)
+                    speak("Add ${place.name} as a stop. Will you get out and come back, so the driver waits? " +
+                        "Or is someone getting off, or getting on?", NarrationTier.QUEUED) { openMic(MicPurpose.STOP_KIND) }
+                }
+            }
+        }
+    }
+
+    private fun resolveMidTripKind(text: String) {
+        val leg = addingStopMidTrip ?: return
+        val kind = StopPlanParser.kindAnswer(text) ?: StopKind.WAIT
+        addingStopMidTrip = null
+        pendingTripAction = TripAction.Add(leg.copy(kind = kind))
+        speak("${leg.name}, ${kind.spoken}. Add it? Say yes or no.", NarrationTier.QUEUED) { openMic(MicPurpose.STOP_CONFIRM) }
+    }
+
+    private fun resolveTripAction(text: String) {
+        val action = pendingTripAction ?: return
+        pendingTripAction = null
+        val rideId = activeRideId ?: return
+        if (Classifier.classify(text, true).intent !is RiderIntent.Yes) {
+            speak("Okay, no change.", NarrationTier.QUEUED)
+            return
+        }
+        viewModelScope.launch {
+            val result = when (action) {
+                is TripAction.Skip -> api.skipStop(rideId, action.stop.stopId)
+                is TripAction.Add -> {
+                    val upcoming = org.json.JSONArray()
+                    activeStops.filter { it.status == "PENDING" }.forEach { s ->
+                        upcoming.put(org.json.JSONObject().put("stopId", s.stopId).put("name", s.name).put("kind", s.kind)
+                            .put("note", s.note).put("address", s.address)
+                            .apply { s.latitude?.let { put("latitude", it) }; s.longitude?.let { put("longitude", it) } })
+                    }
+                    upcoming.put(stopsJson(listOf(action.leg)).getJSONObject(0))
+                    api.replaceStops(rideId, upcoming)
+                }
+            }
+            onMain {
+                when (result) {
+                    is ApiResult.Ok -> setStops(result.value.stops) // the server's event says what changed
+                    is ApiResult.Failed -> speak(result.spoken, NarrationTier.QUEUED)
+                }
+            }
+        }
+    }
+
+    /** A place for a mid-ride stop, found without leaving the ride screen. */
+    private suspend fun findPlaceQuietly(leg: PlannedLeg): PlaceOption? {
+        if (app.memory.enabled) {
+            PreferenceMemoryAgent.direct(leg.spoken, app.memory.current, memoryMoment())?.place?.toOption()?.let { return it }
+        }
+        val candidates = if (BuildConfig.GOOGLE_MAPS_API_KEY.isNotBlank()) {
+            val location = runCatching { app.locationProvider.current() }.getOrNull()
+            app.placeResolver.search(leg.query, location).getOrNull().orEmpty()
+        } else emptyList()
+        val all = candidates.ifEmpty { Gazetteer.score(leg.query) }
+        return (MatchGate.evaluate(leg.spoken, all) as? MatchGate.Decision.Proceed)?.top
     }
 
     // =================================================================================
@@ -3595,6 +4237,22 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             "schedule" -> startScheduling(fromIdle = false)
             "confirm" -> if (ride is RiderState.NextJourney && ride.step == NextStep.CONFIRM) saveSchedule()
             "done" -> endPostRide("Okay. Hold anywhere when you need a ride.")
+            // Multi-stop buttons, for a sighted helper.
+            "im-back" -> {
+                val stop = currentStop()
+                if (stop != null && stop.status == "WAITING" && !stop.riderBack) {
+                    listenForStopCode("Welcome back. Ask the driver to say the code.")
+                }
+            }
+            "plan-yes" -> if (planStage == PlanStage.REVIEW) bookPlan()
+            "plan-no" -> when {
+                planStage == PlanStage.REVIEW -> {
+                    showPlan("What would you like to change?")
+                    speak("What would you like to change? Say remove, swap, add a stop, or cancel.", NarrationTier.QUEUED) {
+                        openMic(MicPurpose.PLAN_REVIEW)
+                    }
+                }
+            }
         }
     }
 
@@ -3825,6 +4483,11 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
      * otherwise part of the "five second window" would be spent listening to the app talk.
      */
     private fun beginOptimisticBooking(place: PlaceOption, rideType: RideType, note: String = "") {
+        // While a route is being planned, a found place belongs to the leg being asked about.
+        if (planStage == PlanStage.RESOLVING && plan != null) {
+            onPlanLegResolved(place)
+            return
+        }
         cancelWindowJob?.cancel()
         silenceJob?.cancel()
         lastBooking = place.name to rideType
@@ -3855,7 +4518,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         engine.earcon(Earcon.BOOKING_CONFIRMED)
 
         speak(
-            buildBookingAnnouncement(place, rideType, note),
+            bookingPlan?.let { planAnnouncement(it, place, rideType) } ?: buildBookingAnnouncement(place, rideType, note),
             NarrationTier.QUEUED,
             onStart = {
                 // T4 — the moment the rider first HEARS something.
@@ -3885,6 +4548,13 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         } else {
             "Booking ${rideType.spokenName} to ${place.name}$why. Say cancel to stop."
         }
+    }
+
+    /** "Booking auto to PSG College, with 2 stops: Apollo Pharmacy, then Gandhipuram. Say cancel to stop." */
+    private fun planAnnouncement(p: TripPlan, place: PlaceOption, rideType: RideType): String {
+        val n = p.stops.size
+        val stops = p.stops.joinToString(", then ") { it.name }
+        return "Booking ${rideType.spokenName} to ${place.name}, with $n ${if (n == 1) "stop" else "stops"}: $stops. Say cancel to stop."
     }
 
     private var bookingStartedAt: Long = System.currentTimeMillis()
@@ -3939,11 +4609,14 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                 contactName = chosenContact?.name.orEmpty(),
                 contactPhone = chosenContact?.phone.orEmpty(),
                 dropNote = chosenDropNote,
-                spokenAs = pendingSpokenAs.also { pendingSpokenAs = "" }
+                spokenAs = pendingSpokenAs.also { pendingSpokenAs = "" },
+                stops = bookingPlan?.stops.orEmpty()
             )) {
                 is ApiResult.Ok -> {
                     val snapshot = result.value
                     activeRideId = snapshot.rideId
+                    activeStops = snapshot.stops
+                    bookingPlan = null
                     expectedCode = snapshot.boardingCode
                     // A new ride: the last ride's payment panel and watcher belong to it, not this.
                     paymentPollJob?.cancel()
@@ -3960,6 +4633,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                     // The booking failed, and this is the moment a silent app would be at its
                     // most dangerous: the rider has been told a cab is coming. It is not.
                     Log.w(TAG, "RIDE creation failed: ${result.detail}")
+                    bookingPlan = null
                     engine.heartbeat(false)
                     engine.earcon(Earcon.ERROR)
                     transition(RiderState.Idle, announce = false)
@@ -3990,6 +4664,10 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         codeVerified = false
         codeListenJob?.cancel()
         codeListenJob = null
+        activeStops = emptyList()
+        codeForStop = false
+        pendingTripAction = null
+        addingStopMidTrip = null
         uiState = uiState.copy(selectedDestination = null)
         NarrationService.stop(getApplication())
     }
@@ -4162,6 +4840,18 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun handleSpeechError(error: SpeechError) {
+        // Mid-ride stop words: never a reason to leave the ride screen.
+        if (micPurpose == MicPurpose.TRIP_COMMAND || micPurpose == MicPurpose.STOP_CONFIRM ||
+            (micPurpose == MicPurpose.STOP_KIND && addingStopMidTrip != null) ||
+            (micPurpose == MicPurpose.CODE_VERIFY && codeForStop)
+        ) {
+            pendingTripAction = null
+            addingStopMidTrip = null
+            if (error == SpeechError.NO_MATCH || error == SpeechError.NO_SPEECH) {
+                speak("I didn't catch that. Press the screen to try again.", NarrationTier.QUEUED)
+            }
+            return
+        }
         if (micPurpose == MicPurpose.CANCEL_WINDOW) {
             if (uiState.ride is RiderState.Confirming) openMic(MicPurpose.CANCEL_WINDOW)
             return
@@ -4204,6 +4894,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
 
         if (consecutiveSpeechErrors > MAX_CONSECUTIVE_ERRORS) {
             consecutiveSpeechErrors = 0
+            resetPlan()
             pendingOptions = null
             pendingNearMiss = null
             engine.earcon(Earcon.ERROR)
@@ -4269,6 +4960,13 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                 return
             }
 
+            MicPurpose.PLAN_LEG, MicPurpose.STOP_KIND, MicPurpose.PLAN_REVIEW -> {
+                speak("Sorry, I didn't catch that. $lastSpoken", NarrationTier.QUEUED) { openMic(micPurpose) }
+                return
+            }
+
+            MicPurpose.TRIP_COMMAND, MicPurpose.STOP_CONFIRM -> return
+
             MicPurpose.MEMORY_ANSWER -> {
                 val pending = pendingMemory
                 if (pending != null) {
@@ -4304,6 +5002,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     /** Applies a server snapshot to the screen without narrating anything. */
     private fun applySnapshot(snapshot: RideSnapshot, announce: Boolean) {
         expectedCode = snapshot.boardingCode.ifBlank { expectedCode }
+        activeStops = snapshot.stops
 
         val driver = DriverInfo(
             name = snapshot.driverName.ifBlank { "Your driver" },
@@ -4323,7 +5022,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                 driver, expectedCode, Headphones.connected(getApplication())
             )
             RidePhase.SEATED, RidePhase.IN_TRIP -> RiderState.InTrip(
-                snapshot.destination, snapshot.etaMinutes, driver
+                snapshot.destination, snapshot.etaMinutes, driver, snapshot.stops
             )
             RidePhase.COMPLETED -> RiderState.Done(
                 snapshot.destination, snapshot.fareRupees, snapshot.durationMinutes

@@ -622,8 +622,73 @@ fun RiderSurface(
                             text = "About ${ride.etaMinutes} minutes remaining to destination.",
                             color = palette.listening
                         )
+                        if (ride.stops.isNotEmpty()) {
+                            val current = ride.currentStop
+                            Spacer(Modifier.height(CabEyeSpacing.md))
+                            SupportingText(
+                                text = ride.stops.joinToString("\n") { s ->
+                                    val mark = when (s.status) {
+                                        "DONE" -> "✓"
+                                        "SKIPPED" -> "–"
+                                        "WAITING", "ARRIVED" -> "●"
+                                        else -> "○"
+                                    }
+                                    "$mark ${s.index}. ${s.name}" + if (s.isWait) " (driver waits)" else ""
+                                } + "\nThen ${ride.destination}",
+                                color = palette.onBackground
+                            )
+                            if (current != null && current.status == "WAITING" && !current.riderBack) {
+                                Spacer(Modifier.height(CabEyeSpacing.md))
+                                PrimaryAction(
+                                    label = "I'M BACK — CHECK CODE",
+                                    onClick = { onPostRideAction("im-back") }
+                                )
+                                Spacer(Modifier.height(CabEyeSpacing.sm))
+                                SecondaryAction(
+                                    label = "CODE IS RIGHT",
+                                    onClick = onCodeConfirmed
+                                )
+                            }
+                        }
                         Spacer(Modifier.height(CabEyeSpacing.md))
                         DriverCard(driver = ride.driver)
+                    }
+
+                    // -----------------------------------------------------------------
+                    // Multi-stop planning: the route as read back, for a sighted helper
+                    // -----------------------------------------------------------------
+                    is RiderState.Planning -> {
+                        StatusIndicator(
+                            label = "PLANNING STOPS",
+                            icon = "⋯",
+                            accent = palette.processing
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.md))
+                        StateHeadline(
+                            text = ride.prompt,
+                            color = palette.onBackground
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.md))
+                        SupportingText(
+                            text = ride.lines.joinToString("\n"),
+                            color = palette.listening
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.xl))
+                        PrimaryAction(
+                            label = "BOOK",
+                            onClick = { onPostRideAction("plan-yes") }
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.sm))
+                        SecondaryAction(
+                            label = "CHANGE",
+                            onClick = { onPostRideAction("plan-no") }
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.sm))
+                        SecondaryAction(
+                            label = "CANCEL",
+                            onClick = onCancel,
+                            accentColor = palette.danger
+                        )
                     }
 
                     // -----------------------------------------------------------------
@@ -1142,5 +1207,6 @@ private fun hapticFor(uiState: RiderUiState): HapticPattern {
         is RiderState.Done -> HapticPattern.TRIP_COMPLETED
         is RiderState.Feedback -> HapticPattern.CLARIFY
         is RiderState.NextJourney -> HapticPattern.CLARIFY
+        is RiderState.Planning -> HapticPattern.CLARIFY
     }
 }

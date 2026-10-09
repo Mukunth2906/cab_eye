@@ -16,7 +16,11 @@ import java.util.List;
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class AdminCase {
 
-    public enum Kind { FEEDBACK, SOS }
+    public enum Kind {
+        FEEDBACK, SOS,
+        /** Multi-stop: the rider did not come back to the car within the WAIT stop's limit. */
+        STOP_OVERDUE
+    }
 
     public enum Status { NEW, ACKNOWLEDGED, RESOLVED }
 

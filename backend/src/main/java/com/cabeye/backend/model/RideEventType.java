@@ -83,7 +83,23 @@ public enum RideEventType {
      * while its payment settles. Payload: {@code status}, {@code paymentRef},
      * {@code fareRupees}, and {@code reason} on failure.
      */
-    PAYMENT_UPDATED;
+    PAYMENT_UPDATED,
+
+    // ---- Multi-stop rides (see RideStop) -------------------------------------------------
+    /** The car reached a stop. Payload: the stop, and for WAIT the wait limit. */
+    STOP_ARRIVED,
+    /** WAIT stop: the rider's phone heard the boarding code again — they are back in the car. */
+    RIDER_RETURNED,
+    /** The driver finished a stop (dropped, picked up, or the rider is back). */
+    STOP_DONE,
+    /** The rider dropped a stop from the route. */
+    STOP_SKIPPED,
+    /** The rider added, removed or reordered stops still to come. Payload: the full list. */
+    STOPS_CHANGED,
+    /** WAIT stop reminder: half the wait used, then one minute left. */
+    WAIT_WARNING,
+    /** WAIT stop: the wait limit passed and the rider is not back. The admin is alerted. */
+    WAIT_OVERDUE;
 
     /** @return true when {@code name} is a member of this enum, case-sensitively. */
     public static boolean isLifecycleType(String name) {

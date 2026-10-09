@@ -135,7 +135,9 @@ class RideApi(private val settings: AppSettings, private val auth: AuthStore) {
         contactName: String = "",
         contactPhone: String = "",
         dropNote: String = "",
-        spokenAs: String = ""
+        spokenAs: String = "",
+        /** Multi-stop: the stops before the destination, in order. Empty = an ordinary ride. */
+        stops: List<com.cabeye.rider.trip.PlannedLeg> = emptyList()
     ): ApiResult<RideSnapshot> {
         val body = JSONObject()
             .put("destination", destination)
@@ -152,6 +154,7 @@ class RideApi(private val settings: AppSettings, private val auth: AuthStore) {
         if (destinationLongitude != null) body.put("destinationLongitude", destinationLongitude)
         if (pickupLatitude != null) body.put("pickupLatitude", pickupLatitude)
         if (pickupLongitude != null) body.put("pickupLongitude", pickupLongitude)
+        if (stops.isNotEmpty()) body.put("stops", stopsJson(stops))
         return postForSnapshot("${base()}/rides", body)
     }
 
@@ -275,6 +278,41 @@ class RideApi(private val settings: AppSettings, private val auth: AuthStore) {
     /** Reports whether the code the rider heard the driver say matched the expected one. */
     suspend fun confirmCode(rideId: String, matched: Boolean): ApiResult<RideSnapshot> =
         postForSnapshot("${base()}/rides/$rideId/code", JSONObject().put("matched", matched))
+
+    // ---- Multi-stop ------------------------------------------------------------------
+    // Refusals carry the server's own sentence ("Your passenger is not back yet…"), so every
+    // failure goes through preferServerSentence.
+
+    /** Rider: drop one stop. */
+    suspend fun skipStop(rideId: String, stopId: String): ApiResult<RideSnapshot> =
+        stopCall("${base()}/rides/$rideId/stops/$stopId/skip", JSONObject())
+
+    /** Rider: replace the stops still ahead (add / remove / reorder). [upcoming] carry stopIds when kept. */
+    suspend fun replaceStops(rideId: String, upcoming: JSONArray): ApiResult<RideSnapshot> {
+        val request = Request.Builder()
+            .url("${base()}/rides/$rideId/stops")
+            .put(JSONObject().put("stops", upcoming).toString().toRequestBody(JSON))
+            .build()
+        return snapshotOrSentence(call(request))
+    }
+
+    /** Driver: reached the stop. */
+    suspend fun stopArrived(rideId: String, stopId: String): ApiResult<RideSnapshot> =
+        stopCall("${base()}/rides/$rideId/stops/$stopId/arrived", JSONObject())
+
+    /** Driver: finished the stop (a WAIT stop only once the passenger's phone confirmed the code). */
+    suspend fun stopDone(rideId: String, stopId: String): ApiResult<RideSnapshot> =
+        stopCall("${base()}/rides/$rideId/stops/$stopId/done", JSONObject())
+
+    private suspend fun stopCall(url: String, body: JSONObject): ApiResult<RideSnapshot> =
+        snapshotOrSentence(call(post(url, body)))
+
+    private fun snapshotOrSentence(result: ApiResult<String>): ApiResult<RideSnapshot> = when (result) {
+        is ApiResult.Ok -> RideSnapshot.parse(result.value)
+            ?.let { ApiResult.Ok(it) }
+            ?: ApiResult.Failed("The server sent something I couldn't read.", result.value.take(200))
+        is ApiResult.Failed -> result.preferServerSentence()
+    }
 
     suspend fun cancel(rideId: String, reason: String = ""): ApiResult<RideSnapshot> =
         postForSnapshot("${base()}/rides/$rideId/cancel", JSONObject().put("reason", reason))
@@ -583,4 +621,21 @@ fun ApiResult.Failed.preferServerSentence(): ApiResult.Failed {
     val json = detail.substringAfter(": ", "")
     val said = runCatching { JSONObject(json).optString("error", "") }.getOrDefault("")
     return if (said.isNotBlank()) ApiResult.Failed(said, detail) else this
+}
+
+/** The stop list as the server's POST /rides and PUT /rides/{id}/stops read it. */
+fun stopsJson(stops: List<com.cabeye.rider.trip.PlannedLeg>): JSONArray = JSONArray().apply {
+    stops.forEach { leg ->
+        val o = JSONObject()
+            .put("name", leg.name)
+            .put("kind", (leg.kind ?: com.cabeye.rider.trip.StopKind.WAIT).name)
+            .put("spokenAs", leg.spoken)
+            .put("note", leg.note)
+        leg.place?.let { p ->
+            o.put("latitude", p.latitude).put("longitude", p.longitude)
+            if (p.formattedAddress.isNotBlank()) o.put("address", p.formattedAddress)
+            if (p.placeId.isNotBlank()) o.put("placeId", p.placeId)
+        }
+        put(o)
+    }
 }

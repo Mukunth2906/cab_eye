@@ -51,8 +51,19 @@ fun announcementFor(uiState: RiderUiState): String {
                 "Your driver has arrived. Ask the driver to say the four-digit boarding code."
         }
 
-        is RiderState.InTrip ->
-            "On the way to ${ride.destination}, approximately ${ride.etaMinutes} minutes remaining."
+        is RiderState.InTrip -> {
+            val stop = ride.currentStop
+            when {
+                stop == null ->
+                    "On the way to ${ride.destination}, approximately ${ride.etaMinutes} minutes remaining."
+                stop.status == "WAITING" && !stop.riderBack ->
+                    "Stopped at ${stop.name}. Your driver is waiting. When you are back, press I'm back and let the driver say the code."
+                else -> "Next stop ${stop.index}, ${stop.name}. Then ${ride.destination}."
+            }
+        }
+
+        is RiderState.Planning ->
+            "Planning your stops. ${ride.lines.joinToString(". ")}. ${ride.prompt}"
 
         is RiderState.Done -> {
             val payment = uiState.payment
@@ -196,6 +207,17 @@ fun buildCustomActions(
                 actions += CustomAccessibilityAction("Schedule it") { onPostRideAction("confirm"); true }
             }
             actions += CustomAccessibilityAction("Done") { onPostRideAction("done"); true }
+        }
+        is RiderState.Planning -> {
+            actions += CustomAccessibilityAction("Book this trip") { onPostRideAction("plan-yes"); true }
+            actions += CustomAccessibilityAction("Change the stops") { onPostRideAction("plan-no"); true }
+            actions += CustomAccessibilityAction("Cancel") { onCancel(); true }
+        }
+        is RiderState.InTrip -> {
+            val stop = ride.currentStop
+            if (stop != null && stop.status == "WAITING" && !stop.riderBack) {
+                actions += CustomAccessibilityAction("I'm back, check the code") { onPostRideAction("im-back"); true }
+            }
         }
         else -> Unit
     }
