@@ -4,6 +4,7 @@ import com.cabeye.backend.model.Ride;
 import com.cabeye.backend.model.RideEvent;
 import com.cabeye.backend.model.RideEventType;
 import com.cabeye.backend.model.RidePhase;
+import com.cabeye.backend.model.RideStop;
 import com.cabeye.backend.websocket.RideSessionManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -58,9 +59,22 @@ public class RideService {
      * memory and its constructor stays the one the tests already use.
      */
     private final List<Consumer<Ride>> completionListeners = new CopyOnWriteArrayList<>();
+    private final com.cabeye.backend.redis.RedisBridge redisBridge;
+    private final com.cabeye.backend.store.Table<com.cabeye.backend.model.RideRecord> rideTable;
 
     public RideService(RideSessionManager sessions) {
+        this(sessions, null, null);
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public RideService(RideSessionManager sessions,
+                       @org.springframework.beans.factory.annotation.Autowired(required = false)
+                       com.cabeye.backend.store.DataDirectory data,
+                       @org.springframework.beans.factory.annotation.Autowired(required = false)
+                       com.cabeye.backend.redis.RedisBridge redisBridge) {
         this.sessions = sessions;
+        this.redisBridge = redisBridge;
+        this.rideTable = data != null ? data.table("rides", com.cabeye.backend.model.RideRecord.class) : null;
     }
 
     public void onCompleted(Consumer<Ride> listener) {
@@ -108,12 +122,34 @@ public class RideService {
     // ===================================================================================
 
     public Optional<Ride> find(String rideId) {
-        return Optional.ofNullable(rides.get(rideId));
+        if (rideId == null) return Optional.empty();
+        Ride local = rides.get(rideId);
+
+        if (rideTable != null) {
+            Optional<com.cabeye.backend.model.RideRecord> record = rideTable.get(rideId);
+            if (record.isPresent()) {
+                com.cabeye.backend.model.RideRecord r = record.get();
+                if (local == null || r.lastSeq > local.lastSeq()) {
+                    try {
+                        Ride restored = Ride.fromRecord(r);
+                        rides.put(rideId, restored);
+                        return Optional.of(restored);
+                    } catch (RuntimeException e) {
+                        log.warn("Failed to restore ride {} from persistence: {}", rideId, e.getMessage());
+                    }
+                }
+            }
+        }
+        return Optional.ofNullable(local);
     }
 
     /** @return true when this ride genuinely exists — the scope check for the debug endpoint. */
     public boolean exists(String rideId) {
-        return rideId != null && rides.containsKey(rideId);
+        return find(rideId).isPresent();
+    }
+
+    private Ride getRide(String rideId) {
+        return find(rideId).orElse(null);
     }
 
     public Collection<Ride> all() {
@@ -122,6 +158,13 @@ public class RideService {
 
     /** Rides a driver may accept: requested, unassigned, not terminal. */
     public List<Ride> openRequests() {
+        if (rideTable != null) {
+            for (com.cabeye.backend.model.RideRecord r : rideTable.all()) {
+                if ("REQUESTED".equals(r.phase) && r.driverId == null) {
+                    find(r.rideId); // refresh
+                }
+            }
+        }
         List<Ride> out = new ArrayList<>();
         for (Ride ride : rides.values()) {
             if (ride.phase() == RidePhase.REQUESTED && ride.driverId() == null) {
@@ -180,16 +223,44 @@ public class RideService {
                        String contactPhone,
                        String dropNote,
                        String rideType) {
-        String rideId = "ride-" + rideCounter.incrementAndGet();
+        return create(riderId, destination, destinationAddress, destinationLatitude,
+                destinationLongitude, destinationPlaceId, pickupLatitude, pickupLongitude,
+                contactName, contactPhone, dropNote, rideType, List.of());
+    }
+
+    /**
+     * Creates a ride with intermediate stops (Uber/Rapido-style multi-stop). {@code stops} are
+     * validated by {@link #prepareNewStops} — at most {@link #MAX_STOPS}, each with a name.
+     *
+     * @throws StopRefused with a speakable sentence when the stop list is not acceptable
+     */
+    public Ride create(String riderId,
+                       String destination,
+                       String destinationAddress,
+                       Double destinationLatitude,
+                       Double destinationLongitude,
+                       String destinationPlaceId,
+                       Double pickupLatitude,
+                       Double pickupLongitude,
+                       String contactName,
+                       String contactPhone,
+                       String dropNote,
+                       String rideType,
+                       List<RideStop> stops) {
+        List<RideStop> prepared = prepareNewStops(stops, 0);
+        Long clusterSeq = (redisBridge != null && redisBridge.isEnabled()) ? redisBridge.incrementRideCounter() : null;
+        String rideId = "ride-" + (clusterSeq != null ? clusterSeq : rideCounter.incrementAndGet());
         String code = generateBoardingCode();
 
         Ride ride = new Ride(rideId, riderId, destination, destinationAddress,
                 destinationLatitude, destinationLongitude, destinationPlaceId,
                 pickupLatitude, pickupLongitude, contactName, contactPhone, dropNote, rideType, code);
+        if (!prepared.isEmpty()) ride.withStops(list -> list.addAll(prepared));
         rides.put(rideId, ride);
 
         Map<String, Object> payload = new HashMap<>();
         payload.put("rideId", rideId);
+        if (!prepared.isEmpty()) payload.put("stops", ride.copyStops());
         payload.put("riderId", riderId);
         payload.put("destination", destination);
         payload.put("destinationAddress", destinationAddress);
@@ -210,8 +281,8 @@ public class RideService {
         // accepted anything — so this is a separate fan-out, not a duplicate of the line above.
         sessions.broadcast(DISPATCH_TOPIC, event);
 
-        log.info("RIDE_CREATED ride={} rider={} destination=\"{}\" type={} code={}",
-                rideId, riderId, destination, rideType, code);
+        log.info("RIDE_CREATED ride={} rider={} destination=\"{}\" type={} code={} stops={}",
+                rideId, riderId, destination, rideType, code, prepared.size());
         for (Consumer<Ride> listener : createdListeners) {
             try {
                 listener.accept(ride);
@@ -230,7 +301,7 @@ public class RideService {
                                               String vehiclePlate,
                                               String driverPhone,
                                               int etaMinutes) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null || ride.phase() != RidePhase.REQUESTED || ride.driverId() != null) {
             return Optional.empty();
         }
@@ -271,7 +342,7 @@ public class RideService {
      * transition the reconnect logic would then have to reconcile against.
      */
     public Optional<Ride> location(String rideId, String driverId, int distanceMeters, float bearingDeg) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null || ride.phase().isTerminal()) {
             return Optional.empty();
         }
@@ -292,7 +363,7 @@ public class RideService {
      * produced at the ear that needs it.
      */
     public Optional<Ride> positionPreset(String rideId, String driverId, String text) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null || ride.phase().isTerminal()) {
             return Optional.empty();
         }
@@ -302,7 +373,7 @@ public class RideService {
 
     /** Audio beacon, panned on the rider's phone to the bearing given here. */
     public Optional<Ride> beacon(String rideId, String driverId, float bearingDeg) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null || ride.phase().isTerminal()) {
             return Optional.empty();
         }
@@ -318,7 +389,7 @@ public class RideService {
      * loss permitted to interrupt.
      */
     public Optional<Ride> arrived(String rideId, String driverId) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null || ride.phase().isTerminal()) {
             return Optional.empty();
         }
@@ -332,9 +403,14 @@ public class RideService {
 
     /** The rider's app verified the code it heard the driver say aloud. */
     public Optional<Ride> confirmCode(String rideId, String riderId, boolean matched) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null || ride.phase().isTerminal()) {
             return Optional.empty();
+        }
+        // Mid-trip, the only reason to check the code again is a rider getting back in at a
+        // WAIT stop. It never touches the pickup confirmation, which is already history.
+        if (ride.phase() == RidePhase.IN_TRIP) {
+            return riderReturned(ride, riderId, matched);
         }
         ride.codeConfirmed(matched);
         publish(ride, RideEventType.CODE_CONFIRMED, riderId, "RIDER", Map.of("matched", matched));
@@ -349,7 +425,7 @@ public class RideService {
      * see a car start moving, so "the trip started" must never be able to precede "they are in".
      */
     public Optional<Ride> passengerSeated(String rideId, String driverId) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null || ride.phase().isTerminal()) {
             return Optional.empty();
         }
@@ -368,7 +444,7 @@ public class RideService {
 
     /** Starts the journey. Refuses unless the passenger has been confirmed seated. */
     public Optional<Ride> startTrip(String rideId, String driverId, int etaMinutes) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null || ride.phase() != RidePhase.SEATED) {
             log.warn("TRIP_START_REFUSED ride={} phase={} (passenger not confirmed seated)",
                     rideId, ride == null ? "MISSING" : ride.phase());
@@ -385,8 +461,14 @@ public class RideService {
 
     /** Ends the journey. */
     public Optional<Ride> complete(String rideId, String driverId, int fareRupees, int durationMinutes) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null || ride.phase().isTerminal()) {
+            return Optional.empty();
+        }
+        // A stop still to visit — or a rider still outside at a WAIT stop — means the ride is
+        // not over. Ending it would strand a blind passenger at an errand.
+        if (ride.hasOpenStops()) {
+            log.warn("COMPLETE_REFUSED ride={} (stop {} still open)", rideId, ride.currentStopIndex());
             return Optional.empty();
         }
         ride.phase(RidePhase.COMPLETED);
@@ -410,7 +492,7 @@ public class RideService {
 
     /** Cancelled by either party. */
     public Optional<Ride> cancel(String rideId, String actorId, String actorRole, String reason) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null || ride.phase().isTerminal()) {
             return Optional.empty();
         }
@@ -424,7 +506,7 @@ public class RideService {
 
     /** Route deviation. Tier 0 on the rider's phone. */
     public Optional<Ride> deviation(String rideId, String note) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null || ride.phase().isTerminal()) {
             return Optional.empty();
         }
@@ -448,7 +530,7 @@ public class RideService {
      * @return how many events were sent
      */
     public int replayTo(String rideId, long afterSeq, org.springframework.web.socket.WebSocketSession session) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null) {
             return 0;
         }
@@ -495,7 +577,7 @@ public class RideService {
      * whereas a false success costs an unpaid fare nobody notices.
      */
     public synchronized Optional<Ride> reportPayment(String rideId, String status, String txnRef) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null) return Optional.empty();
 
         // A settled fare is never downgraded by a late or stale claim from the phone. Without
@@ -539,7 +621,7 @@ public class RideService {
      * @param bankRef the settlement reference; null or blank keeps whatever was recorded
      */
     public synchronized Optional<Ride> confirmPayment(String rideId, String bankRef) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null) return Optional.empty();
         ride.paymentStatus(Ride.PaymentStatus.CONFIRMED);
         if (bankRef != null && !bankRef.isBlank()) ride.paymentRef(bankRef);
@@ -553,7 +635,7 @@ public class RideService {
      * after a successful payment does not un-pay the ride.
      */
     public synchronized Optional<Ride> failPayment(String rideId, String reason) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null) return Optional.empty();
         if (ride.paymentStatus() == Ride.PaymentStatus.CONFIRMED) return Optional.of(ride);
         ride.paymentStatus(Ride.PaymentStatus.FAILED);
@@ -595,7 +677,7 @@ public class RideService {
     private Optional<Ride> transition(String rideId, RidePhase to, RideEventType type,
                                       String actorId, Map<String, Object> payload,
                                       RidePhase... allowedFrom) {
-        Ride ride = rides.get(rideId);
+        Ride ride = getRide(rideId);
         if (ride == null || ride.phase().isTerminal()) {
             return Optional.empty();
         }
@@ -611,6 +693,294 @@ public class RideService {
         }
         ride.phase(to);
         publish(ride, type, actorId, "DRIVER", payload);
+        return Optional.of(ride);
+    }
+
+    // ===================================================================================
+    //  Multi-stop rides — see RideStop for the kinds and the safety rule
+    // ===================================================================================
+
+    /** Uber allows two or three intermediate stops depending on the city; three here. */
+    public static final int MAX_STOPS = 3;
+
+    /** Ten minutes by default: a blind rider's errand takes longer than Uber's three. */
+    private volatile int defaultWaitSeconds = 600;
+
+    public void setDefaultWaitSeconds(int seconds) {
+        this.defaultWaitSeconds = Math.max(60, seconds);
+    }
+
+    public int defaultWaitSeconds() {
+        return defaultWaitSeconds;
+    }
+
+    /** A refused stop action, with a sentence the phone can speak or the driver can read. */
+    public static class StopRefused extends RuntimeException {
+        public final int status;
+
+        public StopRefused(int status, String sentence) {
+            super(sentence);
+            this.status = status;
+        }
+    }
+
+    /**
+     * Cleans a list of new stops: names required, kinds parsed, fresh ids, PENDING, the wait
+     * limit stamped. {@code alreadyUsed} counts stops on the ride that still occupy a slot.
+     */
+    List<RideStop> prepareNewStops(List<RideStop> in, int alreadyUsed) {
+        if (in == null || in.isEmpty()) return new ArrayList<>();
+        if (in.size() + alreadyUsed > MAX_STOPS) {
+            throw new StopRefused(400, "A ride can have up to " + MAX_STOPS + " stops before the destination.");
+        }
+        List<RideStop> out = new ArrayList<>();
+        for (RideStop raw : in) {
+            if (raw == null || raw.name == null || raw.name.isBlank()) {
+                throw new StopRefused(400, "Every stop needs a place.");
+            }
+            RideStop s = raw.copy();
+            s.name = raw.name.trim();
+            if (s.kind == null) s.kind = RideStop.Kind.DROP;
+            if (s.stopId == null || s.stopId.isBlank()) s.stopId = "stop-" + Long.toString(random.nextLong() & Long.MAX_VALUE, 36);
+            s.status = RideStop.Status.PENDING;
+            s.arrivedAt = 0;
+            s.waitStartedAt = 0;
+            s.doneAt = 0;
+            s.riderBack = false;
+            s.warnedHalf = false;
+            s.warnedLastMinute = false;
+            s.overdue = false;
+            s.waitLimitSeconds = s.kind == RideStop.Kind.WAIT ? defaultWaitSeconds : 0;
+            out.add(s);
+        }
+        return out;
+    }
+
+    /** The car reached the stop it was heading to. Driver only, in order, during the trip. */
+    public synchronized Ride stopArrived(String rideId, String driverId, String stopId) {
+        Ride ride = requireTrip(rideId);
+        RideStop arrived = ride.withStops(list -> {
+            RideStop current = currentOpen(list);
+            if (current == null) throw new StopRefused(409, "There are no more stops. Drive to the destination.");
+            if (stopId != null && !stopId.isBlank() && !stopId.equals(current.stopId)) {
+                throw new StopRefused(409, "That isn't the next stop. Stops are visited in order.");
+            }
+            if (current.status != RideStop.Status.PENDING) {
+                throw new StopRefused(409, "You've already arrived at this stop.");
+            }
+            long now = System.currentTimeMillis();
+            current.arrivedAt = now;
+            if (current.kind == RideStop.Kind.WAIT) {
+                current.status = RideStop.Status.WAITING;
+                current.waitStartedAt = now;
+            } else {
+                current.status = RideStop.Status.ARRIVED;
+            }
+            return current.copy();
+        });
+        Map<String, Object> payload = stopPayload(arrived);
+        payload.put("waitLimitSeconds", arrived.waitLimitSeconds);
+        publish(ride, RideEventType.STOP_ARRIVED, driverId, "DRIVER", payload);
+        log.info("STOP_ARRIVED ride={} stop={} kind={} name=\"{}\"", rideId, arrived.index, arrived.kind, arrived.name);
+        return ride;
+    }
+
+    /**
+     * The driver finished the stop: dropped someone, picked someone up, or — at a WAIT stop —
+     * the rider is back. A WAIT stop cannot be finished until the rider's phone has heard the
+     * code again, so the car can never leave with the wrong person or without its passenger.
+     */
+    public synchronized Ride stopDone(String rideId, String driverId, String stopId) {
+        Ride ride = requireTrip(rideId);
+        long now = System.currentTimeMillis();
+        RideStop done = ride.withStops(list -> {
+            RideStop current = currentOpen(list);
+            if (current == null || (stopId != null && !stopId.isBlank() && !stopId.equals(current.stopId))) {
+                throw new StopRefused(409, "That stop is already finished.");
+            }
+            if (current.status == RideStop.Status.PENDING) {
+                throw new StopRefused(409, "Tap Arrived at stop first.");
+            }
+            if (current.kind == RideStop.Kind.WAIT && !current.riderBack) {
+                throw new StopRefused(409, "Your passenger is not back yet. Wait for their phone to confirm the code.");
+            }
+            current.status = RideStop.Status.DONE;
+            current.doneAt = now;
+            return current.copy();
+        });
+        Map<String, Object> payload = stopPayload(done);
+        payload.put("waitedSeconds", done.waitedSeconds(now));
+        payload.put("next", nextLeg(ride));
+        publish(ride, RideEventType.STOP_DONE, driverId, "DRIVER", payload);
+        log.info("STOP_DONE ride={} stop={} kind={} waited={}s", rideId, done.index, done.kind, done.waitedSeconds(now));
+        return ride;
+    }
+
+    /** The rider drops a stop they no longer need — one still ahead, or one just reached. */
+    public synchronized Ride skipStop(String rideId, String riderId, String stopId) {
+        Ride ride = requireLive(rideId);
+        RideStop skipped = ride.withStops(list -> {
+            RideStop target = null;
+            for (RideStop s : list) {
+                if (s.stopId.equals(stopId)) target = s;
+            }
+            if (target == null) throw new StopRefused(404, "I can't find that stop.");
+            if (target.status == RideStop.Status.WAITING) {
+                throw new StopRefused(409, "You're at that stop now. Get back in and the driver will move on.");
+            }
+            if (!target.status.isOpen()) throw new StopRefused(409, "That stop is already behind you.");
+            target.status = RideStop.Status.SKIPPED;
+            target.doneAt = System.currentTimeMillis();
+            return target.copy();
+        });
+        Map<String, Object> payload = stopPayload(skipped);
+        payload.put("next", nextLeg(ride));
+        publish(ride, RideEventType.STOP_SKIPPED, riderId, "RIDER", payload);
+        return ride;
+    }
+
+    /**
+     * Replaces the stops still ahead (PENDING) with {@code upcoming}, keeping every stop that is
+     * finished, skipped or being visited exactly where it is. Covers add, remove and reorder —
+     * the rider's phone sends the list it read back and the rider confirmed.
+     */
+    public synchronized Ride replaceUpcomingStops(String rideId, String riderId, List<RideStop> upcoming) {
+        Ride ride = requireLive(rideId);
+        ride.withStops(list -> {
+            List<RideStop> kept = new ArrayList<>();
+            Map<String, RideStop> pendingById = new HashMap<>();
+            int used = 0;
+            for (RideStop s : list) {
+                if (s.status == RideStop.Status.PENDING) {
+                    pendingById.put(s.stopId, s);
+                } else {
+                    kept.add(s);
+                    if (s.status != RideStop.Status.SKIPPED) used++;
+                }
+            }
+            List<RideStop> fresh = prepareNewStops(upcoming, used);
+            // A stop the rider merely moved keeps its id, so a driver's tap on it still lands.
+            for (int i = 0; i < fresh.size(); i++) {
+                RideStop wanted = upcoming.get(i);
+                if (wanted.stopId != null && pendingById.containsKey(wanted.stopId)) {
+                    fresh.get(i).stopId = wanted.stopId;
+                }
+            }
+            list.clear();
+            list.addAll(kept);
+            list.addAll(fresh);
+            return null;
+        });
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("stops", ride.copyStops());
+        payload.put("next", nextLeg(ride));
+        publish(ride, RideEventType.STOPS_CHANGED, riderId, "RIDER", payload);
+        log.info("STOPS_CHANGED ride={} stops={}", rideId, ride.copyStops().size());
+        return ride;
+    }
+
+    /**
+     * Reminders and the overdue alarm for riders out at a WAIT stop. Called by
+     * {@link com.cabeye.backend.service.StopWaitMonitor} every few seconds; pure on {@code now}
+     * so it is testable without waiting ten minutes.
+     */
+    public void checkWaits(long now) {
+        for (Ride ride : new ArrayList<>(rides.values())) {
+            if (ride.phase() != RidePhase.IN_TRIP) continue;
+            List<Object[]> due = new ArrayList<>();
+            ride.withStops(list -> {
+                for (RideStop s : list) {
+                    if (s.status != RideStop.Status.WAITING || s.riderBack || s.waitLimitSeconds <= 0) continue;
+                    long waited = (now - s.waitStartedAt) / 1000;
+                    long left = s.waitLimitSeconds - waited;
+                    if (left <= 0 && !s.overdue) {
+                        s.overdue = true;
+                        due.add(new Object[]{RideEventType.WAIT_OVERDUE, s.copy(), 0L});
+                    } else if (left > 0 && left <= 60 && !s.warnedLastMinute) {
+                        s.warnedLastMinute = true;
+                        s.warnedHalf = true;
+                        due.add(new Object[]{RideEventType.WAIT_WARNING, s.copy(), left});
+                    } else if (left > 60 && waited >= s.waitLimitSeconds / 2 && !s.warnedHalf) {
+                        s.warnedHalf = true;
+                        due.add(new Object[]{RideEventType.WAIT_WARNING, s.copy(), left});
+                    }
+                }
+                return null;
+            });
+            for (Object[] d : due) {
+                RideStop s = (RideStop) d[1];
+                Map<String, Object> payload = stopPayload(s);
+                payload.put("secondsLeft", d[2]);
+                payload.put("waitedSeconds", s.waitedSeconds(now));
+                publish(ride, (RideEventType) d[0], "server", "SYSTEM", payload);
+                if (d[0] == RideEventType.WAIT_OVERDUE) {
+                    log.warn("WAIT_OVERDUE ride={} stop={} name=\"{}\" waited={}s", ride.rideId(), s.index, s.name, s.waitedSeconds(now));
+                }
+            }
+        }
+    }
+
+    private Ride requireLive(String rideId) {
+        Ride ride = getRide(rideId);
+        if (ride == null) throw new StopRefused(404, "I can't find that ride any more.");
+        if (ride.phase().isTerminal()) throw new StopRefused(409, "That ride has already ended.");
+        return ride;
+    }
+
+    private Ride requireTrip(String rideId) {
+        Ride ride = requireLive(rideId);
+        if (ride.phase() != RidePhase.IN_TRIP) throw new StopRefused(409, "Start the trip first.");
+        return ride;
+    }
+
+    private static RideStop currentOpen(List<RideStop> list) {
+        for (RideStop s : list) if (s.status.isOpen()) return s;
+        return null;
+    }
+
+    /** What the car heads to next: the next open stop, or the destination. */
+    private static Map<String, Object> nextLeg(Ride ride) {
+        Map<String, Object> next = new HashMap<>();
+        for (RideStop s : ride.copyStops()) {
+            if (s.status.isOpen()) {
+                next.put("type", "STOP");
+                next.put("index", s.index);
+                next.put("name", s.name);
+                next.put("kind", s.kind.name());
+                return next;
+            }
+        }
+        next.put("type", "DESTINATION");
+        next.put("name", ride.destination());
+        return next;
+    }
+
+    static Map<String, Object> stopPayload(RideStop s) {
+        Map<String, Object> m = new HashMap<>();
+        m.put("stopId", s.stopId);
+        m.put("index", s.index);
+        m.put("kind", s.kind.name());
+        m.put("status", s.status.name());
+        m.put("name", s.name);
+        if (s.address != null) m.put("address", s.address);
+        if (s.latitude != null) m.put("latitude", s.latitude);
+        if (s.longitude != null) m.put("longitude", s.longitude);
+        if (s.note != null) m.put("note", s.note);
+        return m;
+    }
+
+    private Optional<Ride> riderReturned(Ride ride, String riderId, boolean matched) {
+        RideStop back = ride.withStops(list -> {
+            RideStop current = currentOpen(list);
+            if (current == null || current.status != RideStop.Status.WAITING) return null;
+            if (matched) current.riderBack = true;
+            return current.copy();
+        });
+        if (back == null) return Optional.of(ride); // nothing to confirm mid-trip: harmless
+        Map<String, Object> payload = stopPayload(back);
+        payload.put("matched", matched);
+        publish(ride, RideEventType.RIDER_RETURNED, riderId, "RIDER", payload);
+        log.info("RIDER_RETURNED ride={} stop={} matched={}", ride.rideId(), back.index, matched);
         return Optional.of(ride);
     }
 

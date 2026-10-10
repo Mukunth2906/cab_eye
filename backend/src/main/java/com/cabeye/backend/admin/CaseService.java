@@ -56,6 +56,9 @@ public class CaseService {
         }
         if (copied > 0) log.info("ADMIN inbox: copied {} earlier feedback item(s)", copied);
         feedback.onSubmitted(f -> fromFeedback(f, true));
+        rides.onEvent((ride, event) -> {
+            if ("WAIT_OVERDUE".equals(event.type())) stopOverdue(ride, event.payload());
+        });
     }
 
     static String caseId(FeedbackRecord f) {
@@ -87,6 +90,39 @@ public class CaseService {
         cases.put(id, c);
 
         if (alert && becameUrgent) sendAlert(c);
+        return c;
+    }
+
+    /**
+     * Multi-stop: the rider went out at a WAIT stop and has not come back within the limit.
+     * Urgent — a blind rider may be lost or need help — so the admin gets Telegram and email,
+     * with the stop's location and the rider's emergency contact to call.
+     */
+    AdminCase stopOverdue(Ride ride, java.util.Map<String, Object> stop) {
+        String stopId = String.valueOf(stop.getOrDefault("stopId", "stop"));
+        String id = "stop-" + ride.rideId() + "-" + stopId;
+        if (cases.get(id).isPresent()) return cases.get(id).get();
+        long now = System.currentTimeMillis();
+        AdminCase c = new AdminCase();
+        c.id = id;
+        c.kind = AdminCase.Kind.STOP_OVERDUE;
+        c.urgent = true;
+        c.rideId = ride.rideId();
+        c.createdAt = now;
+        c.updatedAt = now;
+        Object name = stop.get("name");
+        long waited = stop.get("waitedSeconds") instanceof Number n ? n.longValue() : 0;
+        c.text = "Rider has not come back to the car at stop " + stop.getOrDefault("index", "?")
+                + (name == null ? "" : " (" + name + ")") + " after " + Math.max(1, waited / 60) + " minutes.";
+        if (stop.get("latitude") instanceof Number lat && stop.get("longitude") instanceof Number lng) {
+            c.latitude = lat.doubleValue();
+            c.longitude = lng.doubleValue();
+            c.locationAt = now;
+        }
+        fillPeople(c, ride.riderId(), ride.driverId());
+        cases.put(id, c);
+        sendAlert(c);
+        log.warn("ADMIN case {} opened: rider not back ride={} stop={}", id, ride.rideId(), stopId);
         return c;
     }
 

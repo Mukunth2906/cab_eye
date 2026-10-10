@@ -21,6 +21,8 @@ public class PaymentOrderRecord {
     public String bankRef;
     public String failureReason;
     public Instant paidAt;
+    /** Razorpay order ID (starts with order_), or empty when using the sandbox mock. */
+    public String razorpayOrderId;
 
     public PaymentOrderRecord() {}
 }

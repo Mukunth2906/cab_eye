@@ -28,10 +28,19 @@ public class HealthController {
 
     private final RideSessionManager sessions;
     private final RideService rides;
+    private final org.springframework.jdbc.core.JdbcTemplate jdbc;
+    private final com.cabeye.backend.redis.RedisBridge redisBridge;
 
-    public HealthController(RideSessionManager sessions, RideService rides) {
+    public HealthController(RideSessionManager sessions,
+                            RideService rides,
+                            @org.springframework.beans.factory.annotation.Autowired(required = false)
+                            org.springframework.jdbc.core.JdbcTemplate jdbc,
+                            @org.springframework.beans.factory.annotation.Autowired(required = false)
+                            com.cabeye.backend.redis.RedisBridge redisBridge) {
         this.sessions = sessions;
         this.rides = rides;
+        this.jdbc = jdbc;
+        this.redisBridge = redisBridge;
     }
 
     /** Liveness check. Open {@code /health} in a browser — if you see JSON, the backend is up. */
@@ -44,6 +53,32 @@ public class HealthController {
         body.put("openRequests", rides.openRequests().size());
         body.put("socketTopics", sessions.snapshot());
         return body;
+    }
+
+    /** Readiness check for ALB target groups. Verifies DB and Redis connectivity. */
+    @GetMapping("/ready")
+    public org.springframework.http.ResponseEntity<Map<String, Object>> ready() {
+        Map<String, Object> body = new HashMap<>();
+        boolean dbOk = true;
+        if (jdbc != null) {
+            try {
+                jdbc.queryForObject("SELECT 1", Integer.class);
+            } catch (Exception e) {
+                dbOk = false;
+                body.put("databaseError", e.getMessage());
+            }
+        }
+        boolean redisOk = redisBridge == null || redisBridge.ping();
+
+        body.put("status", (dbOk && redisOk) ? "READY" : "NOT_READY");
+        body.put("database", dbOk ? "UP" : "DOWN");
+        body.put("redis", redisOk ? "UP" : (redisBridge != null && redisBridge.isEnabled() ? "DOWN" : "NOT_CONFIGURED"));
+
+        if (dbOk && redisOk) {
+            return org.springframework.http.ResponseEntity.ok(body);
+        } else {
+            return org.springframework.http.ResponseEntity.status(503).body(body);
+        }
     }
 
     /**

@@ -243,7 +243,7 @@
     if (fresh.length) {
       beep();
       const c = casesCache.find(x => x.id === fresh[0]);
-      announce("New urgent " + (c.kind === "SOS" ? "S O S" : "feedback") + " on " + (c.rideId || "a ride"));
+      announce("New urgent " + (c.kind === "SOS" ? "S O S" : c.kind === "STOP_OVERDUE" ? "alert: rider not back at a stop" : "feedback") + " on " + (c.rideId || "a ride"));
       if ("Notification" in window && Notification.permission === "granted") {
         new Notification("Cab Eye: urgent " + (c.kind === "SOS" ? "SOS" : "feedback"), { body: c.text || c.rideId || "" });
       }
@@ -303,7 +303,7 @@
   function caseCard(c) {
     const statusChip = c.status === "RESOLVED" ? h("span", { class: "chip ok" }, "Resolved")
       : c.status === "ACKNOWLEDGED" ? h("span", { class: "chip warn" }, "Acknowledged") : h("span", { class: "chip" }, "New");
-    const title = c.kind === "SOS" ? "SOS" : "Feedback" + (c.category ? " · " + c.category.toLowerCase() : "");
+    const title = c.kind === "SOS" ? "SOS" : c.kind === "STOP_OVERDUE" ? "Rider not back at a stop" : "Feedback" + (c.category ? " · " + c.category.toLowerCase() : "");
     const noteBox = h("textarea", { "aria-label": "Note for " + c.id, placeholder: "Add a note (what you did, who you called)…",
       onfocus: () => busy = true, onblur: () => busy = false });
     const setStatus = (s) => async () => { await api("cases/" + c.id + "/status", { method: "POST", body: { status: s } }); await refresh(); render(); };

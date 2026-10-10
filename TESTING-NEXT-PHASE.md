@@ -9,9 +9,9 @@ and the next journey (book now / schedule / done).
 
 ```powershell
 cd backend
-.\gradlew.bat test          # AuthEndpointTest, MemoryEndpointTest, FeedbackEndpointTest + existing
+.\gradlew.bat test          # AuthEndpointTest, MemoryEndpointTest, FeedbackEndpointTest, MultiStopEndpointTest, MultiStopMemoryTest + existing
 cd ..\android
-.\gradlew.bat testDebugUnitTest   # AuthLogicTest, DialogueFlowTest, MemoryAgentTest, PostRideTest + existing
+.\gradlew.bat testDebugUnitTest   # AuthLogicTest, DialogueFlowTest, MemoryAgentTest, PostRideTest, TripPlanTest, RoutineAgentTest, WalkRouteTest + existing
 .\gradlew.bat assembleDebug
 ```
 
@@ -105,3 +105,82 @@ Logs: `adb logcat -s CabEye.Dialogue CabEye.Memory` — look for `MEMORY proacti
 | "give feedback" later from idle | Feedback for the last finished ride |
 
 Quick scheduling test: say "schedule a ride" → "in 2 minutes" → a place → "yes", then wait.
+
+## 6. Multi-stop rides (Uber/Rapido style) — up to 3 stops, then the destination
+
+Two phones (rider + driver), both signed in. Every booking still goes through the 5-second cancel window.
+
+**Planning by voice (rider)**
+
+| Say / do | Expected |
+|---|---|
+| "Take me to PSG College via Apollo Pharmacy" | "1 stop, then PSG College." → looks up each place (same clarify / did-you-mean questions as always) → "At Apollo Pharmacy, will you get out and come back, so the driver waits? Or are you dropping someone off, or picking someone up?" |
+| "wait for me at the pharmacy, then drop my friend at Gandhipuram, then college" | Kinds taken from the words — no kind questions; read-back "Stop one, Apollo Pharmacy, the driver waits for you. Stop two, Gandhipuram, dropping someone off, my friend. Then PSG College." |
+| "I have a few stops" | "Where is your first stop?" → place → "Next stop? Or say that's all." → "that's all" → "And where do you finish?" |
+| Four stops in one breath | "A ride can have up to 3 stops before the destination…" |
+| At the read-back: "remove stop two" / "swap one and two" / "add a stop at the ATM after stop one" / "change stop one to MedPlus" / "make stop two a wait" / "change the destination to home" / "read it again" | Each edit is said back, then the new read-back |
+| "save this as Monday errands" | "Saved as Monday errands. Next time just say book Monday errands…" |
+| "yes" | "Booking auto to PSG College, with 2 stops: Apollo Pharmacy, then Gandhipuram. Say cancel to stop." |
+| "go back" during the cancel window | Back to the read-back, not to the start |
+| Later: "book Monday errands" | The saved route, read back for a yes |
+| Kind question unclear twice | "I'll ask the driver to wait for you there." (never the unsafe guess) |
+
+**During the ride**
+
+| Do | Expected |
+|---|---|
+| Trip starts | "On the way. First stop, Apollo Pharmacy. Then PSG College." |
+| Driver taps ARRIVED AT STOP (WAIT stop) | Rider: "Stop one, Apollo Pharmacy. Your driver will wait up to 10 minutes…"; driver's DONE is locked |
+| Rider presses the screen (or I'M BACK), driver says the code | "That's the right code. Welcome back." → driver banner "Passenger is back…", DONE unlocks |
+| Driver tries DONE before that / COMPLETE TRIP with a stop open | Refused by the server with the sentence on the banner |
+| Wrong code heard at the stop | "That is not the right code. Do not get in…"; DONE stays locked |
+| Rider waits past half-time / last minute | "N minutes left…" / "One minute left…" |
+| Rider not back after 10 min (`cabeye.stops.wait-minutes`) | Rider phone told support was alerted; admin page gets an urgent "Rider not back at a stop" case with the stop's location; Telegram/email alert |
+| DROP / PICKUP stop | "Stop two, Gandhipuram. My friend can get out here." → driver DROPPED — CONTINUE |
+| Press during the ride, say "skip the next stop" → "yes" | Skipped, next leg announced; skipping the stop you're standing at is refused |
+| "what are my stops" | Remaining stops read out |
+| "add a stop at the ATM" → kind → "yes" | Added (max 3 counting finished ones); driver banner "Passenger changed the stops" |
+| "cancel" while adding a stop mid-ride | "Okay, no change." — the ride is never cancelled from here |
+
+## 7. Memory agent with routes — "be the user"
+
+Habits need weeks of rides, so seed them (LOCAL backend only):
+
+```powershell
+$env:CABEYE_OTP_EXPOSE="true"; $env:CABEYE_MEMORY_SIMULATOR="true"
+cd backend; .\gradlew bootRun          # leave running; open a new terminal at the repo root for the next line
+python scripts\seed_history.py --phone <your rider number> --demo-now --live-ride
+```
+
+Then reopen the rider app (signed in with that number), stay idle at home:
+
+| When | Expected |
+|---|---|
+| Now (with `--demo-now`) | "It's … Your usual route, like most <today> <part of day>: Apollo Pharmacy, then PSG College of Technology. Shall I plan it?" → "yes" → kinds already known → read-back → yes → cancel window |
+| Turn it down | Not offered again this session; "Where would you like to go?" |
+| Monday ~8:40 | The pharmacy-then-college route |
+| Tue–Fri ~8:40 | Just "Going to PSG College of Technology, like most weekday mornings?" — the Monday route is NOT offered |
+| Wednesday ~18:00 from college | "…like most Wednesday evenings: Race Course, then Home" |
+| "take me to the medical shop" | Books Apollo Pharmacy (learned alias), with the cancel window |
+| "my places" / "forget my history" | Lists / clears places, trips and saved routes |
+
+The simulator answers 404 unless `CABEYE_MEMORY_SIMULATOR=true`; it is pinned off in `application-prod.properties`.
+
+## 8. Walking routes — from the cab to the door (on-phone only)
+
+Outdoors first (GPS + steps), then try a corridor indoors (steps + compass only). Keep location permission on.
+
+| Do / say | Expected |
+|---|---|
+| "record my walk to the clinic door" (first time) | Consent question: steps, direction and position kept on this phone only → "yes" → "Recording. Walk as you normally would…"; notification "Recording your walk" |
+| Walk; press and say "kerb here", "bakery smell on my left", "turning left" | "Noted: the kerb." / "Noted: the bakery smell on your left." / "Turn left." |
+| Press and say "the big yellow sign" | Refused: "I'll only keep things you can feel, hear or smell…" |
+| "I'm there" | Saved, with the cue line read back ("Right at the kerb, left …, then the glass door") |
+| "how do I get to the clinic" | Whole route in O&M style, distances in metres and your steps, ends with "I can't tell whether the way is clear." — never books a cab |
+| "guide me to the clinic" | Part 1 read; press + "next" at each turn; "repeat", "more detail", "less detail", "previous", "I'm there", "stop" |
+| Walk the route 3 times, then ask again | Shorter (BRIEF); from the 6th walk just the landmarks; asking "repeat" / "more detail" holds it back |
+| Walk it with a deliberate detour (take a longer way) | "This walk was different from the route I saved. Part 1 was about 45 metres this time; I had about 20. Shall I update the saved route?" |
+| After a walk where a landmark is 2+ weeks old | "Was the bakery smell still there?" → "no" twice removes it; "the bakery smell is the cue for the left turn" moves it |
+| Book a cab to the place the walk was recorded from, finish the ride | "I have your walk from here to the clinic door. Say guide me when you're ready." |
+| In the cab, press and say "tell me the walk" | Preview of the walk, no guidance until you're out |
+| "my walking routes" / "forget the route to the clinic" / "export my walking log" | List / delete / share sheet with a CSV |

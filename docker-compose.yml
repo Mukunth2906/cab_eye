@@ -1,0 +1,76 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: cabeye-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: cabeye
+      POSTGRES_USER: cabeye
+      POSTGRES_PASSWORD: cabeye_local_pwd
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cabeye -d cabeye"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: cabeye-redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  app-1:
+    image: cabeye-backend:latest
+    container_name: cabeye-app-1
+    restart: unless-stopped
+    environment:
+      CABEYE_DB_URL: jdbc:postgresql://postgres:5432/cabeye
+      CABEYE_DB_USER: cabeye
+      CABEYE_DB_PASSWORD: cabeye_local_pwd
+      CABEYE_REDIS_ENABLED: "true"
+      CABEYE_REDIS_HOST: redis
+      CABEYE_REDIS_PORT: "6379"
+      CABEYE_OTP_EXPOSE: "true"
+    ports:
+      - "8081:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  app-2:
+    image: cabeye-backend:latest
+    container_name: cabeye-app-2
+    restart: unless-stopped
+    environment:
+      CABEYE_DB_URL: jdbc:postgresql://postgres:5432/cabeye
+      CABEYE_DB_USER: cabeye
+      CABEYE_DB_PASSWORD: cabeye_local_pwd
+      CABEYE_REDIS_ENABLED: "true"
+      CABEYE_REDIS_HOST: redis
+      CABEYE_REDIS_PORT: "6379"
+      CABEYE_OTP_EXPOSE: "true"
+    ports:
+      - "8082:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  nginx:
+    image: nginx:alpine
+    container_name: cabeye-loadbalancer
+    restart: unless-stopped
+    ports:
+      - "8088:80"
+    volumes:
+      - ./docker/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app-1
+      - app-2

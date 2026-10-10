@@ -56,7 +56,9 @@ sealed interface DriverState {
         // building. Blank on an ordinary ride.
         val contactName: String = "",
         val contactPhone: String = "",
-        val dropNote: String = ""
+        val dropNote: String = "",
+        /** Multi-stop: the stops before the destination, in order. Empty for A-to-B. */
+        val stops: List<com.cabeye.rider.net.StopInfo> = emptyList()
     ) : DriverState
 
     /**
@@ -125,8 +127,13 @@ sealed interface DriverState {
         val destinationAddress: String = "",
         val contactName: String = "",
         val contactPhone: String = "",
-        val dropNote: String = ""
-    ) : DriverState
+        val dropNote: String = "",
+        /** Multi-stop: every stop with its status, as the server last reported it. */
+        val stops: List<com.cabeye.rider.net.StopInfo> = emptyList()
+    ) : DriverState {
+        /** Where the car goes next: the first open stop, or null for the destination. */
+        val currentStop: com.cabeye.rider.net.StopInfo? get() = stops.firstOrNull { it.isOpen }
+    }
 
     /** Journey finished. */
     data class Complete(

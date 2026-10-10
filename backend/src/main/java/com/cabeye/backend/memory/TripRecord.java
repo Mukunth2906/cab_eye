@@ -27,6 +27,28 @@ public class TripRecord {
     public int dayOfWeek;
     public int fareRupees;
     public int durationMinutes;
+    /**
+     * Multi-stop: the stops actually visited, in order (skipped ones left out). With the
+     * destination this is the route the rider took — what the phone's RoutineAgent learns
+     * repeated routes from ("pharmacy, then office, most Monday mornings").
+     */
+    public java.util.List<TripStop> stops;
+
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class TripStop {
+        public String placeKey;
+        public String name;
+        public String kind;
+
+        public TripStop() {}
+
+        public TripStop(String placeKey, String name, String kind) {
+            this.placeKey = placeKey;
+            this.name = name;
+            this.kind = kind;
+        }
+    }
 
     public TripRecord() {}
 }

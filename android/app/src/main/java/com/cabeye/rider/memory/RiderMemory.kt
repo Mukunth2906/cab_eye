@@ -11,7 +11,9 @@ import org.json.JSONObject
 data class RiderMemory(
     val places: List<VisitedPlace> = emptyList(),
     val trips: List<TripRecord> = emptyList(),
-    val stats: MemoryStats = MemoryStats()
+    val stats: MemoryStats = MemoryStats(),
+    /** Routes the rider named — "Monday errands". See [SavedRoute]. */
+    val routes: List<SavedRoute> = emptyList()
 ) {
     val isEmpty: Boolean get() = places.isEmpty()
 
@@ -19,6 +21,7 @@ data class RiderMemory(
         .put("places", JSONArray().apply { places.forEach { put(it.toJson()) } })
         .put("trips", JSONArray().apply { trips.forEach { put(it.toJson()) } })
         .put("stats", stats.toJson())
+        .put("routes", JSONArray().apply { routes.forEach { put(it.toJson()) } })
 
     companion object {
         val EMPTY = RiderMemory()
@@ -26,7 +29,8 @@ data class RiderMemory(
         fun parse(o: JSONObject): RiderMemory = RiderMemory(
             places = o.optJSONArray("places").objects().mapNotNull { runCatching { VisitedPlace.parse(it) }.getOrNull() },
             trips = o.optJSONArray("trips").objects().mapNotNull { runCatching { TripRecord.parse(it) }.getOrNull() },
-            stats = o.optJSONObject("stats")?.let(MemoryStats::parse) ?: MemoryStats()
+            stats = o.optJSONObject("stats")?.let(MemoryStats::parse) ?: MemoryStats(),
+            routes = o.optJSONArray("routes").objects().mapNotNull { runCatching { SavedRoute.parse(it) }.getOrNull() }
         )
 
         fun parse(raw: String?): RiderMemory? =
@@ -97,7 +101,9 @@ data class TripRecord(
     /** Local hour 0–23 at booking. */
     val hour: Int = 0,
     /** ISO day of week, 1 = Monday … 7 = Sunday. */
-    val dayOfWeek: Int = 1
+    val dayOfWeek: Int = 1,
+    /** Multi-stop: the stops actually visited, in order. Empty for an A-to-B trip. */
+    val stops: List<TripStop> = emptyList()
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("rideId", rideId).put("placeKey", placeKey).put("destination", destination)
@@ -105,6 +111,7 @@ data class TripRecord(
         .put("pickupLatitude", pickupLatitude ?: JSONObject.NULL)
         .put("pickupLongitude", pickupLongitude ?: JSONObject.NULL)
         .put("rideType", rideType).put("bookedAt", bookedAt).put("hour", hour).put("dayOfWeek", dayOfWeek)
+        .put("stops", JSONArray().apply { stops.forEach { put(it.toJson()) } })
 
     companion object {
         fun parse(o: JSONObject) = TripRecord(
@@ -117,7 +124,80 @@ data class TripRecord(
             rideType = o.optString("rideType", "AUTO"),
             bookedAt = o.optLong("bookedAt", 0),
             hour = o.optInt("hour", 0),
-            dayOfWeek = o.optInt("dayOfWeek", 1)
+            dayOfWeek = o.optInt("dayOfWeek", 1),
+            stops = o.optJSONArray("stops").objects().mapNotNull { runCatching { TripStop.parse(it) }.getOrNull() }
+        )
+    }
+}
+
+/** One stop of a past multi-stop trip. */
+data class TripStop(val placeKey: String, val name: String, val kind: String = "DROP") {
+    fun toJson(): JSONObject = JSONObject().put("placeKey", placeKey).put("name", name).put("kind", kind)
+
+    companion object {
+        fun parse(o: JSONObject) = TripStop(
+            placeKey = o.getString("placeKey"),
+            name = o.optString("name", ""),
+            kind = o.optString("kind", "DROP")
+        )
+    }
+}
+
+/**
+ * A route the rider named ("Monday errands"), saved on the server. Stops in order, then the
+ * destination. Places carry coordinates when they were resolved at save time.
+ */
+data class SavedRoute(
+    val name: String,
+    val key: String,
+    val stops: List<RouteLeg>,
+    val destination: RouteLeg,
+    val rideType: String = "AUTO",
+    val useCount: Int = 0
+) {
+    fun toJson(): JSONObject = JSONObject()
+        .put("name", name).put("key", key).put("rideType", rideType).put("useCount", useCount)
+        .put("stops", JSONArray().apply { stops.forEach { put(it.toJson()) } })
+        .put("destination", destination.toJson())
+
+    companion object {
+        fun parse(o: JSONObject) = SavedRoute(
+            name = o.getString("name"),
+            key = o.optString("key", "").ifBlank { o.getString("name").lowercase() },
+            stops = o.optJSONArray("stops").objects().map(RouteLeg::parse),
+            destination = RouteLeg.parse(o.getJSONObject("destination")),
+            rideType = o.optString("rideType", "AUTO"),
+            useCount = o.optInt("useCount", 0)
+        )
+    }
+}
+
+data class RouteLeg(
+    val name: String,
+    val address: String = "",
+    val latitude: Double? = null,
+    val longitude: Double? = null,
+    val placeId: String = "",
+    /** DROP / PICKUP / WAIT for a stop; blank for the destination. */
+    val kind: String = "",
+    val note: String = ""
+) {
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("name", name).put("address", address)
+        put("latitude", latitude ?: JSONObject.NULL).put("longitude", longitude ?: JSONObject.NULL)
+        put("placeId", placeId).put("note", note)
+        if (kind.isNotBlank()) put("kind", kind)
+    }
+
+    companion object {
+        fun parse(o: JSONObject) = RouteLeg(
+            name = o.optString("name", ""),
+            address = o.optString("address", "").takeUnless { it == "null" }.orEmpty(),
+            latitude = o.optDoubleOrNull("latitude"),
+            longitude = o.optDoubleOrNull("longitude"),
+            placeId = o.optString("placeId", "").takeUnless { it == "null" }.orEmpty(),
+            kind = o.optString("kind", "").takeUnless { it == "null" }.orEmpty(),
+            note = o.optString("note", "").takeUnless { it == "null" }.orEmpty()
         )
     }
 }

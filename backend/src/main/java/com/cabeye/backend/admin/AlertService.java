@@ -160,6 +160,7 @@ public class AlertService {
 
     String subjectFor(AdminCase c) {
         String what = c.kind == AdminCase.Kind.SOS ? "SOS"
+                : c.kind == AdminCase.Kind.STOP_OVERDUE ? "Rider not back at a stop"
                 : "Feedback" + (c.category == null ? "" : " (" + c.category + ")");
         return (c.urgent ? "URGENT · " : "") + what + " · " + (c.rideId == null ? "no ride" : c.rideId);
     }

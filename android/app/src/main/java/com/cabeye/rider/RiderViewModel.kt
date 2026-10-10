@@ -64,6 +64,29 @@ import com.cabeye.rider.memory.SuggestionKind
 import com.cabeye.rider.memory.VisitedPlace
 import java.time.ZoneId
 import kotlinx.coroutines.Dispatchers
+import com.cabeye.rider.memory.RouteLeg
+import com.cabeye.rider.memory.RoutineAgent
+import com.cabeye.rider.memory.SavedRoute
+import com.cabeye.rider.net.StopInfo
+import com.cabeye.rider.net.stopsJson
+import com.cabeye.rider.trip.PlannedLeg
+import com.cabeye.rider.trip.StopKind
+import com.cabeye.rider.trip.StopPlanParser
+import com.cabeye.rider.trip.TripPlan
+import com.cabeye.rider.walk.DetailLevel
+import com.cabeye.rider.walk.Landmark
+import com.cabeye.rider.walk.RouteBuilder
+import com.cabeye.rider.walk.RouteMemory
+import com.cabeye.rider.walk.Side
+import com.cabeye.rider.walk.TurnDirection
+import com.cabeye.rider.walk.WalkCommands
+import com.cabeye.rider.walk.WalkEvent
+import com.cabeye.rider.walk.WalkLogEntry
+import com.cabeye.rider.walk.WalkNarrator
+import com.cabeye.rider.walk.WalkRecorder
+import com.cabeye.rider.walk.WalkRecordingService
+import com.cabeye.rider.walk.WalkRoute
+import com.cabeye.rider.walk.WalkStore
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -147,7 +170,31 @@ private enum class MicPurpose {
      * "stop camera". Only camera words mean anything here. Nothing heard under this purpose
      * can book, cancel or change the ride.
      */
-    CAMERA
+    CAMERA,
+
+    /** Multi-stop planning: naming the next stop ("next stop? or say that's all"). */
+    PLAN_LEG,
+
+    /** Multi-stop: what happens at a stop — the driver waits, a drop-off, or a pick-up. */
+    STOP_KIND,
+
+    /** Multi-stop: the numbered read-back — yes, or an edit ("remove stop two"). */
+    PLAN_REVIEW,
+
+    /**
+     * During a multi-stop ride: only stop words mean anything ("I'm back", "skip the next
+     * stop", "what are my stops", "add a stop at …"). Nothing heard here can cancel the ride.
+     */
+    TRIP_COMMAND,
+
+    /** During a ride: yes or no to a stop change just read back. */
+    STOP_CONFIRM,
+
+    /**
+     * The walking-route agent: consent, a landmark while recording, a route's name, "next" while
+     * being guided, or "was it still there?". What it means depends on the walk's mode.
+     */
+    WALK
 }
 
 /**
@@ -779,10 +826,13 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                 val destination = event.string("destination", lastBooking?.first ?: "your destination")
                 val eta = event.int("etaMinutes", 12)
                 val driver = currentDriver() ?: driverFrom(event)
-                transition(RiderState.InTrip(destination, eta, driver), announce = false)
+                transition(RiderState.InTrip(destination, eta, driver, activeStops), announce = false)
                 // Destination only — see the note on RIDE_ASSIGNED. The driver's own message
                 // is the channel for "about ten minutes, traffic at Avinashi Road".
-                narrate(event, "On the way to $destination.")
+                val first = currentStop()
+                narrate(event, if (first == null) "On the way to $destination."
+                else "On the way. First stop, ${first.name}. Then $destination.")
+                activeRideId?.let(::refreshStops)
                 lastSpokenPhase = RidePhase.IN_TRIP
                 engine.heartbeat(true)
             }
@@ -802,6 +852,14 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                 transition(RiderState.Done(destination, fare, minutes), announce = false)
                 narrate(event, "You've arrived. $fare rupees.")
                 lastSpokenPhase = RidePhase.COMPLETED
+                lastRidePlace = lastBookingPlace
+                lastRideEndedAt = System.currentTimeMillis()
+                // A saved walk from this drop-off: say so once, without getting in the way of paying.
+                lastRidePlace?.let { place ->
+                    RouteMemory.forPlace(walkStore.routes(), RouteMemory.placeKey(place.placeId, place.name))?.let { walk ->
+                        speak("I have your walk from here to ${walk.name}. Say guide me when you're ready.", NarrationTier.QUEUED)
+                    }
+                }
                 endRide("completed")
                 // The server has just recorded this trip as a visit; pull the updated places so
                 // the very next booking can already use them.
@@ -821,6 +879,15 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
 
             RideEventType.CODE_CONFIRMED,
             RideEventType.RIDE_CREATED -> Unit
+
+            // Multi-stop — see "Multi-stop rides" below.
+            RideEventType.STOP_ARRIVED,
+            RideEventType.RIDER_RETURNED,
+            RideEventType.STOP_DONE,
+            RideEventType.STOP_SKIPPED,
+            RideEventType.STOPS_CHANGED,
+            RideEventType.WAIT_WARNING,
+            RideEventType.WAIT_OVERDUE -> onStopEvent(event)
 
             // The live camera — see "Live camera" below.
             RideEventType.CAMERA_REQUESTED -> onCameraRequested(event)
@@ -961,6 +1028,8 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             }
             return
         }
+        // Back at the car at a stop: the same check, and a wrong code means the same thing.
+        if (codeForStop && !heardDigits.contains(expectedDigits)) codeForStop = false
 
         if (heardDigits.contains(expectedDigits)) {
             // Settle the code BEFORE speaking. Everything that could ask again — the bounded
@@ -968,7 +1037,10 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             settleBoardingCode()
 
             engine.earcon(Earcon.UNDERSTOOD)
-            speak("That's the right code. This is your car.", NarrationTier.INTERRUPT)
+            val backAtStop = codeForStop
+            codeForStop = false
+            speak(if (backAtStop) "That's the right code. Welcome back." else "That's the right code. This is your car.",
+                NarrationTier.INTERRUPT)
             activeRideId?.let { rideId ->
                 viewModelScope.launch { api.confirmCode(rideId, matched = true) }
             }
@@ -977,6 +1049,9 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
 
         // A wrong code is not a recognition failure to be retried quietly. It is the one
         // outcome this entire mechanism exists to catch, and it is tier 0.
+        uiState = uiState.copy(
+            ride = (uiState.ride as? RiderState.Arrived)?.copy(verificationFailed = true) ?: uiState.ride
+        )
         engine.earcon(Earcon.ERROR)
         speak(
             "That is not the right code. Do not get in. Say S O S if you need help.",
@@ -1018,6 +1093,9 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         codeVerified = true
         codeListenJob?.cancel()
         codeListenJob = null
+        uiState = uiState.copy(
+            ride = (uiState.ride as? RiderState.Arrived)?.copy(codeVerified = true, verificationFailed = false) ?: uiState.ride
+        )
         // The right car is found; the camera's job is done. "Camera off." is queued behind
         // whatever the caller says next, never over it.
         stopCamera("CODE_CONFIRMED")
@@ -1488,8 +1566,12 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                             phase = PaymentPhase.AWAITING,
                             amountRupees = order.amountRupees,
                             orderId = order.orderId,
+                            checkoutUrl = order.checkoutUrl,
                             method = "UPI",
-                            message = "Tap Pay or say \"pay\""
+                            message = if (order.isRazorpay)
+                                "Tap Pay to open Razorpay checkout"
+                            else
+                                "Tap Pay or say \"pay\""
                         )
                     )
                     val fare = if (announceFare) "Your fare is ${order.amountRupees} rupees. " else ""
@@ -1579,6 +1661,35 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     /** Sends the payment to the gateway and speaks what the gateway decided. */
     private fun confirmPayment() {
         val current = uiState.payment ?: return
+
+        // Razorpay flow: open the checkout URL in the browser. The Razorpay checkout
+        // page handles the actual payment (UPI, card, netbanking). The order watcher
+        // detects the result.
+        if (current.checkoutUrl.isNotBlank() && current.checkoutUrl.contains("/pay/")) {
+            setPayment(current.copy(
+                phase = PaymentPhase.PROCESSING,
+                message = "Opening Razorpay checkout…"
+            ))
+            speak("Opening payment page. Complete the payment there.", NarrationTier.INTERRUPT)
+            try {
+                val intent = android.content.Intent(
+                    android.content.Intent.ACTION_VIEW,
+                    android.net.Uri.parse(current.checkoutUrl)
+                )
+                intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                getApplication<android.app.Application>().startActivity(intent)
+            } catch (e: Exception) {
+                Log.w(TAG, "PAYMENT could not open checkout URL", e)
+                setPayment(current.copy(message = "Could not open payment page"))
+                speak("Could not open the payment page. Try again.", NarrationTier.INTERRUPT)
+                return
+            }
+            // Keep watching — the watcher will detect when Razorpay settles the order.
+            watchOrder(current.orderId)
+            return
+        }
+
+        // Sandbox mock flow: call the simulate endpoint directly.
         setPayment(current.copy(phase = PaymentPhase.PROCESSING, message = "Processing payment…"))
         speak("Processing.", NarrationTier.INTERRUPT)
 
@@ -1798,10 +1909,37 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         stt?.cancel()
         closeMic()
         engine.earcon(Earcon.UNDERSTOOD)
-        speak("Confirmed. Have a good trip.", NarrationTier.QUEUED)
+        val backAtStop = codeForStop || uiState.ride is RiderState.InTrip
+        codeForStop = false
+        speak(if (backAtStop) "Confirmed. Welcome back." else "Confirmed. Have a good trip.", NarrationTier.QUEUED)
         activeRideId?.let { rideId ->
             viewModelScope.launch { api.confirmCode(rideId, matched = true) }
         }
+    }
+
+    /** Triggered when the rider or helper taps "Verify Boarding Code" or "Repeat Code". */
+    fun onVerifyBoardingCode() {
+        if (uiState.ride is RiderState.Arrived) {
+            uiState = uiState.copy(
+                ride = (uiState.ride as RiderState.Arrived).copy(verificationFailed = false)
+            )
+            openMic(MicPurpose.CODE_VERIFY)
+        }
+    }
+
+    /** Tapped "Call Driver" or requested driver phone / vehicle details. */
+    fun onCallDriver() {
+        val driver = currentDriver()
+        if (driver == null) {
+            speak("No driver assigned yet.", NarrationTier.QUEUED)
+        } else {
+            speak("${driver.name}, phone ${driver.phoneNumber}.", NarrationTier.QUEUED)
+        }
+    }
+
+    /** Tapped "Help" from idle or status. */
+    fun onHelp() {
+        speakHelp()
     }
 
     // =================================================================================
@@ -1842,11 +1980,49 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
+        // A multi-stop ride: a press is "I'm back" at a WAIT stop, otherwise it opens the
+        // microphone for stop words only — never for a new booking.
+        val trip = uiState.ride as? RiderState.InTrip
+        if (trip != null && activeStops.isNotEmpty()) {
+            trace?.tapCount = (trace?.tapCount ?: 0) + 1
+            engine.stopSpeaking()
+            if (stt?.isListening == true) stt?.cancel()
+            val stop = currentStop()
+            if (stop != null && stop.status == "WAITING" && !stop.riderBack) {
+                listenForStopCode("Welcome back. Ask the driver to say the code.")
+            } else {
+                openMic(MicPurpose.TRIP_COMMAND)
+            }
+            return
+        }
+
         if (isRideUnderway(uiState.ride)) {
             trace?.tapCount = (trace?.tapCount ?: 0) + 1
             engine.stopSpeaking()
             engine.earcon(Earcon.UNDERSTOOD)
             speakStatus()
+            return
+        }
+
+        // Walking: a press is "let me tell you something" — a landmark, next, I'm there.
+        if (uiState.ride is RiderState.Walking || walkMode != WalkMode.NONE) {
+            engine.stopSpeaking()
+            if (stt?.isListening == true) stt?.cancel()
+            openMic(MicPurpose.WALK)
+            return
+        }
+
+        // Planning a route: a press answers the question on screen.
+        if (uiState.ride is RiderState.Planning) {
+            engine.stopSpeaking()
+            if (stt?.isListening == true) stt?.cancel()
+            when {
+                pendingRoutine != null -> openMic(MicPurpose.MEMORY_ANSWER)
+                planStage == PlanStage.REVIEW -> openMic(MicPurpose.PLAN_REVIEW)
+                planStage == PlanStage.KINDS -> openMic(MicPurpose.STOP_KIND)
+                planStage == PlanStage.COLLECTING -> openMic(MicPurpose.PLAN_LEG)
+                else -> openMic(MicPurpose.SLOT_ANSWER)
+            }
             return
         }
 
@@ -1942,6 +2118,16 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun onCancel() {
+        if (walkMode == WalkMode.RECORDING || guideRecording) {
+            WalkRecordingService.stop(getApplication())
+            WalkRecorder.finish()
+        }
+        resetWalk()
+        resetPlan()
+        bookingPlan = null
+        pendingRoutine = null
+        pendingTripAction = null
+        addingStopMidTrip = null
         cancelWindowJob?.cancel()
         silenceJob?.cancel()
         demoRideJob?.cancel()
@@ -2019,7 +2205,8 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         // The post-ride questions stay on screen too: their step lives in the state itself.
         if (purpose != MicPurpose.CANCEL_WINDOW && purpose != MicPurpose.CODE_VERIFY &&
             purpose != MicPurpose.FEEDBACK && purpose != MicPurpose.NEXT_JOURNEY &&
-            purpose != MicPurpose.CAMERA
+            purpose != MicPurpose.CAMERA && purpose != MicPurpose.TRIP_COMMAND &&
+            purpose != MicPurpose.STOP_CONFIRM && purpose != MicPurpose.WALK && !planPurpose(purpose)
         ) {
             transition(
                 RiderState.Listening(isFollowUp = purpose != MicPurpose.BOOKING),
@@ -2075,6 +2262,18 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                 endPostRide("I'll wait. Hold anywhere when you need a ride.")
                 return@launch
             }
+            if (purpose == MicPurpose.WALK) {
+                onWalkNoAnswer()
+                return@launch
+            }
+            // Mid-ride stop words: silence changes nothing, and the ride screen stays.
+            if (purpose == MicPurpose.TRIP_COMMAND || purpose == MicPurpose.STOP_CONFIRM ||
+                (purpose == MicPurpose.STOP_KIND && addingStopMidTrip != null)
+            ) {
+                pendingTripAction = null
+                addingStopMidTrip = null
+                return@launch
+            }
             // Silence to the camera question is a no; silence while it is on means nothing.
             if (purpose == MicPurpose.CAMERA) {
                 if (uiState.camera == CameraShare.ASKING) declineCamera("NO_ANSWER")
@@ -2090,6 +2289,8 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             } else {
                 Log.i(TAG, "SILENCE timeoutMs=${RecoveryLadder.SILENCE_TIMEOUT_MS} action=REST")
                 silenceRepromptUsed = false
+                resetPlan()
+                pendingRoutine = null
                 transition(RiderState.Idle, announce = false)
                 speak(RecoveryLadder.SILENCE_REST, NarrationTier.QUEUED)
             }
@@ -2177,6 +2378,21 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             micPurpose == MicPurpose.CAMERA ->
                 alternatives.firstOrNull { CameraConsent.answer(it) != null }
 
+            micPurpose == MicPurpose.STOP_KIND ->
+                alternatives.firstOrNull { StopPlanParser.kindAnswer(it) != null }
+
+            micPurpose == MicPurpose.TRIP_COMMAND ->
+                alternatives.firstOrNull { StopPlanParser.tripCommand(it) != null }
+
+            micPurpose == MicPurpose.PLAN_REVIEW ->
+                alternatives.firstOrNull { StopPlanParser.planEdit(it) != null }
+
+            micPurpose == MicPurpose.WALK && walkMode == WalkMode.RECORDING ->
+                alternatives.firstOrNull { WalkCommands.record(it) != null }
+
+            micPurpose == MicPurpose.WALK && walkMode == WalkMode.GUIDING ->
+                alternatives.firstOrNull { WalkCommands.guide(it) != null }
+
             micPurpose == MicPurpose.FEEDBACK -> when ((uiState.ride as? RiderState.Feedback)?.step) {
                 FeedbackStep.RATING -> alternatives.firstOrNull { FeedbackParser.intentOf(it) != FeedbackParser.Intent.NONE }
                 FeedbackStep.RATING_CHECK -> alternatives.firstOrNull { yesNo(it) || FeedbackParser.rating(it) != null }
@@ -2227,6 +2443,10 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
+        // Multi-stop answers and in-ride stop words, before the classifier: "cancel stop two"
+        // must change a stop, never cancel the ride.
+        if (handleStopSpeech(text)) return
+
         // Held from the Done screen, "pay" means pay — not a destination called Pay. The mic
         // moved the screen to Listening, so the finished ride is restored before paying.
         val doneScreen = doneBeforeListening
@@ -2236,6 +2456,9 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             if (!handlePaymentSpeech(text)) speak("Say pay to confirm, or decline.", NarrationTier.QUEUED)
             return
         }
+
+        // Walking routes: "how do I get to the clinic", "record my walk", answers while walking.
+        if (handleWalkSpeech(text)) return
 
         val rideActive = uiState.ride !is RiderState.Idle
         val classification = Classifier.classify(text, rideActive)
@@ -2266,6 +2489,10 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             goBack()
             return
         }
+
+        // A route rather than a place: "pharmacy, then college", "I have a few stops",
+        // or a saved route by name.
+        if (handlePlanEntry(text)) return
 
         when (micPurpose) {
             MicPurpose.CANCEL_WINDOW -> {
@@ -2327,6 +2554,8 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
 
             MicPurpose.CODE_VERIFY -> return // handled above
             MicPurpose.CAMERA -> return // handled above
+            MicPurpose.PLAN_LEG, MicPurpose.STOP_KIND, MicPurpose.PLAN_REVIEW,
+            MicPurpose.TRIP_COMMAND, MicPurpose.STOP_CONFIRM, MicPurpose.WALK -> return // handled above
             MicPurpose.BOOKING -> Unit
         }
 
@@ -2516,7 +2745,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         // A road is not an address. Before booking a five-kilometre stretch of Thadagam Road,
         // find out who is meeting the rider there — the one person who can wave the car down
         // on their behalf. Buildings skip this entirely, so an ordinary booking is unchanged.
-        if (top.isVague && chosenContact == null && chosenDropNote.isBlank()) {
+        if (top.isVague && chosenContact == null && chosenDropNote.isBlank() && planStage == null) {
             startMeetingLadder(top, rideType)
             return
         }
@@ -2836,6 +3065,27 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         cancelWindowJob?.cancel()
         if (wasBooking != null) heldRideType = wasBooking.rideType
 
+        // A route: back to its read-back, not to the start.
+        val confirmedPlan = bookingPlan
+        if (wasBooking != null && confirmedPlan != null) {
+            bookingPlan = null
+            plan = confirmedPlan
+            planRideType = wasBooking.rideType
+            engine.earcon(Earcon.UNDERSTOOD)
+            reviewPlan("Okay, not booking yet. ")
+            return
+        }
+        // Mid-plan, inside one of the place questions: one step back within the plan.
+        if (planStage != null) {
+            pendingOptions = null
+            pendingNearMiss = null
+            pendingMemory = null
+            planBack()
+            return
+        }
+        pendingRoutine?.let { rejectedRoutines += it.signature }
+        pendingRoutine = null
+
         pendingOptions = null
         pendingNearMiss = null
         pendingMemory?.let { rejectedMemoryKeys += it.place.placeKey }
@@ -2925,9 +3175,16 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             val moment = memoryMoment()
             val suggestion = PreferenceMemoryAgent.proactive(
                 app.memory.current, moment, memoryThresholds(), rejectedMemoryKeys
-            ) ?: return@launch
+            )
+            val routine = RoutineAgent.proactive(app.memory.current, moment, memoryThresholds(), rejectedRoutines)
             // Re-check: the rider may have started talking while the location was fetched.
             if (uiState.ride !is RiderState.Idle || uiState.micOpen || activeRideId != null) return@launch
+            if (RoutineAgent.preferRoutine(routine, suggestion)) {
+                lastProactiveAt = System.currentTimeMillis()
+                askRoutine(routine!!, moment)
+                return@launch
+            }
+            if (suggestion == null) return@launch
 
             lastProactiveAt = System.currentTimeMillis()
             Log.i(TAG, "MEMORY proactive trigger=$trigger place=\"${suggestion.place.name}\" " +
@@ -2954,6 +3211,22 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun resolveMemoryAnswer(classification: Classification, raw: String) {
+        val routine = pendingRoutine
+        if (routine != null) {
+            when (classification.intent) {
+                is RiderIntent.Yes -> acceptRoutine()
+                is RiderIntent.No -> rejectRoutine()
+                else -> {
+                    // Another place entirely: an implicit no to the route, and a new request.
+                    pendingRoutine = null
+                    rejectedRoutines += routine.signature
+                    proactiveDeclines++
+                    app.memory.reportOutcome(routine.destinationKey, SuggestionKind.PROACTIVE, accepted = false, heard = "")
+                    if (!handlePlanEntry(raw)) resolveSlotAnswer(classification, raw)
+                }
+            }
+            return
+        }
         when (classification.intent) {
             is RiderIntent.Yes -> acceptMemory()
             is RiderIntent.No -> rejectMemory()
@@ -3064,6 +3337,1165 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             placeId = placeId
         )
     }
+
+    // =================================================================================
+    //  Multi-stop rides — planned by voice, Uber/Rapido style
+    //
+    //   "pharmacy, then Gandhipuram, then home"  ─▶ each place looked up in turn, through the
+    //        same resolver, clarify and memory-repair questions as any booking
+    //   ─▶ "At the pharmacy, will you get out and come back, or…?"  (only where not said)
+    //   ─▶ numbered read-back ─▶ edits ("remove stop two", "swap one and two", "add a stop",
+    //        "save this as Monday errands") ─▶ yes ─▶ the normal booking and cancel window
+    //
+    //  During the ride every stop is announced; at a WAIT stop the rider presses (or says
+    //  "I'm back") and the phone hears the boarding code again — the car cannot leave until
+    //  it does. "Skip the next stop", "what are my stops", "add a stop at …" work mid-ride.
+    // =================================================================================
+
+    private enum class PlanStage { COLLECTING, RESOLVING, KINDS, REVIEW }
+
+    /** Something said mid-ride that needs a yes before it happens. */
+    private sealed interface TripAction {
+        data class Skip(val stop: StopInfo) : TripAction
+        data class Add(val leg: PlannedLeg) : TripAction
+    }
+
+    private var plan: TripPlan? = null
+    private var planStage: PlanStage? = null
+    private var planLegIndex = 0
+    private var planRideType: RideType = RideType.AUTO
+    private var planMisses = 0
+    private var planHintsGiven = false
+    private val collectedLegs = mutableListOf<PlannedLeg>()
+    private var collectingDestination = false
+    /** The confirmed plan, between "yes" and the server accepting it. */
+    private var bookingPlan: TripPlan? = null
+    /** Set when the plan came from a saved route, so its use is counted. */
+    private var planFromRoute: SavedRoute? = null
+
+    /** The ride's stops as the server last reported them. */
+    private var activeStops: List<StopInfo> = emptyList()
+    /** The boarding-code listen is for a rider getting back in at a WAIT stop. */
+    private var codeForStop = false
+    private var pendingTripAction: TripAction? = null
+    /** Mid-ride "add a stop": the place is found, its kind is being asked. */
+    private var addingStopMidTrip: PlannedLeg? = null
+
+    private var pendingRoutine: RoutineAgent.Routine? = null
+    private val rejectedRoutines = mutableSetOf<String>()
+
+    private fun planPurpose(p: MicPurpose) =
+        p == MicPurpose.PLAN_LEG || p == MicPurpose.STOP_KIND || p == MicPurpose.PLAN_REVIEW
+
+    /**
+     * Multi-stop speech that must be heard before the classifier: answers to the planning
+     * questions, and stop commands during the ride. @return true when the words were handled.
+     */
+    private fun handleStopSpeech(text: String): Boolean {
+        val shortCancel = com.cabeye.rider.intent.IntentParser.CANCEL.containsMatchIn(text) && text.trim().split(Regex("\\s+")).size <= 2
+        when (micPurpose) {
+            MicPurpose.PLAN_LEG, MicPurpose.STOP_KIND, MicPurpose.PLAN_REVIEW -> {
+                if (addingStopMidTrip != null && (shortCancel ||
+                        Classifier.classify(text, true).intent is RiderIntent.Back)
+                ) {
+                    // Mid-ride: "cancel" drops the stop being added, never the ride.
+                    addingStopMidTrip = null
+                    speak("Okay, no change.", NarrationTier.QUEUED)
+                    return true
+                }
+                if (shortCancel) { onCancel(); return true }
+                if (Classifier.classify(text, false).intent is RiderIntent.Back) { planBack(); return true }
+                when (micPurpose) {
+                    MicPurpose.PLAN_LEG -> resolveCollect(text)
+                    MicPurpose.STOP_KIND -> if (addingStopMidTrip != null) resolveMidTripKind(text) else resolveStopKind(text)
+                    else -> resolvePlanReview(text)
+                }
+                return true
+            }
+            MicPurpose.TRIP_COMMAND -> { handleTripCommand(text); return true }
+            MicPurpose.STOP_CONFIRM -> { resolveTripAction(text); return true }
+            else -> return false
+        }
+    }
+
+    /**
+     * A new booking that is really a route: a saved route by name, several places in one
+     * breath, or "I have a few stops". @return true when it started a plan.
+     */
+    private fun handlePlanEntry(text: String): Boolean {
+        if (micPurpose != MicPurpose.BOOKING && micPurpose != MicPurpose.SLOT_ANSWER) return false
+        if (activeRideId != null || planStage != null || uiState.ride is RiderState.Confirming) return false
+        if (app.memory.enabled) {
+            RoutineAgent.named(text, app.memory.current.routes)?.let { startPlanFromRoute(it); return true }
+        }
+        if (StopPlanParser.tooManyStops(text)) {
+            engine.earcon(Earcon.NOT_UNDERSTOOD)
+            speak("A ride can have up to ${TripPlan.MAX_STOPS} stops before the destination. " +
+                "Say your stops again, then where you finish.", NarrationTier.QUEUED) { openMic(MicPurpose.BOOKING) }
+            return true
+        }
+        StopPlanParser.parseTrip(text)?.let { parsed ->
+            val type = if (parsed.rideTypeWasExplicit) parsed.rideType else heldRideType ?: preferredRideType()
+            startPlan(parsed.toPlan(), type)
+            return true
+        }
+        if (StopPlanParser.isPlanStart(text)) {
+            startCollecting()
+            return true
+        }
+        return false
+    }
+
+    // ---- Step by step: "I have a few stops" ---------------------------------------------
+
+    private fun startCollecting() {
+        resetPlan()
+        planStage = PlanStage.COLLECTING
+        planRideType = heldRideType ?: preferredRideType()
+        engine.earcon(Earcon.UNDERSTOOD)
+        showPlan("Where is your first stop?")
+        speak("Okay. Where is your first stop?", NarrationTier.QUEUED) { openMic(MicPurpose.PLAN_LEG) }
+    }
+
+    private fun resolveCollect(text: String) {
+        if (StopPlanParser.isDoneAdding(text) && !collectingDestination) {
+            if (collectedLegs.isEmpty()) {
+                speak("You haven't said a stop yet. Where is your first stop?", NarrationTier.QUEUED) { openMic(MicPurpose.PLAN_LEG) }
+            } else {
+                collectingDestination = true
+                showPlan("Where do you finish?")
+                speak("And where do you finish?", NarrationTier.QUEUED) { openMic(MicPurpose.PLAN_LEG) }
+            }
+            return
+        }
+        val leg = StopPlanParser.parseLeg(text)
+        if (leg == null) {
+            planMisses++
+            if (planMisses >= 3) { resetPlan(); runLadder(unrecognised = ""); return }
+            speak("I didn't catch a place. Say it again.", NarrationTier.QUEUED) { openMic(MicPurpose.PLAN_LEG) }
+            return
+        }
+        planMisses = 0
+        engine.earcon(Earcon.UNDERSTOOD)
+        if (collectingDestination) {
+            startPlan(TripPlan(collectedLegs.toList(), leg.copy(kind = null)), planRideType, intro = "Got it.")
+            return
+        }
+        collectedLegs += leg
+        if (collectedLegs.size >= TripPlan.MAX_STOPS) {
+            collectingDestination = true
+            showPlan("Where do you finish?")
+            speak("That's ${TripPlan.MAX_STOPS} stops, the most a ride can have. Where do you finish?", NarrationTier.QUEUED) {
+                openMic(MicPurpose.PLAN_LEG)
+            }
+        } else {
+            showPlan("Next stop, or say that's all.")
+            speak("Next stop? Or say that's all.", NarrationTier.QUEUED) { openMic(MicPurpose.PLAN_LEG) }
+        }
+    }
+
+    // ---- Resolving each place, then the kinds, then the read-back ------------------------
+
+    private fun startPlan(p: TripPlan, rideType: RideType, intro: String? = null) {
+        val keepRoute = planFromRoute
+        resetPlan()
+        planFromRoute = keepRoute
+        plan = p
+        planRideType = rideType
+        planStage = PlanStage.RESOLVING
+        engine.earcon(Earcon.UNDERSTOOD)
+        Log.i(TAG, "PLAN start stops=${p.stops.size} destination=\"${p.destination.query}\"")
+        val n = p.stops.size
+        val line = intro ?: "$n ${if (n == 1) "stop" else "stops"}, then ${p.destination.name}."
+        speak(line, NarrationTier.QUEUED) { resolveNextLeg() }
+    }
+
+    private fun resolveNextLeg() {
+        val p = plan ?: return
+        val idx = p.nextUnresolved
+        if (idx == null) { askNextKind(); return }
+        planLegIndex = idx
+        planStage = PlanStage.RESOLVING
+        val leg = p.legs[idx]
+        resolveDestination(leg.query, leg.spoken, planRideType)
+    }
+
+    private fun legLabel(idx: Int, p: TripPlan) =
+        if (idx < p.stops.size) "Stop ${TripPlan.ordinalWord(idx + 1)}" else "Destination"
+
+    /** Called instead of booking while a plan is being resolved: the place belongs to a leg. */
+    private fun onPlanLegResolved(place: PlaceOption) {
+        val p = plan ?: return
+        val idx = planLegIndex.coerceIn(0, p.legs.size - 1)
+        val leg = p.legs[idx]
+        plan = p.withLeg(idx, leg.copy(place = place, spoken = pendingSpokenAs.ifBlank { leg.spoken }))
+        pendingSpokenAs = ""
+        failureCount = 0
+        pendingMemory = null
+        engine.earcon(Earcon.UNDERSTOOD)
+        showPlan("${legLabel(idx, p)}: ${place.name}")
+        speak("${legLabel(idx, p)}: ${place.name}.", NarrationTier.QUEUED) { resolveNextLeg() }
+    }
+
+    private fun askNextKind() {
+        val p = plan ?: return
+        val i = p.nextWithoutKind
+        if (i == null) { reviewPlan(); return }
+        planStage = PlanStage.KINDS
+        planLegIndex = i
+        showPlan("At ${p.stops[i].name}: wait, drop off, or pick up?")
+        speak(
+            "At ${p.stops[i].name}, will you get out and come back, so the driver waits? " +
+                "Or are you dropping someone off, or picking someone up?",
+            NarrationTier.QUEUED
+        ) { openMic(MicPurpose.STOP_KIND) }
+    }
+
+    private fun resolveStopKind(text: String) {
+        val p = plan ?: return
+        val i = p.nextWithoutKind ?: run { reviewPlan(); return }
+        var kind = StopPlanParser.kindAnswer(text)
+        var said = ""
+        if (kind == null) {
+            planMisses++
+            if (planMisses < 2) {
+                speak("Say wait, drop off, or pick up.", NarrationTier.QUEUED) { openMic(MicPurpose.STOP_KIND) }
+                return
+            }
+            // Never guessed in the unsafe direction: a WAIT stop keeps the car until the rider's
+            // phone hears the code again, so nobody can be left behind.
+            kind = StopKind.WAIT
+            said = "I'll ask the driver to wait for you there. "
+        }
+        planMisses = 0
+        plan = p.withLeg(i, p.stops[i].copy(kind = kind))
+        engine.earcon(Earcon.UNDERSTOOD)
+        if (said.isNotEmpty()) speak(said, NarrationTier.QUEUED) { askNextKind() } else askNextKind()
+    }
+
+    private fun reviewPlan(lead: String = "") {
+        val p = plan ?: return
+        planStage = PlanStage.REVIEW
+        planMisses = 0
+        val hint = if (!planHintsGiven) {
+            planHintsGiven = true
+            " Say yes to book it. Or change it: remove stop two, swap one and two, add a stop, or save it with a name."
+        } else " Shall I book it?"
+        showPlan("Book this trip?")
+        speak("$lead${p.readBack()}$hint", NarrationTier.QUEUED) { openMic(MicPurpose.PLAN_REVIEW) }
+    }
+
+    private fun resolvePlanReview(text: String) {
+        val p = plan ?: return
+        when (val edit = StopPlanParser.planEdit(text)) {
+            null -> when (Classifier.classify(text, false).intent) {
+                is RiderIntent.Yes -> bookPlan()
+                is RiderIntent.No -> {
+                    showPlan("What would you like to change?")
+                    speak("What would you like to change? Say remove, swap, add a stop, or cancel.", NarrationTier.QUEUED) {
+                        openMic(MicPurpose.PLAN_REVIEW)
+                    }
+                }
+                else -> {
+                    planMisses++
+                    if (planMisses >= 3) { onCancel(); return }
+                    speak("Say yes to book it, or tell me what to change.", NarrationTier.QUEUED) { openMic(MicPurpose.PLAN_REVIEW) }
+                }
+            }
+            is StopPlanParser.PlanEdit.Remove -> {
+                val n = when {
+                    edit.stop == -1 -> p.stops.size
+                    edit.stop != null -> edit.stop
+                    else -> p.stopNamed(edit.words) ?: -99
+                }
+                applyEdit(if (n == -99) TripPlan.Edit.Refused("I couldn't tell which stop. Say remove stop one, two or three.") else p.remove(n))
+            }
+            is StopPlanParser.PlanEdit.Swap -> applyEdit(p.swap(resolveN(edit.a, p), resolveN(edit.b, p)))
+            is StopPlanParser.PlanEdit.SetKind -> applyEdit(p.setKind(resolveN(edit.stop, p), edit.kind))
+            is StopPlanParser.PlanEdit.Change -> {
+                val n = resolveN(edit.stop, p)
+                if (n !in 1..p.stops.size) applyEdit(p.remove(n))
+                else applyEdit(TripPlan.Edit.Ok(p.withLeg(n - 1, edit.leg.copy(kind = edit.leg.kind ?: p.stops[n - 1].kind, note = edit.leg.note.ifBlank { p.stops[n - 1].note })), ""))
+            }
+            is StopPlanParser.PlanEdit.Add -> applyEdit(p.add(edit.leg, edit.afterStop?.let { resolveN(it, p) }))
+            is StopPlanParser.PlanEdit.ChangeDestination -> applyEdit(TripPlan.Edit.Ok(p.copy(destination = edit.leg), ""))
+            is StopPlanParser.PlanEdit.SaveAs -> saveRouteFromPlan(edit.name)
+            StopPlanParser.PlanEdit.ReadAgain -> reviewPlan()
+        }
+    }
+
+    private fun resolveN(n: Int, p: TripPlan) = if (n == -1) p.stops.size else n
+
+    private fun applyEdit(result: TripPlan.Edit) {
+        when (result) {
+            is TripPlan.Edit.Refused -> speak(result.sentence, NarrationTier.QUEUED) { openMic(MicPurpose.PLAN_REVIEW) }
+            is TripPlan.Edit.Ok -> {
+                plan = result.plan
+                engine.earcon(Earcon.UNDERSTOOD)
+                val lead = if (result.said.isNotBlank()) result.said + " " else ""
+                when {
+                    result.plan.nextUnresolved != null -> speak(lead.ifBlank { "Okay." }, NarrationTier.QUEUED) { resolveNextLeg() }
+                    result.plan.nextWithoutKind != null -> speak(lead.ifBlank { "Okay." }, NarrationTier.QUEUED) { askNextKind() }
+                    else -> reviewPlan(lead)
+                }
+            }
+        }
+    }
+
+    private fun bookPlan() {
+        val p = plan ?: return
+        val dest = p.destination.place ?: run { resolveNextLeg(); return }
+        if (!p.isComplete) { resolveNextLeg(); return }
+        val type = planRideType
+        val route = planFromRoute
+        bookingPlan = p
+        resetPlan()
+        route?.let { app.memory.routeUsed(it.name) }
+        pendingSpokenAs = p.destination.spoken
+        Log.i(TAG, "PLAN book stops=${p.stops.size} destination=\"${dest.name}\"")
+        beginOptimisticBooking(dest, type)
+    }
+
+    /** "Go back" while planning: one step, never the whole plan. */
+    private fun planBack() {
+        val p = plan
+        when {
+            planStage == PlanStage.COLLECTING -> {
+                if (collectingDestination) collectingDestination = false
+                else if (collectedLegs.isNotEmpty()) collectedLegs.removeAt(collectedLegs.size - 1)
+                speak(if (collectedLegs.isEmpty()) "Okay. Where is your first stop?" else "Okay. Next stop, or say that's all.",
+                    NarrationTier.QUEUED) { openMic(MicPurpose.PLAN_LEG) }
+            }
+            p != null && planStage == PlanStage.RESOLVING -> {
+                speak("Okay. Say ${legLabel(planLegIndex, p).lowercase()} again.", NarrationTier.QUEUED) {
+                    openMic(MicPurpose.SLOT_ANSWER)
+                }
+            }
+            p != null && p.isComplete -> reviewPlan()
+            else -> { resetPlan(); askDestinationAgain("Okay. Where would you like to go?") }
+        }
+    }
+
+    /** Forgets the plan being built (not a booking already confirmed). */
+    private fun resetPlan() {
+        plan = null
+        planStage = null
+        planLegIndex = 0
+        planMisses = 0
+        collectedLegs.clear()
+        collectingDestination = false
+        planFromRoute = null
+    }
+
+    private fun showPlan(prompt: String) {
+        val p = plan
+        val lines = when {
+            p != null -> p.stops.mapIndexed { i, s ->
+                "${i + 1}. ${s.name}" + (s.kind?.let { " — ${it.driverLabel}" } ?: "")
+            } + "Then ${p.destination.name}"
+            else -> collectedLegs.mapIndexed { i, s -> "${i + 1}. ${s.name}" }
+        }
+        transition(RiderState.Planning(lines, prompt), announce = false)
+    }
+
+    // ---- Saved routes and learned routines ----------------------------------------------
+
+    private fun startPlanFromRoute(route: SavedRoute) {
+        fun leg(r: RouteLeg) = PlannedLeg(
+            query = r.name, spoken = r.name,
+            kind = r.kind.takeIf { it.isNotBlank() }?.let { StopKind.parse(it) },
+            note = r.note,
+            place = if (r.latitude != null && r.longitude != null)
+                PlaceOption(r.name, r.latitude, r.longitude, 1f, coversWholeToken = true,
+                    formattedAddress = r.address, placeId = r.placeId) else null
+        )
+        val p = TripPlan(route.stops.map(::leg), leg(route.destination).copy(kind = null))
+        planFromRoute = route
+        Log.i(TAG, "MEMORY named route \"${route.name}\"")
+        startPlan(p, runCatching { RideType.valueOf(route.rideType) }.getOrDefault(preferredRideType()), intro = "${route.name}.")
+    }
+
+    private fun saveRouteFromPlan(name: String) {
+        val p = plan ?: return
+        if (!app.memory.enabled) {
+            speak("I can only save routes when you're signed in. Shall I book it?", NarrationTier.QUEUED) { openMic(MicPurpose.PLAN_REVIEW) }
+            return
+        }
+        if (!p.isComplete) {
+            speak("Let's finish the plan first.", NarrationTier.QUEUED) { resolveNextLeg() }
+            return
+        }
+        fun leg(l: PlannedLeg, kind: StopKind?) = RouteLeg(
+            name = l.name, address = l.place?.formattedAddress.orEmpty(),
+            latitude = l.place?.latitude, longitude = l.place?.longitude, placeId = l.place?.placeId.orEmpty(),
+            kind = kind?.name.orEmpty(), note = l.note
+        )
+        val route = SavedRoute(
+            name = name, key = TripPlan.norm(name),
+            stops = p.stops.map { leg(it, it.kind) }, destination = leg(p.destination, null),
+            rideType = planRideType.name
+        )
+        app.memory.saveRoute(route) { refused ->
+            onMain {
+                speak(refused ?: "Saved as $name. Next time just say book $name. Shall I book it now?", NarrationTier.QUEUED) {
+                    openMic(MicPurpose.PLAN_REVIEW)
+                }
+            }
+        }
+    }
+
+    /** "It's 8 40 AM. Your usual route, like most Monday mornings: the pharmacy, then college." */
+    private fun askRoutine(r: RoutineAgent.Routine, moment: PreferenceMemoryAgent.Moment) {
+        pendingRoutine = r
+        pendingMemory = null
+        engine.earcon(Earcon.UNDERSTOOD)
+        Log.i(TAG, "MEMORY routine \"${r.spokenRoute()}\" support=${r.support} confidence=${r.confidence}")
+        transition(RiderState.Planning(r.stops.mapIndexed { i, s -> "${i + 1}. ${s.name}" } + "Then ${r.destinationName}",
+            "Your usual route?"), announce = false)
+        speak(
+            "It's ${PreferenceMemoryAgent.spokenTime(moment)}. Your usual route, ${r.reason}: ${r.spokenRoute()}. " +
+                "Shall I plan it? Say yes, or tell me another place.",
+            NarrationTier.QUEUED
+        ) { openMic(MicPurpose.MEMORY_ANSWER) }
+    }
+
+    private fun acceptRoutine() {
+        val r = pendingRoutine ?: return
+        pendingRoutine = null
+        app.memory.reportOutcome(r.destinationKey, SuggestionKind.PROACTIVE, accepted = true, heard = "")
+        val places = app.memory.current.places
+        fun leg(key: String, name: String, kind: StopKind?) = PlannedLeg(
+            query = name, spoken = name, kind = kind,
+            place = places.firstOrNull { it.placeKey == key }?.toOption()
+        )
+        val p = TripPlan(
+            stops = r.stops.map { leg(it.placeKey, it.name, StopKind.parse(it.kind)) },
+            destination = leg(r.destinationKey, r.destinationName, null)
+        )
+        startPlan(p, heldRideType ?: preferredRideType(), intro = "Okay.")
+    }
+
+    private fun rejectRoutine() {
+        val r = pendingRoutine ?: return
+        pendingRoutine = null
+        rejectedRoutines += r.signature
+        proactiveDeclines++
+        app.memory.reportOutcome(r.destinationKey, SuggestionKind.PROACTIVE, accepted = false, heard = "")
+        engine.earcon(Earcon.NOT_UNDERSTOOD)
+        askDestinationAgain("Okay. Where would you like to go?")
+    }
+
+    // ---- During the ride ----------------------------------------------------------------
+
+    private fun refreshStops(rideId: String) {
+        viewModelScope.launch {
+            val result = api.snapshot(rideId)
+            if (result is ApiResult.Ok && rideId == activeRideId) setStops(result.value.stops)
+        }
+    }
+
+    private fun setStops(stops: List<StopInfo>) {
+        activeStops = stops
+        val ride = uiState.ride
+        if (ride is RiderState.InTrip) uiState = uiState.copy(ride = ride.copy(stops = stops))
+    }
+
+    private fun currentStop(): StopInfo? = activeStops.firstOrNull { it.isOpen }
+
+    private fun nextLegLine(event: RideEvent): String {
+        val next = event.payload.optJSONObject("next") ?: return ""
+        val name = next.optString("name")
+        return if (next.optString("type") == "STOP")
+            "Next, stop ${TripPlan.ordinalWord(next.optInt("index"))}, $name."
+        else "Next, $name."
+    }
+
+    private fun onStopEvent(event: RideEvent) {
+        val name = event.string("name", "the stop")
+        val index = TripPlan.ordinalWord(event.int("index", 1))
+        val note = event.string("note")
+        activeRideId?.let(::refreshStops)
+        when (event.type) {
+            RideEventType.STOP_ARRIVED -> when (event.string("kind")) {
+                "WAIT" -> {
+                    val minutes = (event.int("waitLimitSeconds", 600) + 59) / 60
+                    narrate(event, "Stop $index, $name. Your driver will wait up to $minutes minutes. " +
+                        "When you're back at the car, press the screen and let the driver say the code.")
+                }
+                "PICKUP" -> narrate(event, "Stop $index, $name. Picking up ${note.ifBlank { "your companion" }}.")
+                else -> narrate(event, "Stop $index, $name. ${note.ifBlank { "Your companion" }.replaceFirstChar { it.uppercase() }} can get out here.")
+            }
+            RideEventType.STOP_DONE -> narrate(event, "Leaving $name. ${nextLegLine(event)}")
+            RideEventType.STOP_SKIPPED -> narrate(event, "Skipped $name. ${nextLegLine(event)}")
+            RideEventType.STOPS_CHANGED -> narrate(event, "Your stops are updated. ${nextLegLine(event)}")
+            RideEventType.WAIT_WARNING -> {
+                if (currentStop()?.riderBack == true) return
+                val left = event.int("secondsLeft", 60)
+                narrate(event, if (left <= 60) "One minute left. Your driver is waiting at $name."
+                else "${(left + 59) / 60} minutes left before your driver needs you back at $name.")
+            }
+            RideEventType.WAIT_OVERDUE -> narrate(event,
+                "Your driver has been waiting a long time at $name. Cab Eye support has been told and may call you. " +
+                    "If you need help, press S O S.")
+            // This phone's own confirmation; already spoken when the code was heard.
+            else -> Unit
+        }
+    }
+
+    /** Mid-ride words: only stop commands mean anything; anything else answers "where are we". */
+    private fun handleTripCommand(text: String) {
+        when (val cmd = StopPlanParser.tripCommand(text)) {
+            StopPlanParser.TripCommand.ImBack -> {
+                val stop = currentStop()
+                if (stop?.status == "WAITING" && !stop.riderBack) listenForStopCode("Welcome back. Ask the driver to say the code.")
+                else speak("You're already on the way.", NarrationTier.QUEUED)
+            }
+            is StopPlanParser.TripCommand.Skip -> {
+                val target = if (cmd.stop == null) currentStop()
+                else activeStops.firstOrNull { it.index == (if (cmd.stop == -1) activeStops.lastOrNull { s -> s.isOpen }?.index else cmd.stop) && it.isOpen }
+                when {
+                    target == null -> speak("There are no more stops on this ride.", NarrationTier.QUEUED)
+                    target.status == "WAITING" -> speak("You're at that stop now. Get back in and the driver will move on.", NarrationTier.QUEUED)
+                    else -> {
+                        pendingTripAction = TripAction.Skip(target)
+                        speak("Skip ${target.name}? Say yes or no.", NarrationTier.QUEUED) { openMic(MicPurpose.STOP_CONFIRM) }
+                    }
+                }
+            }
+            StopPlanParser.TripCommand.ReadStops -> speak(remainingStopsLine(), NarrationTier.QUEUED)
+            is StopPlanParser.TripCommand.AddStop -> addStopMidTrip(cmd.leg)
+            // In the car: "tell me the walk" previews the walk from the drop-off.
+            null -> if (!handleWalkCommand(text)) speakStatus()
+        }
+    }
+
+    private fun remainingStopsLine(): String {
+        val open = activeStops.filter { it.isOpen }
+        val dest = (uiState.ride as? RiderState.InTrip)?.destination ?: lastBooking?.first ?: "your destination"
+        if (open.isEmpty()) return "No more stops. Next, $dest."
+        return open.joinToString(" ") { s ->
+            "Stop ${TripPlan.ordinalWord(s.index)}, ${s.name}, ${StopKind.parse(s.kind).spoken}."
+        } + " Then $dest."
+    }
+
+    private fun listenForStopCode(prompt: String) {
+        codeForStop = true
+        codeVerified = false
+        speak(prompt, NarrationTier.QUEUED) { openMic(MicPurpose.CODE_VERIFY) }
+    }
+
+    private fun addStopMidTrip(leg: PlannedLeg) {
+        val used = activeStops.count { it.status != "SKIPPED" }
+        if (used >= TripPlan.MAX_STOPS) {
+            speak("This ride already has ${TripPlan.MAX_STOPS} stops, which is the most it can have.", NarrationTier.QUEUED)
+            return
+        }
+        viewModelScope.launch {
+            val place = findPlaceQuietly(leg)
+            onMain {
+                if (place == null) {
+                    speak("I couldn't find ${leg.query}. Try again with a nearby landmark.", NarrationTier.QUEUED)
+                } else {
+                    addingStopMidTrip = leg.copy(place = place)
+                    speak("Add ${place.name} as a stop. Will you get out and come back, so the driver waits? " +
+                        "Or is someone getting off, or getting on?", NarrationTier.QUEUED) { openMic(MicPurpose.STOP_KIND) }
+                }
+            }
+        }
+    }
+
+    private fun resolveMidTripKind(text: String) {
+        val leg = addingStopMidTrip ?: return
+        val kind = StopPlanParser.kindAnswer(text) ?: StopKind.WAIT
+        addingStopMidTrip = null
+        pendingTripAction = TripAction.Add(leg.copy(kind = kind))
+        speak("${leg.name}, ${kind.spoken}. Add it? Say yes or no.", NarrationTier.QUEUED) { openMic(MicPurpose.STOP_CONFIRM) }
+    }
+
+    private fun resolveTripAction(text: String) {
+        val action = pendingTripAction ?: return
+        pendingTripAction = null
+        val rideId = activeRideId ?: return
+        if (Classifier.classify(text, true).intent !is RiderIntent.Yes) {
+            speak("Okay, no change.", NarrationTier.QUEUED)
+            return
+        }
+        viewModelScope.launch {
+            val result = when (action) {
+                is TripAction.Skip -> api.skipStop(rideId, action.stop.stopId)
+                is TripAction.Add -> {
+                    val upcoming = org.json.JSONArray()
+                    activeStops.filter { it.status == "PENDING" }.forEach { s ->
+                        upcoming.put(org.json.JSONObject().put("stopId", s.stopId).put("name", s.name).put("kind", s.kind)
+                            .put("note", s.note).put("address", s.address)
+                            .apply { s.latitude?.let { put("latitude", it) }; s.longitude?.let { put("longitude", it) } })
+                    }
+                    upcoming.put(stopsJson(listOf(action.leg)).getJSONObject(0))
+                    api.replaceStops(rideId, upcoming)
+                }
+            }
+            onMain {
+                when (result) {
+                    is ApiResult.Ok -> setStops(result.value.stops) // the server's event says what changed
+                    is ApiResult.Failed -> speak(result.spoken, NarrationTier.QUEUED)
+                }
+            }
+        }
+    }
+
+    /** A place for a mid-ride stop, found without leaving the ride screen. */
+    private suspend fun findPlaceQuietly(leg: PlannedLeg): PlaceOption? {
+        if (app.memory.enabled) {
+            PreferenceMemoryAgent.direct(leg.spoken, app.memory.current, memoryMoment())?.place?.toOption()?.let { return it }
+        }
+        val candidates = if (BuildConfig.GOOGLE_MAPS_API_KEY.isNotBlank()) {
+            val location = runCatching { app.locationProvider.current() }.getOrNull()
+            app.placeResolver.search(leg.query, location).getOrNull().orEmpty()
+        } else emptyList()
+        val all = candidates.ifEmpty { Gazetteer.score(leg.query) }
+        return (MatchGate.evaluate(leg.spoken, all) as? MatchGate.Decision.Proceed)?.top
+    }
+
+    // =================================================================================
+    //  Walking routes — "the last hundred metres"
+    //
+    //  The cab gets the rider to the kerb; this gets them from the kerb to the door.
+    //
+    //   "record my walk to the clinic door" ─▶ consent (once) ─▶ steps, compass and GPS
+    //       recorded on this phone; the rider presses and says what they notice ("kerb here",
+    //       "bakery smell on my left", "turning left") ─▶ "I'm there" ─▶ O&M-style stretches,
+    //       read back and saved under a name
+    //   "how do I get to the clinic" ─▶ the whole route, at the detail familiarity allows
+    //   "guide me to the clinic"     ─▶ one part at a time: next / repeat / more or less detail
+    //       / I'm there; the walk is re-recorded silently, so a changed route is noticed and
+    //       the rider is asked about a landmark that may be gone ("was the bakery smell still
+    //       there?")
+    //   In the cab: "tell me the walk" previews it before getting out. After the ride the app
+    //   says when it has a walk from this drop-off.
+    //
+    //  Everything stays on the phone (WalkStore). It never says the way is clear.
+    // =================================================================================
+
+    private enum class WalkMode { NONE, CONSENT, RECORDING, NAMING, UPDATE_CONFIRM, GUIDING, VERIFY }
+
+    private val walkStore by lazy { WalkStore(getApplication()) }
+    private var walkMode = WalkMode.NONE
+    private var walkName = ""
+    /** The cab destination a new walk is linked to (recorded soon after a ride there). */
+    private var walkPlace: Pair<String, String>? = null
+    private var walkBuilt: RouteBuilder.Built? = null
+    private var walkOld: WalkRoute? = null
+    private var guideRoute: WalkRoute? = null
+    private var guidePart = 0
+    private var guideHelp = 0
+    private var guideRecording = false
+    private var verifyRoute: WalkRoute? = null
+    private var verifyLandmark: Landmark? = null
+    private var lastRideEndedAt = 0L
+    private var lastRidePlace: PlaceOption? = null
+
+    private fun walkLog(routeId: String, event: String, detail: String = "") =
+        walkStore.log(WalkLogEntry(System.currentTimeMillis(), routeId, event, detail))
+
+    /**
+     * Walking-route words. @return true when handled. Called before the cab classifier, so
+     * "how do I get to the clinic" is never booked as a ride.
+     */
+    private fun handleWalkSpeech(text: String): Boolean {
+        if (micPurpose == MicPurpose.WALK) {
+            handleWalkAnswer(text)
+            return true
+        }
+        // "Guide me" answers the after-ride question too: the walk to the door comes first.
+        if (micPurpose == MicPurpose.NEXT_JOURNEY && WalkCommands.parse(text) != null) {
+            endPostRide(null)
+            return handleWalkCommand(text)
+        }
+        if (micPurpose != MicPurpose.BOOKING && micPurpose != MicPurpose.SLOT_ANSWER) return false
+        if (uiState.ride is RiderState.Confirming || planStage != null) return false
+        return handleWalkCommand(text)
+    }
+
+    private fun handleWalkCommand(text: String): Boolean {
+        val cmd = WalkCommands.parse(text) ?: return false
+        val inCar = activeRideId != null
+        engine.earcon(Earcon.UNDERSTOOD)
+        when (cmd) {
+            is WalkCommands.Command.Record -> when {
+                inCar -> speak("I'll record your walk once you're out of the car. Say record my walk then.", NarrationTier.QUEUED)
+                !walkStore.profile().consentGiven -> {
+                    walkMode = WalkMode.CONSENT
+                    walkName = cmd.name
+                    speak(
+                        "I'll record this walk's steps, direction and position on this phone only, to build a route " +
+                            "you can ask for later. Nothing leaves the phone. Shall I start?",
+                        NarrationTier.QUEUED
+                    ) { openMic(MicPurpose.WALK) }
+                }
+                else -> startWalkRecording(cmd.name)
+            }
+            is WalkCommands.Command.Recall -> recallWalk(cmd.name, cmd.guided)
+            WalkCommands.Command.List -> {
+                val names = walkStore.routes().map { it.name }
+                speak(
+                    when (names.size) {
+                        0 -> "You haven't saved a walking route yet. When you're at the start, say record my walk."
+                        1 -> "You have one walking route: ${names[0]}."
+                        else -> "You have ${names.size} walking routes: ${names.joinToString(", ")}."
+                    },
+                    NarrationTier.QUEUED
+                )
+            }
+            is WalkCommands.Command.Forget -> {
+                val r = RouteMemory.find(walkStore.routes(), cmd.name)
+                if (r == null) speak("I don't have a walking route called ${cmd.name}.", NarrationTier.QUEUED)
+                else {
+                    walkStore.delete(r.id)
+                    walkLog(r.id, "FORGET")
+                    speak("Done. I've forgotten the route to ${r.name}.", NarrationTier.QUEUED)
+                }
+            }
+            WalkCommands.Command.ForgetAll -> {
+                walkStore.clear()
+                speak("Done. I've forgotten all your walking routes.", NarrationTier.QUEUED)
+            }
+            WalkCommands.Command.Export -> exportWalkLog()
+        }
+        return true
+    }
+
+    // ---- recording ----------------------------------------------------------------------
+
+    private fun startWalkRecording(name: String) {
+        val now = System.currentTimeMillis()
+        walkName = name
+        // Recorded within half an hour of a ride: this is the walk from that drop-off.
+        walkPlace = lastRidePlace?.takeIf { now - lastRideEndedAt < 30 * 60_000L }
+            ?.let { RouteMemory.placeKey(it.placeId, it.name) to it.name }
+        WalkRecorder.begin(now)
+        val started = WalkRecordingService.start(getApplication())
+        if (!started) {
+            WalkRecorder.finish()
+            speak("I couldn't start recording on this phone.", NarrationTier.QUEUED)
+            return
+        }
+        walkMode = WalkMode.RECORDING
+        walkLog("", "RECORD_START", name)
+        showWalk(recording = true, prompt = "Recording your walk")
+        speak(
+            "Recording. Walk as you normally would. Press the screen and tell me what you notice: a kerb, a smell, " +
+                "a sound, a door — or say turning left. Say I'm there at the end.",
+            NarrationTier.QUEUED
+        )
+    }
+
+    private fun finishWalkRecording() {
+        WalkRecordingService.stop(getApplication())
+        val events = WalkRecorder.finish()
+        val now = System.currentTimeMillis()
+        val built = RouteBuilder.build(events, now, idPrefix = "lm${now.toString(36)}")
+        if (built.segments.isEmpty() || built.segments.sumOf { it.metres } < 3.0) {
+            resetWalk()
+            transition(RiderState.Idle, announce = false)
+            speak("I didn't get enough of the walk to save it. Keep the phone with you and try again.", NarrationTier.QUEUED)
+            return
+        }
+        walkBuilt = built
+        val routes = walkStore.routes()
+        val existing = (if (walkName.isNotBlank()) RouteMemory.find(routes, walkName) else null)
+            ?: walkPlace?.let { RouteMemory.forPlace(routes, it.first) }
+        if (existing != null) {
+            compareWithStored(existing, built, help = 0)
+            return
+        }
+        if (walkName.isBlank()) {
+            walkMode = WalkMode.NAMING
+            val draft = draftRoute("this route", built, now)
+            speak("${WalkNarrator.narrate(draft, DetailLevel.BRIEF, now)} What should I call this route?", NarrationTier.QUEUED) {
+                openMic(MicPurpose.WALK)
+            }
+        } else {
+            saveNewWalk(walkName)
+        }
+    }
+
+    private fun draftRoute(name: String, built: RouteBuilder.Built, now: Long) = WalkRoute(
+        id = "walk-${now.toString(36)}",
+        name = name,
+        placeKey = walkPlace?.first.orEmpty(),
+        placeName = walkPlace?.second.orEmpty(),
+        start = if (walkPlace != null) "where the cab stops" else "where you started",
+        segments = built.segments,
+        createdAt = now,
+        updatedAt = now,
+        lastWalkedAt = now,
+        walks = 1,
+        indoor = built.indoor
+    )
+
+    private fun saveNewWalk(name: String) {
+        val built = walkBuilt ?: return
+        val now = System.currentTimeMillis()
+        val route = draftRoute(name, built, now)
+        walkStore.save(route)
+        walkLog(route.id, "RECORD_SAVED", "segments=${route.segments.size} metres=${route.totalMetres.toInt()} indoor=${route.indoor}")
+        resetWalk()
+        transition(RiderState.Idle, announce = false)
+        engine.earcon(Earcon.BOOKING_CONFIRMED)
+        speak(
+            "Saved as $name. ${WalkNarrator.cueLine(route).replaceFirstChar { it.uppercase() }}. " +
+                "Ask me how do I get to $name, or say guide me to $name, whenever you need it.",
+            NarrationTier.QUEUED
+        )
+    }
+
+    /** A walk along a stored route just ended (recorded or guided): same, or changed? */
+    private fun compareWithStored(stored: WalkRoute, built: RouteBuilder.Built, help: Int) {
+        val now = System.currentTimeMillis()
+        when (val c = RouteMemory.compare(stored, built.segments)) {
+            RouteMemory.Comparison.Same -> {
+                var r = RouteMemory.rewalked(stored, built.segments, now)
+                if (help > 0) r = r.copy(helpRequests = minOf(stored.helpRequests + help, 3))
+                walkStore.save(r)
+                walkLog(r.id, "WALK_DONE", "help=$help same=true")
+                resetWalk()
+                afterWalk(r, "That matched your route to ${r.name}.")
+            }
+            is RouteMemory.Comparison.Changed -> {
+                walkOld = RouteMemory.walked(stored, help, now)
+                walkBuilt = built
+                walkMode = WalkMode.UPDATE_CONFIRM
+                walkLog(stored.id, "CHANGE_DETECTED", c.sentence)
+                speak("This walk was different from the route I saved. ${c.sentence} Shall I update the saved route?",
+                    NarrationTier.QUEUED) { openMic(MicPurpose.WALK) }
+            }
+        }
+    }
+
+    /** After a walk: one landmark worth checking, else done. */
+    private fun afterWalk(route: WalkRoute, lead: String) {
+        val now = System.currentTimeMillis()
+        val ask = RouteMemory.toVerify(route, now)
+        transition(RiderState.Idle, announce = false)
+        if (ask == null) {
+            speak(lead, NarrationTier.QUEUED)
+            return
+        }
+        walkMode = WalkMode.VERIFY
+        verifyRoute = route
+        verifyLandmark = ask
+        speak("$lead One question: was ${WalkNarrator.phrase(ask)} still there? Say yes, no, or tell me what's there now.",
+            NarrationTier.QUEUED) { openMic(MicPurpose.WALK) }
+    }
+
+    // ---- recall and guidance ------------------------------------------------------------
+
+    private fun walkForContext(): WalkRoute? {
+        val routes = walkStore.routes()
+        val place = (if (activeRideId != null) lastBookingPlace else lastRidePlace)
+        return place?.let { RouteMemory.forPlace(routes, RouteMemory.placeKey(it.placeId, it.name)) }
+            ?: routes.singleOrNull()
+    }
+
+    private fun recallWalk(name: String, guided: Boolean) {
+        val routes = walkStore.routes()
+        val route = if (name.isBlank()) walkForContext() else RouteMemory.find(routes, name)
+        if (route == null) {
+            speak(
+                when {
+                    routes.isEmpty() -> "You haven't saved a walking route yet. When you're at the start, say record my walk."
+                    name.isBlank() -> "Which route? You have ${routes.joinToString(", ") { it.name }}."
+                    else -> "I don't have a walking route to $name. When you're there, say record my walk to $name."
+                },
+                NarrationTier.QUEUED
+            )
+            return
+        }
+        val now = System.currentTimeMillis()
+        val level = WalkNarrator.levelFor(route, walkStore.profile())
+        if (!guided || activeRideId != null) {
+            walkLog(route.id, if (activeRideId != null) "PREVIEW" else "RECALL", "level=$level")
+            val tail = when {
+                activeRideId != null -> " Say guide me after you get out, and I'll take you one part at a time."
+                else -> " Say guide me to go one part at a time."
+            }
+            speak(WalkNarrator.narrate(route, level, now) + tail, NarrationTier.QUEUED)
+            return
+        }
+        // Guided: one part at a time, re-recording silently when the rider has agreed to recording.
+        guideRoute = route
+        guidePart = 0
+        guideHelp = 0
+        guideRecording = walkStore.profile().consentGiven && WalkRecordingService.start(getApplication())
+        if (guideRecording) WalkRecorder.begin(now)
+        walkMode = WalkMode.GUIDING
+        walkLog(route.id, "GUIDE_START", "level=$level recording=$guideRecording")
+        showWalk(recording = false, prompt = "Part 1 of ${route.segments.size}")
+        speak(
+            "Guiding you to ${route.name}, ${route.segments.size} ${if (route.segments.size == 1) "part" else "parts"}. " +
+                "Press the screen and say next at each turn, repeat, more detail, or I'm there. " +
+                WalkNarrator.segment(route, 0, level, now),
+            NarrationTier.QUEUED
+        )
+    }
+
+    private fun speakGuidePart(lead: String = "") {
+        val route = guideRoute ?: return
+        val now = System.currentTimeMillis()
+        val level = WalkNarrator.levelFor(route.copy(helpRequests = route.helpRequests + guideHelp), walkStore.profile())
+        showWalk(recording = false, prompt = "Part ${guidePart + 1} of ${route.segments.size}")
+        speak(lead + WalkNarrator.segment(route, guidePart, level, now), NarrationTier.QUEUED)
+    }
+
+    private fun finishGuide(stopped: Boolean) {
+        val route = guideRoute ?: return
+        val events = if (guideRecording) { WalkRecordingService.stop(getApplication()); WalkRecorder.finish() } else emptyList()
+        val now = System.currentTimeMillis()
+        if (stopped) {
+            walkLog(route.id, "GUIDE_STOPPED", "part=${guidePart + 1} help=$guideHelp")
+            resetWalk()
+            transition(RiderState.Idle, announce = false)
+            speak("Okay, I've stopped guiding.", NarrationTier.QUEUED)
+            return
+        }
+        val built = if (events.isNotEmpty()) RouteBuilder.build(events, now, idPrefix = "lm${now.toString(36)}") else null
+        val help = guideHelp
+        resetWalk()
+        if (built != null && built.segments.isNotEmpty() && built.segments.sumOf { it.metres } >= 3.0) {
+            compareWithStored(route, built, help)
+        } else {
+            val r = RouteMemory.walked(route, help, now)
+            walkStore.save(r)
+            walkLog(r.id, "WALK_DONE", "help=$help recorded=false")
+            afterWalk(r, "You're at ${route.name}.")
+        }
+    }
+
+    // ---- answers ------------------------------------------------------------------------
+
+    private fun handleWalkAnswer(text: String) {
+        val yesNo = Classifier.classify(text, false).intent
+        val shortCancel = com.cabeye.rider.intent.IntentParser.CANCEL.containsMatchIn(text) &&
+            text.trim().split(Regex("\\s+")).size <= 3
+        when (walkMode) {
+            WalkMode.CONSENT -> when {
+                yesNo is RiderIntent.Yes -> {
+                    walkStore.saveProfile(walkStore.profile().copy(consentGiven = true))
+                    walkLog("", "CONSENT", "yes")
+                    startWalkRecording(walkName)
+                }
+                else -> { resetWalk(); speak("Okay, I won't record.", NarrationTier.QUEUED) }
+            }
+            WalkMode.RECORDING -> when (val input = WalkCommands.record(text)) {
+                WalkCommands.RecordInput.Finish -> finishWalkRecording()
+                WalkCommands.RecordInput.Cancel -> {
+                    WalkRecordingService.stop(getApplication()); WalkRecorder.finish()
+                    resetWalk(); transition(RiderState.Idle, announce = false)
+                    speak("Okay, I've discarded that walk.", NarrationTier.QUEUED)
+                }
+                is WalkCommands.RecordInput.Turn -> {
+                    WalkRecorder.add(WalkEvent.Turn(System.currentTimeMillis(), input.direction))
+                    speak("${input.direction.spoken.replaceFirstChar { it.uppercase() }}.", NarrationTier.QUEUED)
+                }
+                is WalkCommands.RecordInput.Mark -> {
+                    WalkRecorder.add(WalkEvent.Mark(System.currentTimeMillis(), input.spoken))
+                    val r = input.result
+                    speak("Noted: the ${r.text}${if (r.side != Side.NONE) " ${r.side.spoken}" else ""}.", NarrationTier.QUEUED)
+                }
+                is WalkCommands.RecordInput.Visual -> {
+                    walkLog("", "VISUAL_REFUSED", input.text)
+                    speak("I'll only keep things you can feel, hear or smell — a sign or a colour won't help when you " +
+                        "walk it. What can you feel, hear or smell here?", NarrationTier.QUEUED) { openMic(MicPurpose.WALK) }
+                }
+                null -> speak("Tell me what you notice — a kerb, a smell, a sound — or say turning left, or I'm there.",
+                    NarrationTier.QUEUED)
+            }
+            WalkMode.NAMING -> {
+                val name = text.lowercase()
+                    .replace(Regex("^(?:call it|name it|save it as|it'?s|the|my)\\s+"), "")
+                    .replace(Regex("[^a-z0-9' ]"), " ").replace(Regex("\\s+"), " ").trim()
+                if (shortCancel) { resetWalk(); transition(RiderState.Idle, announce = false); speak("Okay, not saved.", NarrationTier.QUEUED) }
+                else if (name.isBlank()) speak("Say a short name, like clinic door.", NarrationTier.QUEUED) { openMic(MicPurpose.WALK) }
+                else saveNewWalk(name)
+            }
+            WalkMode.UPDATE_CONFIRM -> {
+                val old = walkOld ?: return
+                val built = walkBuilt ?: return
+                val now = System.currentTimeMillis()
+                resetWalk()
+                if (yesNo is RiderIntent.Yes) {
+                    val r = RouteMemory.replaced(old, built.segments, now)
+                    walkStore.save(r)
+                    walkLog(r.id, "ROUTE_UPDATED")
+                    transition(RiderState.Idle, announce = false)
+                    speak("Updated. ${WalkNarrator.cueLine(r).replaceFirstChar { it.uppercase() }}.", NarrationTier.QUEUED)
+                } else {
+                    walkStore.save(old)
+                    walkLog(old.id, "ROUTE_KEPT")
+                    transition(RiderState.Idle, announce = false)
+                    speak("Okay, I kept the saved route.", NarrationTier.QUEUED)
+                }
+            }
+            WalkMode.GUIDING -> {
+                val route = guideRoute ?: return
+                when (WalkCommands.guide(text)) {
+                    WalkCommands.Guide.NEXT -> {
+                        walkLog(route.id, "NEXT", "part=${guidePart + 1}")
+                        // "Next" is said at the turn: record it, so the re-walk keeps the turn the
+                        // compass may have smoothed over.
+                        val turn = route.segments[guidePart].turn
+                        if (guideRecording && turn != TurnDirection.NONE) {
+                            WalkRecorder.add(WalkEvent.Turn(System.currentTimeMillis(), turn))
+                        }
+                        if (guidePart + 1 < route.segments.size) { guidePart++; speakGuidePart() } else finishGuide(stopped = false)
+                    }
+                    WalkCommands.Guide.REPEAT -> { guideHelp++; walkLog(route.id, "REPEAT", "part=${guidePart + 1}"); speakGuidePart() }
+                    WalkCommands.Guide.PREVIOUS -> { guidePart = (guidePart - 1).coerceAtLeast(0); speakGuidePart() }
+                    WalkCommands.Guide.MORE_DETAIL -> {
+                        guideHelp++
+                        val p = walkStore.profile()
+                        walkStore.saveProfile(p.copy(detailBias = (p.detailBias + 1).coerceAtMost(2)))
+                        walkLog(route.id, "MORE_DETAIL")
+                        speakGuidePart("More detail. ")
+                    }
+                    WalkCommands.Guide.LESS_DETAIL -> {
+                        val p = walkStore.profile()
+                        walkStore.saveProfile(p.copy(detailBias = (p.detailBias - 1).coerceAtLeast(-2)))
+                        walkLog(route.id, "LESS_DETAIL")
+                        speakGuidePart("Less detail. ")
+                    }
+                    WalkCommands.Guide.ARRIVED -> finishGuide(stopped = false)
+                    WalkCommands.Guide.STOP -> finishGuide(stopped = true)
+                    null -> {
+                        // A correction or a new landmark said mid-walk.
+                        val now = System.currentTimeMillis()
+                        val fixed = RouteMemory.correct(route, text, null, now, "lm${now.toString(36)}")
+                        when {
+                            fixed != null -> {
+                                guideRoute = fixed.first
+                                walkStore.save(fixed.first)
+                                walkLog(route.id, "CORRECTION", text)
+                                speak(fixed.second, NarrationTier.QUEUED)
+                            }
+                            guideRecording && WalkCommands.record(text) is WalkCommands.RecordInput.Mark -> {
+                                WalkRecorder.add(WalkEvent.Mark(now, text))
+                                speak("Noted.", NarrationTier.QUEUED)
+                            }
+                            else -> speak("Say next, repeat, more detail, or I'm there.", NarrationTier.QUEUED)
+                        }
+                    }
+                }
+            }
+            WalkMode.VERIFY -> {
+                val route = verifyRoute ?: return
+                val l = verifyLandmark ?: return
+                val now = System.currentTimeMillis()
+                resetWalk()
+                when {
+                    yesNo is RiderIntent.Yes -> {
+                        walkStore.save(RouteMemory.confirm(route, l.id, now))
+                        walkLog(route.id, "VERIFY_YES", l.text)
+                        speak("Thanks, noted.", NarrationTier.QUEUED)
+                    }
+                    yesNo is RiderIntent.No || Regex("\\b(gone|not there|wasn'?t there|isn'?t there|missing|removed|closed)\\b")
+                        .containsMatchIn(text.lowercase()) -> {
+                        val (r, removed) = RouteMemory.miss(route, l.id, now)
+                        walkStore.save(r)
+                        walkLog(route.id, "VERIFY_NO", l.text)
+                        speak(if (removed) "I've taken ${WalkNarrator.phrase(l, withSide = false)} off the route."
+                        else "Okay. I'll say it may be gone, and ask again next time.", NarrationTier.QUEUED)
+                    }
+                    else -> {
+                        val fixed = RouteMemory.correct(route, text, l, now, "lm${now.toString(36)}")
+                        if (fixed != null) {
+                            walkStore.save(fixed.first)
+                            walkLog(route.id, "CORRECTION", text)
+                            speak(fixed.second, NarrationTier.QUEUED)
+                        } else speak("Okay.", NarrationTier.QUEUED)
+                    }
+                }
+            }
+            WalkMode.NONE -> speak("Say record my walk, or how do I get to a place.", NarrationTier.QUEUED)
+        }
+    }
+
+    /** Silence or a recognition error while the walk mic was open. */
+    private fun onWalkNoAnswer() {
+        when (walkMode) {
+            WalkMode.CONSENT -> { resetWalk(); speak("Okay, I won't record.", NarrationTier.QUEUED) }
+            WalkMode.NAMING -> saveNewWalk(walkPlace?.second?.lowercase() ?: "walk ${walkStore.routes().size + 1}")
+            WalkMode.UPDATE_CONFIRM -> handleWalkAnswer("no")
+            WalkMode.VERIFY -> resetWalk()
+            // Recording and guidance go on: the rider presses again when they need to.
+            WalkMode.RECORDING, WalkMode.GUIDING, WalkMode.NONE -> Unit
+        }
+    }
+
+    /** Screen buttons on the walking screen, for a helper or a TalkBack user. */
+    private fun onWalkAction(action: String) {
+        when (action) {
+            "walk-mark" -> openMic(MicPurpose.WALK)
+            "walk-left" -> if (walkMode == WalkMode.RECORDING) handleWalkAnswer("turning left")
+            "walk-right" -> if (walkMode == WalkMode.RECORDING) handleWalkAnswer("turning right")
+            "walk-done" -> when (walkMode) {
+                WalkMode.RECORDING -> finishWalkRecording()
+                WalkMode.GUIDING -> finishGuide(stopped = false)
+                else -> Unit
+            }
+            "walk-next" -> if (walkMode == WalkMode.GUIDING) handleWalkAnswer("next")
+            "walk-repeat" -> if (walkMode == WalkMode.GUIDING) handleWalkAnswer("repeat")
+            "walk-stop" -> when (walkMode) {
+                WalkMode.RECORDING -> handleWalkAnswer("cancel recording")
+                WalkMode.GUIDING -> finishGuide(stopped = true)
+                else -> Unit
+            }
+        }
+    }
+
+    private fun showWalk(recording: Boolean, prompt: String) {
+        val route = guideRoute
+        val lines = if (route != null) route.segments.mapIndexed { i, s ->
+            (if (i == guidePart) "▶ " else "") + "${i + 1}. about ${WalkNarrator.roundMetres(s.metres)} m" +
+                (if (s.turn != TurnDirection.NONE) ", then ${s.turn.spoken.removePrefix("turn ")}" else "") +
+                (s.landmarks.firstOrNull()?.let { " · ${it.text}" } ?: "")
+        } else listOf("Steps so far: ${WalkRecorder.steps()}")
+        transition(RiderState.Walking(prompt, lines, recording, guiding = route != null), announce = false)
+    }
+
+    private fun resetWalk() {
+        walkMode = WalkMode.NONE
+        walkName = ""
+        walkPlace = null
+        walkBuilt = null
+        walkOld = null
+        guideRoute = null
+        guidePart = 0
+        guideHelp = 0
+        guideRecording = false
+        verifyRoute = null
+        verifyLandmark = null
+    }
+
+    /** "export my walking log": the field-study measures, as CSV, through the share sheet. */
+    private fun exportWalkLog() {
+        val entries = walkStore.logEntries()
+        if (entries.isEmpty()) {
+            speak("There's nothing in the walking log yet.", NarrationTier.QUEUED)
+            return
+        }
+        val send = android.content.Intent(android.content.Intent.ACTION_SEND)
+            .setType("text/csv")
+            .putExtra(android.content.Intent.EXTRA_SUBJECT, "Cab Eye walking log")
+            .putExtra(android.content.Intent.EXTRA_TEXT, RouteMemory.csv(entries))
+        runCatching {
+            getApplication<android.app.Application>().startActivity(
+                android.content.Intent.createChooser(send, "Share walking log")
+                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        }
+        speak("The walking log has ${entries.size} entries. Choose where to send it.", NarrationTier.QUEUED)
+    }
+
 
     // =================================================================================
     //  After the ride: optional feedback, then the next journey
@@ -3531,6 +4963,28 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             "schedule" -> startScheduling(fromIdle = false)
             "confirm" -> if (ride is RiderState.NextJourney && ride.step == NextStep.CONFIRM) saveSchedule()
             "done" -> endPostRide("Okay. Hold anywhere when you need a ride.")
+            // Walking-route buttons.
+            "walk-mark", "walk-left", "walk-right", "walk-done", "walk-next", "walk-repeat", "walk-stop" -> onWalkAction(action)
+            // Multi-stop buttons, for a sighted helper.
+            "im-back" -> {
+                val stop = currentStop()
+                if (stop != null && stop.status == "WAITING" && !stop.riderBack) {
+                    listenForStopCode("Welcome back. Ask the driver to say the code.")
+                }
+            }
+            "plan-yes" -> when {
+                pendingRoutine != null -> acceptRoutine()
+                planStage == PlanStage.REVIEW -> bookPlan()
+            }
+            "plan-no" -> when {
+                pendingRoutine != null -> rejectRoutine()
+                planStage == PlanStage.REVIEW -> {
+                    showPlan("What would you like to change?")
+                    speak("What would you like to change? Say remove, swap, add a stop, or cancel.", NarrationTier.QUEUED) {
+                        openMic(MicPurpose.PLAN_REVIEW)
+                    }
+                }
+            }
         }
     }
 
@@ -3761,6 +5215,11 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
      * otherwise part of the "five second window" would be spent listening to the app talk.
      */
     private fun beginOptimisticBooking(place: PlaceOption, rideType: RideType, note: String = "") {
+        // While a route is being planned, a found place belongs to the leg being asked about.
+        if (planStage == PlanStage.RESOLVING && plan != null) {
+            onPlanLegResolved(place)
+            return
+        }
         cancelWindowJob?.cancel()
         silenceJob?.cancel()
         lastBooking = place.name to rideType
@@ -3791,7 +5250,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         engine.earcon(Earcon.BOOKING_CONFIRMED)
 
         speak(
-            buildBookingAnnouncement(place, rideType, note),
+            bookingPlan?.let { planAnnouncement(it, place, rideType) } ?: buildBookingAnnouncement(place, rideType, note),
             NarrationTier.QUEUED,
             onStart = {
                 // T4 — the moment the rider first HEARS something.
@@ -3821,6 +5280,13 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         } else {
             "Booking ${rideType.spokenName} to ${place.name}$why. Say cancel to stop."
         }
+    }
+
+    /** "Booking auto to PSG College, with 2 stops: Apollo Pharmacy, then Gandhipuram. Say cancel to stop." */
+    private fun planAnnouncement(p: TripPlan, place: PlaceOption, rideType: RideType): String {
+        val n = p.stops.size
+        val stops = p.stops.joinToString(", then ") { it.name }
+        return "Booking ${rideType.spokenName} to ${place.name}, with $n ${if (n == 1) "stop" else "stops"}: $stops. Say cancel to stop."
     }
 
     private var bookingStartedAt: Long = System.currentTimeMillis()
@@ -3875,11 +5341,14 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                 contactName = chosenContact?.name.orEmpty(),
                 contactPhone = chosenContact?.phone.orEmpty(),
                 dropNote = chosenDropNote,
-                spokenAs = pendingSpokenAs.also { pendingSpokenAs = "" }
+                spokenAs = pendingSpokenAs.also { pendingSpokenAs = "" },
+                stops = bookingPlan?.stops.orEmpty()
             )) {
                 is ApiResult.Ok -> {
                     val snapshot = result.value
                     activeRideId = snapshot.rideId
+                    activeStops = snapshot.stops
+                    bookingPlan = null
                     expectedCode = snapshot.boardingCode
                     // A new ride: the last ride's payment panel and watcher belong to it, not this.
                     paymentPollJob?.cancel()
@@ -3896,6 +5365,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                     // The booking failed, and this is the moment a silent app would be at its
                     // most dangerous: the rider has been told a cab is coming. It is not.
                     Log.w(TAG, "RIDE creation failed: ${result.detail}")
+                    bookingPlan = null
                     engine.heartbeat(false)
                     engine.earcon(Earcon.ERROR)
                     transition(RiderState.Idle, announce = false)
@@ -3926,6 +5396,10 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         codeVerified = false
         codeListenJob?.cancel()
         codeListenJob = null
+        activeStops = emptyList()
+        codeForStop = false
+        pendingTripAction = null
+        addingStopMidTrip = null
         uiState = uiState.copy(selectedDestination = null)
         NarrationService.stop(getApplication())
     }
@@ -4098,6 +5572,22 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun handleSpeechError(error: SpeechError) {
+        if (micPurpose == MicPurpose.WALK) {
+            onWalkNoAnswer()
+            return
+        }
+        // Mid-ride stop words: never a reason to leave the ride screen.
+        if (micPurpose == MicPurpose.TRIP_COMMAND || micPurpose == MicPurpose.STOP_CONFIRM ||
+            (micPurpose == MicPurpose.STOP_KIND && addingStopMidTrip != null) ||
+            (micPurpose == MicPurpose.CODE_VERIFY && codeForStop)
+        ) {
+            pendingTripAction = null
+            addingStopMidTrip = null
+            if (error == SpeechError.NO_MATCH || error == SpeechError.NO_SPEECH) {
+                speak("I didn't catch that. Press the screen to try again.", NarrationTier.QUEUED)
+            }
+            return
+        }
         if (micPurpose == MicPurpose.CANCEL_WINDOW) {
             if (uiState.ride is RiderState.Confirming) openMic(MicPurpose.CANCEL_WINDOW)
             return
@@ -4140,6 +5630,8 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
 
         if (consecutiveSpeechErrors > MAX_CONSECUTIVE_ERRORS) {
             consecutiveSpeechErrors = 0
+            resetPlan()
+            pendingRoutine = null
             pendingOptions = null
             pendingNearMiss = null
             engine.earcon(Earcon.ERROR)
@@ -4205,7 +5697,21 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                 return
             }
 
+            MicPurpose.PLAN_LEG, MicPurpose.STOP_KIND, MicPurpose.PLAN_REVIEW -> {
+                speak("Sorry, I didn't catch that. $lastSpoken", NarrationTier.QUEUED) { openMic(micPurpose) }
+                return
+            }
+
+            MicPurpose.TRIP_COMMAND, MicPurpose.STOP_CONFIRM, MicPurpose.WALK -> return
+
             MicPurpose.MEMORY_ANSWER -> {
+                val routine = pendingRoutine
+                if (routine != null) {
+                    speak("Sorry. ${routine.spokenRoute()}? Yes or no.", NarrationTier.QUEUED) {
+                        openMic(MicPurpose.MEMORY_ANSWER)
+                    }
+                    return
+                }
                 val pending = pendingMemory
                 if (pending != null) {
                     speak("Sorry. ${pending.place.name}? Yes or no.", NarrationTier.QUEUED) {
@@ -4240,6 +5746,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     /** Applies a server snapshot to the screen without narrating anything. */
     private fun applySnapshot(snapshot: RideSnapshot, announce: Boolean) {
         expectedCode = snapshot.boardingCode.ifBlank { expectedCode }
+        activeStops = snapshot.stops
 
         val driver = DriverInfo(
             name = snapshot.driverName.ifBlank { "Your driver" },
@@ -4259,7 +5766,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                 driver, expectedCode, Headphones.connected(getApplication())
             )
             RidePhase.SEATED, RidePhase.IN_TRIP -> RiderState.InTrip(
-                snapshot.destination, snapshot.etaMinutes, driver
+                snapshot.destination, snapshot.etaMinutes, driver, snapshot.stops
             )
             RidePhase.COMPLETED -> RiderState.Done(
                 snapshot.destination, snapshot.fareRupees, snapshot.durationMinutes

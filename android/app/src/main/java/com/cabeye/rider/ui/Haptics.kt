@@ -47,6 +47,18 @@ enum class HapticPattern(val timings: LongArray, val amplitudes: IntArray) {
     /** SOS raised. Three hard pulses. */
     SOS(longArrayOf(0, 120, 80, 120, 80, 120), intArrayOf(0, 255, 0, 255, 0, 255)),
 
+    /** Driver assigned. Double light pulse. */
+    DRIVER_ASSIGNED(longArrayOf(0, 35, 60, 35), intArrayOf(0, 160, 0, 160)),
+
+    /** Boarding verified. Success pulse. */
+    BOARDING_VERIFIED(longArrayOf(0, 50, 60, 70), intArrayOf(0, 200, 0, 255)),
+
+    /** Wrong boarding code. Warning/error pulse. */
+    WRONG_CODE(longArrayOf(0, 80, 50, 80, 50, 80), intArrayOf(0, 220, 0, 220, 0, 220)),
+
+    /** Trip completed. Success pattern. */
+    TRIP_COMPLETED(longArrayOf(0, 60, 80, 60, 80, 120), intArrayOf(0, 200, 0, 220, 0, 255)),
+
     /**
      * The camera is still on. One very light tick every few seconds — felt, not heard, so it
      * never reaches the microphone listening for the boarding code.

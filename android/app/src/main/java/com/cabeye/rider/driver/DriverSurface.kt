@@ -44,6 +44,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.cabeye.rider.net.StopInfo
 import com.cabeye.rider.ui.QrCode
 import com.cabeye.rider.ui.theme.LocalPalette
 import com.cabeye.rider.ui.theme.MinTouchTarget
@@ -89,6 +90,8 @@ fun DriverSurface(
     cameraFrame: Bitmap? = null,
     onRequestCamera: () -> Unit = {},
     onStopCamera: () -> Unit = {},
+    onStopArrived: () -> Unit = {},
+    onStopDone: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val palette = LocalPalette.current
@@ -123,7 +126,7 @@ fun DriverSurface(
                     onMessage = onMessage
                 )
                 is DriverState.Seated -> SeatedScreen(onStartTrip)
-                is DriverState.InTrip -> InTripScreen(state, onComplete, onMessage)
+                is DriverState.InTrip -> InTripScreen(state, onComplete, onMessage, onStopArrived, onStopDone)
                 is DriverState.Complete -> CompleteScreen(state, onFinish)
             }
 
@@ -260,6 +263,15 @@ private fun RequestScreen(
     )
     Spacer(Modifier.height(8.dp))
     Text(state.rideType.lowercase(), style = MaterialTheme.typography.bodyLarge, color = palette.muted)
+
+    if (state.stops.isNotEmpty()) {
+        Spacer(Modifier.height(16.dp))
+        Text(
+            "${state.stops.size} ${if (state.stops.size == 1) "stop" else "stops"} on the way",
+            style = MaterialTheme.typography.labelLarge, color = palette.listening
+        )
+        StopList(state.stops)
+    }
 
     Spacer(Modifier.height(36.dp))
     DriverButton("ACCEPT", palette.confirm, onClick = onAccept)
@@ -628,9 +640,21 @@ private fun SeatedScreen(onStartTrip: () -> Unit) {
 private fun InTripScreen(
     state: DriverState.InTrip,
     onComplete: () -> Unit,
-    onMessage: (String) -> Unit
+    onMessage: (String) -> Unit,
+    onStopArrived: () -> Unit = {},
+    onStopDone: () -> Unit = {}
 ) {
     val palette = LocalPalette.current
+    val stop = state.currentStop
+    if (stop != null) {
+        StopCard(stop, onStopArrived, onStopDone)
+        StopList(state.stops)
+        Spacer(Modifier.height(20.dp))
+        MessageComposer(onMessage)
+        Spacer(Modifier.height(24.dp))
+        Text("Then: ${state.destination}", style = MaterialTheme.typography.bodyLarge, color = palette.muted)
+        return
+    }
 
     Spacer(Modifier.height(60.dp))
     Text("On the way", style = MaterialTheme.typography.headlineLarge, color = palette.onBackground)
@@ -665,6 +689,82 @@ private fun InTripScreen(
 
     Spacer(Modifier.height(40.dp))
     DriverButton("COMPLETE TRIP", palette.confirm, onClick = onComplete)
+}
+
+// =====================================================================================
+//  6b — Multi-stop: the stop the car is heading to or standing at
+// =====================================================================================
+
+/**
+ * One stop at a time, like Uber's driver app: navigate there, ARRIVED AT STOP, then DONE.
+ * At a "wait for passenger" stop DONE stays locked until the passenger's phone has heard the
+ * boarding code again — the server refuses it anyway, so the button only saves a refusal.
+ */
+@Composable
+private fun StopCard(stop: StopInfo, onArrived: () -> Unit, onDone: () -> Unit) {
+    val palette = LocalPalette.current
+    val kind = when (stop.kind) {
+        "WAIT" -> "Wait for passenger"
+        "PICKUP" -> "Pick-up"
+        else -> "Drop-off"
+    }
+    Spacer(Modifier.height(24.dp))
+    Text("Stop ${stop.index} · $kind", style = MaterialTheme.typography.labelLarge, color = palette.muted)
+    Spacer(Modifier.height(8.dp))
+    Text(stop.name, style = MaterialTheme.typography.headlineLarge, color = palette.onBackground, textAlign = TextAlign.Center)
+    if (stop.address.isNotBlank()) {
+        Spacer(Modifier.height(6.dp))
+        Text(stop.address, style = MaterialTheme.typography.bodyMedium, color = palette.muted, textAlign = TextAlign.Center)
+    }
+    if (stop.note.isNotBlank()) {
+        Spacer(Modifier.height(6.dp))
+        Text(stop.note, style = MaterialTheme.typography.bodyLarge, color = palette.listening, textAlign = TextAlign.Center)
+    }
+    when (stop.status) {
+        "PENDING" -> {
+            NavigateButton(latitude = stop.latitude, longitude = stop.longitude, label = "NAVIGATE TO STOP ${stop.index}")
+            Spacer(Modifier.height(16.dp))
+            DriverButton("ARRIVED AT STOP", palette.listening, onClick = onArrived)
+        }
+        "WAITING" -> {
+            Spacer(Modifier.height(16.dp))
+            val minutes = (stop.waitLimitSeconds + 59) / 60
+            Text(
+                if (stop.riderBack) "Passenger is back and confirmed the code."
+                else "Passenger is out. Wait up to $minutes min. When they're back, say the boarding code to them.",
+                style = MaterialTheme.typography.bodyLarge,
+                color = if (stop.riderBack) palette.confirm else palette.onBackground,
+                textAlign = TextAlign.Center
+            )
+            Spacer(Modifier.height(16.dp))
+            if (stop.riderBack) DriverButton("DONE — CONTINUE", palette.confirm, onClick = onDone)
+            else Text("DONE unlocks when the passenger's phone confirms the code.",
+                style = MaterialTheme.typography.bodyMedium, color = palette.muted, textAlign = TextAlign.Center)
+        }
+        else -> {
+            Spacer(Modifier.height(16.dp))
+            DriverButton(if (stop.kind == "PICKUP") "PICKED UP — CONTINUE" else "DROPPED — CONTINUE", palette.confirm, onClick = onDone)
+        }
+    }
+}
+
+@Composable
+private fun StopList(stops: List<StopInfo>) {
+    val palette = LocalPalette.current
+    Spacer(Modifier.height(16.dp))
+    stops.forEach { s ->
+        val mark = when (s.status) {
+            "DONE" -> "✓"
+            "SKIPPED" -> "–"
+            "PENDING" -> "○"
+            else -> "●"
+        }
+        Text(
+            "$mark ${s.index}. ${s.name}",
+            style = MaterialTheme.typography.bodyLarge,
+            color = if (s.isOpen) palette.onBackground else palette.muted
+        )
+    }
 }
 
 /**

@@ -214,7 +214,9 @@ class MainActivity : FragmentActivity() {
                             onProfile = accountVm::editProfile,
                             cameraFrame = driverVm.cameraFrame,
                             onRequestCamera = driverVm::requestCamera,
-                            onStopCamera = driverVm::stopCamera
+                            onStopCamera = driverVm::stopCamera,
+                            onStopArrived = driverVm::arrivedAtStop,
+                            onStopDone = driverVm::finishStop
                         )
                         }
                     }
@@ -280,7 +282,9 @@ class MainActivity : FragmentActivity() {
                             onOpenSettings = { showSettings = true },
                             onPostRideAction = vm::onPostRideAction,
                             onCameraAnswer = vm::onCameraAnswer,
-                            onStopCamera = vm::onStopCamera
+                            onStopCamera = vm::onStopCamera,
+                            onCallDriver = vm::onCallDriver,
+                            onHelp = vm::onHelp
                         )
                     }
                 }

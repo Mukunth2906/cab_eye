@@ -56,23 +56,54 @@ public final class JdbcTable<T> implements Table<T> {
     }
 
     // -----------------------------------------------------------------------------------
-    //  Reads — from the in-memory copy
+    //  Reads — querying DB with memory synchronization for multi-instance consistency
     // -----------------------------------------------------------------------------------
 
     @Override
     public synchronized Optional<T> get(String key) {
-        return Optional.ofNullable(rows.get(key));
+        if (key == null) return Optional.empty();
+        List<String> found = jdbc.query(
+                "SELECT body FROM store_rows WHERE table_name = ? AND row_key = ?",
+                (rs, i) -> rs.getString(1),
+                name, key);
+        if (found.isEmpty()) {
+            rows.remove(key);
+            return Optional.empty();
+        }
+        try {
+            T row = mapper.readValue(found.get(0), rowType);
+            rows.put(key, row);
+            return Optional.of(row);
+        } catch (JsonProcessingException e) {
+            log.error("Cannot deserialize row '{}' of table '{}'", key, name, e);
+            return Optional.ofNullable(rows.get(key));
+        }
     }
 
     @Override
     public synchronized List<T> all() {
-        return new ArrayList<>(rows.values());
+        List<Object[]> found = jdbc.query(
+                "SELECT row_key, body FROM store_rows WHERE table_name = ? ORDER BY ord",
+                (rs, i) -> new Object[]{rs.getString(1), rs.getString(2)},
+                name);
+        List<T> out = new ArrayList<>();
+        for (Object[] r : found) {
+            String key = (String) r[0];
+            try {
+                T item = mapper.readValue((String) r[1], rowType);
+                rows.put(key, item);
+                out.add(item);
+            } catch (JsonProcessingException e) {
+                log.warn("Cannot deserialize row '{}' of table '{}'", key, name, e);
+            }
+        }
+        return out;
     }
 
     @Override
     public synchronized List<T> where(Predicate<T> filter) {
         List<T> out = new ArrayList<>();
-        for (T row : rows.values()) {
+        for (T row : all()) {
             if (filter.test(row)) out.add(row);
         }
         return out;
@@ -80,7 +111,7 @@ public final class JdbcTable<T> implements Table<T> {
 
     @Override
     public synchronized Optional<T> first(Predicate<T> filter) {
-        for (T row : rows.values()) {
+        for (T row : all()) {
             if (filter.test(row)) return Optional.of(row);
         }
         return Optional.empty();
@@ -88,16 +119,22 @@ public final class JdbcTable<T> implements Table<T> {
 
     @Override
     public synchronized int size() {
-        return rows.size();
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM store_rows WHERE table_name = ?",
+                Integer.class, name);
+        return count == null ? rows.size() : count;
     }
 
     @Override
     public synchronized Collection<String> keys() {
-        return new ArrayList<>(rows.keySet());
+        return jdbc.query(
+                "SELECT row_key FROM store_rows WHERE table_name = ? ORDER BY ord",
+                (rs, i) -> rs.getString(1),
+                name);
     }
 
     // -----------------------------------------------------------------------------------
-    //  Writes — database first, then the cache
+    //  Writes — database first, then local cache
     // -----------------------------------------------------------------------------------
 
     @Override
@@ -109,9 +146,9 @@ public final class JdbcTable<T> implements Table<T> {
 
     @Override
     public synchronized Optional<T> update(String key, UnaryOperator<T> change) {
-        T current = rows.get(key);
-        if (current == null) return Optional.empty();
-        T next = change.apply(current);
+        Optional<T> current = get(key);
+        if (current.isEmpty()) return Optional.empty();
+        T next = change.apply(current.get());
         write(key, next);
         rows.put(key, next);
         return Optional.of(next);
@@ -119,17 +156,21 @@ public final class JdbcTable<T> implements Table<T> {
 
     @Override
     public synchronized boolean remove(String key) {
-        if (!rows.containsKey(key)) return false;
-        jdbc.update("DELETE FROM store_rows WHERE table_name = ? AND row_key = ?", name, key);
+        int deleted = jdbc.update("DELETE FROM store_rows WHERE table_name = ? AND row_key = ?", name, key);
         rows.remove(key);
-        return true;
+        return deleted > 0;
     }
 
     @Override
     public synchronized int removeWhere(Predicate<T> filter) {
         List<String> doomed = new ArrayList<>();
-        for (Map.Entry<String, T> e : rows.entrySet()) {
-            if (filter.test(e.getValue())) doomed.add(e.getKey());
+        for (T item : all()) {
+            if (filter.test(item)) {
+                // find row_key from rows cache
+                for (Map.Entry<String, T> entry : rows.entrySet()) {
+                    if (entry.getValue() == item) doomed.add(entry.getKey());
+                }
+            }
         }
         for (String key : doomed) {
             jdbc.update("DELETE FROM store_rows WHERE table_name = ? AND row_key = ?", name, key);
@@ -145,15 +186,17 @@ public final class JdbcTable<T> implements Table<T> {
     private void write(String key, T row) {
         String body = toJson(row);
         Timestamp now = Timestamp.from(Instant.now());
-        // UPDATE, then INSERT if nothing was there: the same two statements work on H2 and
-        // PostgreSQL, unlike either database's own upsert syntax. Safe under this object's lock.
         int updated = jdbc.update(
                 "UPDATE store_rows SET body = ?, updated_at = ? WHERE table_name = ? AND row_key = ?",
                 body, now, name, key);
         if (updated == 0) {
+            Long maxOrd = jdbc.queryForObject(
+                    "SELECT COALESCE(MAX(ord), 0) FROM store_rows WHERE table_name = ?",
+                    Long.class, name);
+            long ord = (maxOrd == null ? 0 : maxOrd) + 1;
             jdbc.update(
                     "INSERT INTO store_rows (table_name, row_key, ord, body, updated_at) VALUES (?, ?, ?, ?, ?)",
-                    name, key, nextOrd++, body, now);
+                    name, key, ord, body, now);
         }
     }
 

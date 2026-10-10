@@ -14,6 +14,7 @@
 
 plugins {
     id 'java'
+    id 'eclipse'
     id 'org.springframework.boot'            version '3.3.5'
     id 'io.spring.dependency-management'     version '1.1.6'
 }
@@ -49,6 +50,21 @@ dependencies {
     implementation 'org.springframework.boot:spring-boot-starter-mail'
     runtimeOnly 'com.h2database:h2'
     runtimeOnly 'org.postgresql:postgresql'
+
+    // --- Razorpay (real payment gateway) -----------------------------------------------
+    // Used when cabeye.razorpay.key-id/key-secret are set. Falls back to the sandbox mock
+    // when they are blank. The SDK handles order creation, signature verification and the
+    // REST calls so we don't hand-roll auth headers.
+    implementation 'com.razorpay:razorpay-java:1.4.10'
+
+    // --- Redis & Cluster Support (Phase 1 & 3) ----------------------------------------
+    // For cross-instance WebSocket event propagation, driver GPS caching, and distributed OTPs.
+    // Gracefully idle if Redis is not configured (maintains local H2 zero-dependency mode).
+    implementation 'org.springframework.boot:spring-boot-starter-data-redis'
+    implementation 'org.apache.commons:commons-pool2'
+
+    // --- Production Health & Metrics (Phase 1 & 6) ------------------------------------
+    implementation 'org.springframework.boot:spring-boot-starter-actuator'
 
     // --- Test (harmless; lets `gradlew test` succeed rather than error on no config) ---
     testImplementation 'org.springframework.boot:spring-boot-starter-test'

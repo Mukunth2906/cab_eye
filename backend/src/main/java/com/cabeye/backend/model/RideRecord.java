@@ -48,6 +48,8 @@ public class RideRecord {
 
     public long lastSeq;
     public List<RideEvent> events = new ArrayList<>();
+    /** Multi-stop: the intermediate stops with their status. Empty for an A-to-B ride. */
+    public List<RideStop> stops = new ArrayList<>();
 
     public RideRecord() {}
 }

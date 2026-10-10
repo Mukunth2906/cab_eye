@@ -36,21 +36,33 @@ public class DatabaseConfig {
     public DataSource dataSource(@Value("${cabeye.data.dir:data}") String dataDir,
                                  @Value("${cabeye.db.url:}") String url,
                                  @Value("${cabeye.db.user:sa}") String user,
-                                 @Value("${cabeye.db.password:}") String password) {
+                                 @Value("${cabeye.db.password:}") String password,
+                                 @Value("${cabeye.db.max-pool:10}") int maxPool,
+                                 @Value("${cabeye.db.min-idle:2}") int minIdle,
+                                 @Value("${cabeye.db.connection-timeout-ms:30000}") long connTimeout,
+                                 @Value("${cabeye.db.idle-timeout-ms:600000}") long idleTimeout,
+                                 @Value("${cabeye.db.max-lifetime-ms:1800000}") long maxLifetime,
+                                 @Value("${cabeye.db.leak-threshold-ms:10000}") long leakThreshold) {
         String jdbcUrl = url == null || url.isBlank() ? h2Url(dataDir) : url.trim();
 
         HikariDataSource ds = new HikariDataSource();
         ds.setJdbcUrl(jdbcUrl);
         ds.setUsername(user);
         ds.setPassword(password);
-        ds.setMaximumPoolSize(5);
+        ds.setMaximumPoolSize(maxPool);
+        ds.setMinimumIdle(Math.min(minIdle, maxPool));
+        ds.setConnectionTimeout(connTimeout);
+        ds.setIdleTimeout(idleTimeout);
+        ds.setMaxLifetime(maxLifetime);
+        ds.setLeakDetectionThreshold(leakThreshold);
         ds.setPoolName("cabeye-db");
 
         if (jdbcUrl.startsWith("jdbc:h2:")) {
             log.info("DATABASE H2 file {}.mv.db — view it at http://localhost:8080/h2-console "
-                    + "(JDBC URL: {} , user: {} , no password)", h2File(dataDir), jdbcUrl, user);
+                    + "(JDBC URL: {} , user: {} , maxPool: {})", h2File(dataDir), jdbcUrl, user, maxPool);
         } else {
-            log.info("DATABASE {}", jdbcUrl.replaceAll("password=[^&;]*", "password=***"));
+            log.info("DATABASE {} (maxPool: {}, minIdle: {})",
+                    jdbcUrl.replaceAll("password=[^&;]*", "password=***"), maxPool, minIdle);
         }
         return ds;
     }

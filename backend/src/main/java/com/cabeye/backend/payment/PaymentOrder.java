@@ -48,6 +48,8 @@ public class PaymentOrder {
     private String bankRef = "";
     private String failureReason = "";
     private Instant paidAt;
+    /** Razorpay order ID (starts with {@code order_}), or empty for the sandbox mock. */
+    private String razorpayOrderId = "";
 
     public PaymentOrder(String orderId, String rideId, int amountRupees, String payeeVpa,
                         String payeeName, String note, Instant createdAt, Instant expiresAt) {
@@ -107,6 +109,7 @@ public class PaymentOrder {
         r.bankRef = bankRef;
         r.failureReason = failureReason;
         r.paidAt = paidAt;
+        r.razorpayOrderId = razorpayOrderId;
         return r;
     }
 
@@ -120,6 +123,7 @@ public class PaymentOrder {
             o.bankRef = r.bankRef == null ? "" : r.bankRef;
             o.failureReason = r.failureReason == null ? "" : r.failureReason;
             o.paidAt = r.paidAt;
+            o.razorpayOrderId = r.razorpayOrderId == null ? "" : r.razorpayOrderId;
         }
         return o;
     }
@@ -150,6 +154,9 @@ public class PaymentOrder {
     public synchronized String bankRef()       { return bankRef; }
     public synchronized String failureReason() { return failureReason; }
     public synchronized Instant paidAt()       { return paidAt; }
+    public synchronized String razorpayOrderId() { return razorpayOrderId; }
+
+    synchronized void setRazorpayOrderId(String id) { this.razorpayOrderId = id == null ? "" : id; }
 
     /**
      * What clients see. {@code checkoutUrl} is absolute and built from the address the caller
@@ -174,12 +181,15 @@ public class PaymentOrder {
             Instant createdAt,
             Instant expiresAt,
             Instant paidAt,
-            boolean testMode
+            boolean testMode,
+            /** Razorpay order ID, present when Razorpay is the active gateway. */
+            String razorpayOrderId
     ) {}
 
     public synchronized View view(String upiUri, String checkoutUrl) {
         return new View(orderId, rideId, amountRupees, "INR", status.name(), method,
                 gatewayTxnId, bankRef, failureReason, payeeVpa, payeeName, upiUri, checkoutUrl,
-                createdAt, expiresAt, paidAt, true);
+                createdAt, expiresAt, paidAt, true,
+                razorpayOrderId.isEmpty() ? null : razorpayOrderId);
     }
 }

@@ -69,7 +69,7 @@ public class RideController {
      *   verify against what it hears the driver say
      */
     @PostMapping
-    public ResponseEntity<Ride.Snapshot> create(
+    public ResponseEntity<?> create(
             @RequestHeader(value = "X-User-Id", required = false, defaultValue = "rider-1") String headerRiderId,
             @RequestBody Map<String, Object> body,
             HttpServletRequest request) {
@@ -90,9 +90,16 @@ public class RideController {
         String dropNote = str(body.get("dropNote"), "");
         String rideType = str(body.get("rideType"), "AUTO");
 
-        Ride ride = rides.create(riderId, destination, destinationAddress,
-                destinationLatitude, destinationLongitude, destinationPlaceId,
-                pickupLatitude, pickupLongitude, contactName, contactPhone, dropNote, rideType);
+        // Multi-stop: optional, up to RideService.MAX_STOPS, visited in the order given.
+        Ride ride;
+        try {
+            ride = rides.create(riderId, destination, destinationAddress,
+                    destinationLatitude, destinationLongitude, destinationPlaceId,
+                    pickupLatitude, pickupLongitude, contactName, contactPhone, dropNote, rideType,
+                    StopController.parseStops(body.get("stops")));
+        } catch (RideService.StopRefused e) {
+            return ResponseEntity.status(e.status).body(Map.of("error", e.getMessage()));
+        }
         // What the rider said, for their memory. Optional; older clients never send it.
         ride.spokenAs(str(body.get("spokenAs"), ""));
         return ResponseEntity.ok(ride.snapshot());
@@ -334,11 +341,15 @@ public class RideController {
 
     /** Journey finished. Body: {@code {"fareRupees":148,"durationMinutes":12}} */
     @PostMapping("/{rideId}/complete")
-    public ResponseEntity<Ride.Snapshot> complete(
+    public ResponseEntity<?> complete(
             @PathVariable String rideId,
             @RequestHeader(value = "X-User-Id", required = false, defaultValue = "driver-1") String driverId,
             @RequestBody(required = false) Map<String, Object> body) {
         Map<String, Object> b = body == null ? Map.of() : body;
+        if (rides.find(rideId).map(Ride::hasOpenStops).orElse(false)) {
+            return ResponseEntity.status(409).body(Map.of("error",
+                    "There's still a stop on this ride. Finish it, or the passenger can skip it."));
+        }
         return respond(rides.complete(rideId, driverId,
                 num(b.get("fareRupees"), 0), num(b.get("durationMinutes"), 0)));
     }

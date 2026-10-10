@@ -1,22 +1,12 @@
 package com.cabeye.rider.ui
 
-import androidx.activity.compose.ManagedActivityResultLauncher
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.ActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
-import android.content.ActivityNotFoundException
-import android.content.Context
-import android.content.Intent
-import android.net.Uri
-import android.util.Log
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -36,95 +26,69 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableLongStateOf
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalConfiguration
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.viewinterop.AndroidView
-import androidx.compose.ui.semantics.CustomAccessibilityAction
-import androidx.compose.ui.semantics.LiveRegionMode
-import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.customActions
-import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import com.cabeye.rider.BuildConfig
+import androidx.compose.ui.unit.sp
+import com.cabeye.rider.places.Gazetteer
+import com.cabeye.rider.state.CameraShare
+import com.cabeye.rider.state.FeedbackStep
+import com.cabeye.rider.state.NextStep
+import com.cabeye.rider.state.PaymentPhase
+import com.cabeye.rider.state.PaymentUi
 import com.cabeye.rider.state.PlaceOption
 import com.cabeye.rider.state.RiderState
 import com.cabeye.rider.state.RiderUiState
-import com.cabeye.rider.state.PaymentPhase
-import com.cabeye.rider.state.PaymentUi
-import com.cabeye.rider.state.FeedbackStep
-import com.cabeye.rider.state.NextStep
-import com.cabeye.rider.state.CameraShare
-import com.cabeye.rider.places.Gazetteer
-import com.cabeye.rider.ui.theme.FocusIndicatorWidth
+import com.cabeye.rider.ui.components.CabEyeHeader
+import com.cabeye.rider.ui.components.DestinationCard
+import com.cabeye.rider.ui.components.DriverCard
+import com.cabeye.rider.ui.components.EmergencyOverlay
+import com.cabeye.rider.ui.components.PrimaryAction
+import com.cabeye.rider.ui.components.SecondaryAction
+import com.cabeye.rider.ui.components.SosButton
+import com.cabeye.rider.ui.components.StateHeadline
+import com.cabeye.rider.ui.components.StatusIndicator
+import com.cabeye.rider.ui.components.SupportingText
+import com.cabeye.rider.ui.components.VoiceOrb
+import com.cabeye.rider.ui.components.VoiceOrbState
+import com.cabeye.rider.ui.components.announcementFor
+import com.cabeye.rider.ui.components.buildCustomActions
+import com.cabeye.rider.ui.theme.CabEyeColors
+import com.cabeye.rider.ui.theme.CabEyeShapes
+import com.cabeye.rider.ui.theme.CabEyeSpacing
+import com.cabeye.rider.ui.theme.CabEyeType
 import com.cabeye.rider.ui.theme.LocalPalette
 import com.cabeye.rider.ui.theme.LocalReducedMotion
-import com.cabeye.rider.ui.theme.MinTouchTarget
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import androidx.lifecycle.compose.LocalLifecycleOwner
-import com.google.android.gms.maps.CameraUpdateFactory
-import com.google.android.gms.maps.MapView
-import com.google.android.gms.maps.model.LatLng
-import com.google.android.gms.maps.model.MarkerOptions
 import kotlin.math.roundToInt
 
 /**
- * **The** rider surface. One Composable, eleven states, no navigation.
+ * The redesigned Cab Eye Rider Surface.
  *
- * This is principle 1 made concrete: there is no `NavHost`, no back stack, and no
- * transition the rider can initiate. The surface changes because the *ride* changed. A
- * blind user cannot be somewhere unexpected in a hierarchy if there is no hierarchy.
- *
- * ## What the screen is for
- * Nothing here is the primary interface. Audio is. But "blind users can't see it, so it doesn't
- * matter" is the wrong conclusion to draw from that: most people with a vision impairment have
- * **some** usable sight, and they are exactly the people who will look at this screen. So it is
- * designed for low vision specifically — true black to avoid halation, 24sp floor on body text,
- * bold weights only, one target filling most of the screen — rather than for a sighted
- * designer's idea of an accessible theme.
- *
- * ## The per-state contract, enforced structurally
- * Every state renders through [StateScaffold], which allows exactly: one huge headline, at most
- * one supporting line, a listening indicator, and at most two buttons. That is a constraint the
- * brief states in prose, and prose constraints get violated one screen at a time. Making it a
- * function signature means a screen that wanted three buttons would not compile.
- *
- * @param uiState complete state to render
- * @param onHoldStart the rider pressed the surface; open the microphone
- * @param onHoldEnd the rider released; close the microphone and transcribe
- * @param onCancel cancel the in-flight booking during the 5 s window
- * @param onClarifyChoice a disambiguation option was chosen. Note this is the *fallback*
- *   path for a sighted helper — the rider answers by voice, per principle 2
- * @param onNearMissAnswer yes/no answer to "Did you mean Adyar?", same fallback status
- * @param onCodeConfirmed the sighted-helper fallback for the boarding code. The rider's own
- *   path is to let the app hear the driver say it — this button exists for the case where the
- *   street is too loud for the recogniser, not as the primary route
- * @param onSos raise the SOS overlay
- * @param onDismissSos lower it, returning to the state underneath
- * @param onOpenSettings raises the debug settings screen. Reached only by [SETTINGS_TAP_COUNT]
- *   taps on the small connection indicator — deliberately awkward, because a rider who cannot
- *   see the screen landing in settings by accident has no way to get back out
+ * Implements a clean, dark, high-contrast, voice-first accessibility experience
+ * for blind and low-vision users:
+ * - Almost-black background (#050505)
+ * - Large, bold typography (36-48sp headlines, 20-26sp body)
+ * - Central animated VoiceOrb with glowing concentric rings
+ * - Minimal cards and rounded controls
+ * - Semantic accents: Blue (voice), Purple (processing), Yellow (finding/approaching),
+ *   Green (success), Red (emergency/SOS)
+ * - Whole screen hold-to-talk gesture preserved
+ * - TalkBack semantics and custom actions preserved
  */
 @Composable
 fun RiderSurface(
@@ -145,21 +109,18 @@ fun RiderSurface(
     onPostRideAction: (String) -> Unit = {},
     onCameraAnswer: (Boolean) -> Unit = {},
     onStopCamera: () -> Unit = {},
+    onCallDriver: () -> Unit = {},
+    onHelp: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val palette = LocalPalette.current
     val haptics = rememberHaptics()
     val announcement = announcementFor(uiState)
-    val context = LocalContext.current
 
-    // The gesture detector below is keyed on Unit so it is never restarted. These keep the
-    // callbacks it captured up to date across recompositions without changing that key.
     val currentHoldStart by rememberUpdatedState(onHoldStart)
     val currentHoldEnd by rememberUpdatedState(onHoldEnd)
 
-    // The haptic fires on every ride-state change, not on every recomposition. Keying the
-    // effect on the state's class means a Listening -> Listening update carrying a new
-    // partial transcript does not buzz the phone thirty times while the rider is talking.
+    // Trigger distinctive haptic on state change
     LaunchedEffect(uiState.ride::class, uiState.sosActive) {
         haptics.perform(hapticFor(uiState))
     }
@@ -169,52 +130,20 @@ fun RiderSurface(
             .fillMaxSize()
             .background(palette.background)
 
-            // ------------------------------------------------------------------
-            //  THE MASSIVE TAP TARGET
-            //  The whole screen is the button. There is nothing to aim at, which is
-            //  the only design a rider who cannot see the screen can use reliably.
-            //  Press and hold to talk; release to send.
-            // ------------------------------------------------------------------
-            // KEYED ON Unit, DELIBERATELY. An earlier version keyed this on the ride state,
-            // which was a real bug found on device: pressing changes the state, the changed
-            // key cancels and restarts this whole block mid-press, and the restarted
-            // detector re-fires onPress and immediately resolves the release. The symptom
-            // was the app appearing to start listening on its own and then cutting the
-            // rider off after ~7 ms. The gesture detector must outlive state changes.
+            // Massive whole-screen tap-and-hold target for voice input
             .pointerInput(Unit) {
                 detectTapGestures(
                     onPress = {
                         currentHoldStart()
-                        // Suspends until the finger lifts (or the gesture is cancelled),
-                        // which is what makes this hold-to-talk rather than tap-to-toggle.
                         tryAwaitRelease()
                         currentHoldEnd()
                     }
                 )
             }
 
-            // ------------------------------------------------------------------
-            //  SEMANTICS: one merged target with a live region
-            //
-            //  mergeDescendants = true collapses every child into a single node, so
-            //  TalkBack presents the surface as ONE thing to swipe to rather than a
-            //  traversal list of labels. Traversing a list is exactly the navigation
-            //  this product is built to remove.
-            //
-            //  Deliberately no live region: the narrator already speaks every change,
-            //  and a live region made TalkBack say it again over the top.
-            // ------------------------------------------------------------------
+            // Merged accessibility semantics for screen readers
             .semantics(mergeDescendants = true) {
                 contentDescription = announcement
-                // No live region. It made TalkBack announce every change while the app's own
-                // narrator was already saying the same thing, so with TalkBack on the two
-                // voices talked over each other (found in the demo: "no proper hearing of the
-                // narrator"). The narrator speaks every change; TalkBack still reads this
-                // description whenever the rider touches the screen.
-
-                // With descendants merged, child buttons stop being individually
-                // focusable. These custom actions put those affordances back for a
-                // TalkBack user, reachable from the single merged node.
                 customActions = buildCustomActions(
                     uiState, onCancel, onClarifyChoice, onNearMissAnswer, onSos,
                     onPay = onPay,
@@ -223,264 +152,828 @@ fun RiderSurface(
                     onPostRideAction = onPostRideAction,
                     onCameraAnswer = onCameraAnswer,
                     onStopCamera = onStopCamera,
-                    onCodeConfirmed = onCodeConfirmed
+                    onCodeConfirmed = onCodeConfirmed,
+                    onCallDriver = onCallDriver,
+                    onHelp = onHelp
                 )
             }
     ) {
-        // The `when` is exhaustive over the sealed interface — no `else` branch. Adding a
-        // twelfth state becomes a compile error here rather than a blank screen at runtime.
-        when (val ride = uiState.ride) {
-
-            is RiderState.Idle -> StateScaffold(
-                icon = "●",
-                word = "Ready",
-                headline = "Hold anywhere\nand speak",
-                support = "“take me to ${firstExample()}”  ·  ${uiState.activeCityName}",
-                accent = palette.onBackground,
-                micOpen = uiState.micOpen
+        Column(
+            modifier = Modifier.fillMaxSize()
+        ) {
+            // Top App Bar Header with title, active city, and 5-tap connection chip
+            CabEyeHeader(
+                cityName = uiState.activeCityName,
+                connected = uiState.connected,
+                onOpenSettings = onOpenSettings
             )
 
-            is RiderState.Listening -> StateScaffold(
-                icon = "◉",
-                word = "Listening",
-                headline = if (ride.isFollowUp) "Listening\nfor your answer" else "Listening",
-                support = ride.partialTranscript.takeIf { it.isNotBlank() },
-                accent = palette.listening,
-                micOpen = uiState.micOpen,
-                inputLevel = ride.inputLevel
-            )
+            // Main scrollable content column
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = CabEyeSpacing.screenPadding, vertical = CabEyeSpacing.md),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
+            ) {
+                when (val ride = uiState.ride) {
 
-            is RiderState.Resolving -> StateScaffold(
-                icon = "◌",
-                word = "Working",
-                headline = "Working\nthat out",
-                support = ride.transcript.takeIf { it.isNotBlank() },
-                accent = palette.muted,
-                micOpen = uiState.micOpen
-            )
+                    // -----------------------------------------------------------------
+                    // 1. Ready State
+                    // -----------------------------------------------------------------
+                    is RiderState.Idle -> {
+                        VoiceOrb(
+                            state = VoiceOrbState.READY,
+                            customAccent = palette.listening
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.lg))
+                        StateHeadline(
+                            text = "Hold anywhere\nand speak",
+                            color = palette.onBackground
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.sm))
+                        SupportingText(
+                            text = "“Take me to ${firstExample()}”",
+                            color = palette.listening
+                        )
+                    }
 
-            is RiderState.Clarify -> ClarifyContent(
-                state = ride,
-                micOpen = uiState.micOpen,
-                onChoice = onClarifyChoice,
-                onNearMissAnswer = onNearMissAnswer
-            )
+                    // -----------------------------------------------------------------
+                    // 2. Listening State
+                    // -----------------------------------------------------------------
+                    is RiderState.Listening -> {
+                        VoiceOrb(
+                            state = VoiceOrbState.LISTENING,
+                            inputLevel = ride.inputLevel,
+                            customAccent = palette.listening
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.lg))
+                        StateHeadline(
+                            text = if (ride.isFollowUp) "Listening for\nyour answer" else "Listening...",
+                            color = palette.listening
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.sm))
+                        SupportingText(
+                            text = if (ride.partialTranscript.isNotBlank())
+                                "“${ride.partialTranscript}”"
+                            else
+                                "Speak your destination",
+                            color = palette.onBackground
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.xl))
+                        SecondaryAction(
+                            label = "CANCEL",
+                            onClick = onCancel,
+                            accentColor = palette.danger
+                        )
+                    }
 
-            is RiderState.Confirming -> ConfirmingContent(ride, uiState.micOpen, uiState.selectedDestination, onCancel)
+                    // -----------------------------------------------------------------
+                    // 3. Processing State (Resolving)
+                    // -----------------------------------------------------------------
+                    is RiderState.Resolving -> {
+                        VoiceOrb(
+                            state = VoiceOrbState.PROCESSING,
+                            customAccent = palette.processing
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.lg))
+                        StateHeadline(
+                            text = "Understanding\nyour request",
+                            color = palette.processing
+                        )
+                        if (ride.transcript.isNotBlank()) {
+                            Spacer(Modifier.height(CabEyeSpacing.sm))
+                            SupportingText(
+                                text = "“${ride.transcript}”",
+                                color = palette.muted
+                            )
+                        }
+                    }
 
-            is RiderState.Finding -> StateScaffold(
-                icon = "◍",
-                word = "Finding",
-                headline = "Finding\na driver",
-                support = "The pulse means it's still working",
-                accent = palette.listening,
-                micOpen = uiState.micOpen
-            )
+                    // -----------------------------------------------------------------
+                    // 4. Clarification State
+                    // -----------------------------------------------------------------
+                    is RiderState.Clarify -> {
+                        if (ride.isNearMiss) {
+                            StatusIndicator(
+                                label = "CONFIRM DESTINATION",
+                                icon = "?",
+                                accent = palette.clarify
+                            )
+                            Spacer(Modifier.height(CabEyeSpacing.md))
+                            StateHeadline(
+                                text = "Did you mean\n${ride.optionA.name}?",
+                                color = palette.clarify
+                            )
+                            Spacer(Modifier.height(CabEyeSpacing.sm))
+                            SupportingText(
+                                text = "Say yes or no",
+                                color = palette.muted
+                            )
+                            Spacer(Modifier.height(CabEyeSpacing.lg))
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(16.dp)
+                            ) {
+                                PrimaryAction(
+                                    label = "YES",
+                                    onClick = { onNearMissAnswer(true) },
+                                    accentColor = palette.confirm,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                SecondaryAction(
+                                    label = "NO",
+                                    onClick = { onNearMissAnswer(false) },
+                                    accentColor = palette.danger,
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
+                        } else {
+                            StatusIndicator(
+                                label = "CHOOSE DESTINATION",
+                                icon = "?",
+                                accent = palette.clarify
+                            )
+                            Spacer(Modifier.height(CabEyeSpacing.md))
+                            StateHeadline(
+                                text = "Which place\ndid you mean?",
+                                color = palette.clarify
+                            )
+                            Spacer(Modifier.height(CabEyeSpacing.sm))
+                            SupportingText(
+                                text = "Say the name you want",
+                                color = palette.muted
+                            )
+                            Spacer(Modifier.height(CabEyeSpacing.lg))
+                            Column(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalArrangement = Arrangement.spacedBy(14.dp)
+                            ) {
+                                PrimaryAction(
+                                    label = ride.optionA.name,
+                                    onClick = { onClarifyChoice(ride.optionA) },
+                                    accentColor = palette.clarify,
+                                    containerColor = palette.surface
+                                )
+                                Text(
+                                    text = "or",
+                                    style = CabEyeType.secondaryInfo.copy(fontWeight = FontWeight.Bold),
+                                    color = palette.muted,
+                                    modifier = Modifier.align(Alignment.CenterHorizontally)
+                                )
+                                PrimaryAction(
+                                    label = ride.optionB.name,
+                                    onClick = { onClarifyChoice(ride.optionB) },
+                                    accentColor = palette.clarify,
+                                    containerColor = palette.surface
+                                )
+                            }
+                        }
+                    }
 
-            is RiderState.Assigned -> StateScaffold(
-                icon = "✓",
-                word = "Assigned",
-                headline = "${ride.driver.name}\nis coming",
-                support = "${ride.etaMinutes} min  ·  ${ride.driver.vehicleModel}",
-                accent = palette.confirm,
-                micOpen = uiState.micOpen,
-                primary = ButtonSpec("Cancel", palette.danger, onCancel)
-            )
+                    // -----------------------------------------------------------------
+                    // 5. Confirm Ride State (Confirming)
+                    // -----------------------------------------------------------------
+                    is RiderState.Confirming -> {
+                        val secondsLeft = (ride.cancelWindowMillisRemaining / 1000.0).roundToInt()
+                        StatusIndicator(
+                            label = "BOOKING ${ride.rideType.spokenName.uppercase()}",
+                            icon = "✓",
+                            accent = palette.confirm
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.md))
+                        StateHeadline(
+                            text = "CONFIRM YOUR RIDE",
+                            color = palette.onBackground
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.md))
+                        DestinationCard(
+                            destinationName = ride.destination,
+                            address = uiState.selectedDestination?.formattedAddress,
+                            rideType = ride.rideType,
+                            place = uiState.selectedDestination
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.md))
+                        SupportingText(
+                            text = "Say “cancel” to abort (${secondsLeft}s remaining)",
+                            color = palette.clarify
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.md))
+                        SecondaryAction(
+                            label = "CANCEL BOOKING",
+                            onClick = onCancel,
+                            accentColor = palette.danger
+                        )
+                    }
 
-            // Wordless by design: the panned, rising earcon carries the distance far faster
-            // than a sentence could. The screen still shows it, for the sighted helper.
-            is RiderState.Approaching -> StateScaffold(
-                icon = "→",
-                word = "Approaching",
-                headline = "${ride.distanceMeters} m\naway",
-                support = "${ride.driver.name}  ·  ${ride.driver.vehiclePlate}",
-                accent = palette.listening,
-                micOpen = uiState.micOpen,
-                primary = ButtonSpec("Cancel", palette.danger, onCancel)
-            )
+                    // -----------------------------------------------------------------
+                    // 6. Finding Driver State (Finding)
+                    // -----------------------------------------------------------------
+                    is RiderState.Finding -> {
+                        VoiceOrb(
+                            state = VoiceOrbState.READY,
+                            customGlyph = "🚕",
+                            customLabel = "SEARCHING",
+                            customAccent = palette.clarify
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.lg))
+                        StateHeadline(
+                            text = "FINDING DRIVER",
+                            color = palette.clarify
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.sm))
+                        SupportingText(
+                            text = "We're finding the nearest driver for you.",
+                            color = palette.muted
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.xl))
+                        SecondaryAction(
+                            label = "CANCEL BOOKING",
+                            onClick = onCancel,
+                            accentColor = palette.danger
+                        )
+                    }
 
-            // The boarding code is REVERSED on purpose: the driver's screen shows it, the
-            // driver says it aloud, and this app verifies it. A blind rider standing on a
-            // street cannot tell who is within earshot, so the app announcing a secret over a
-            // loudspeaker would defeat the whole point of having one.
-            is RiderState.Arrived -> StateScaffold(
-                icon = "◆",
-                word = "Arrived",
-                headline = "Your driver\nis here",
-                // The code IS shown here, and only here. This screen is for the sighted helper
-                // and the low-vision rider who can read it — the rider who cannot never has it
-                // spoken aloud on the loudspeaker, which is the part that matters. The app
-                // announces it through the earpiece only, and only with headphones connected.
-                support = if (ride.headphonesConnected)
-                    "Listening for the driver to say the code"
-                else
-                    "Ask the driver to say the code — I'm listening",
-                accent = palette.confirm,
-                micOpen = uiState.micOpen,
-                primary = ButtonSpec("Code is right", palette.confirm, onCodeConfirmed),
-                secondary = ButtonSpec("Not my driver", palette.danger, onSos)
-            )
+                    // -----------------------------------------------------------------
+                    // 7. Driver Assigned State (Assigned)
+                    // -----------------------------------------------------------------
+                    is RiderState.Assigned -> {
+                        StatusIndicator(
+                            label = "DRIVER ASSIGNED",
+                            icon = "✓",
+                            accent = palette.confirm
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.md))
+                        StateHeadline(
+                            text = "${ride.driver.name}\nis coming",
+                            color = palette.onBackground
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.md))
+                        DriverCard(
+                            driver = ride.driver,
+                            etaMinutes = ride.etaMinutes,
+                            statusText = "Heading to pickup"
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.lg))
+                        SecondaryAction(
+                            label = "CANCEL RIDE",
+                            onClick = onCancel,
+                            accentColor = palette.danger
+                        )
+                    }
 
-            is RiderState.InTrip -> StateScaffold(
-                icon = "▶",
-                word = "On the way",
-                headline = "On the way\nto ${ride.destination}",
-                support = "${ride.etaMinutes} min  ·  ${ride.driver.name}",
-                accent = palette.onBackground,
-                micOpen = uiState.micOpen
-            )
+                    // -----------------------------------------------------------------
+                    // 8. Driver Approaching State (Approaching)
+                    // -----------------------------------------------------------------
+                    is RiderState.Approaching -> {
+                        StatusIndicator(
+                            label = "DRIVER APPROACHING",
+                            icon = "→",
+                            accent = palette.clarify
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.md))
+                        ProximityBeaconVisualization(
+                            distanceMeters = ride.distanceMeters,
+                            bearingDegrees = ride.bearingDegrees,
+                            accent = palette.clarify
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.md))
+                        StateHeadline(
+                            text = "${ride.distanceMeters} meters away",
+                            color = palette.clarify
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.md))
+                        DriverCard(
+                            driver = ride.driver,
+                            distanceMeters = ride.distanceMeters,
+                            bearingDegrees = ride.bearingDegrees
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.md))
+                        SecondaryAction(
+                            label = "CANCEL RIDE",
+                            onClick = onCancel,
+                            accentColor = palette.danger
+                        )
+                    }
 
-            is RiderState.Done -> {
-                val payment = uiState.payment
-                val paid = payment?.phase == PaymentPhase.PAID
-                StateScaffold(
-                    icon = if (paid) "✓" else "★",
-                    word = if (paid) "Paid" else "Complete",
-                    headline = "You've\narrived",
-                    support = "${ride.destination}  ·  ₹${ride.fareRupees}  ·  ${ride.durationMinutes} min",
-                    accent = palette.confirm,
-                    micOpen = uiState.micOpen,
-                    extraContent = payment?.let { p ->
-                        @Composable { PaymentPanel(p, onPaymentMethod) }
-                    },
-                    // Payment happens inside this app: no browser, no other app. The server's
-                    // sandbox gateway decides the outcome. The QR code for a sighted companion
-                    // is on the driver's screen, not here.
-                    primary = when (payment?.phase) {
-                        null, PaymentPhase.ERROR ->
-                            ButtonSpec("PAY ₹${ride.fareRupees}", palette.confirm, onPay)
-                        PaymentPhase.AWAITING ->
-                            ButtonSpec("PAY ₹${payment?.amountRupees ?: ride.fareRupees}", palette.confirm, onPay)
-                        PaymentPhase.STARTING, PaymentPhase.PROCESSING -> null
-                        PaymentPhase.FAILED ->
-                            ButtonSpec("TRY AGAIN", palette.confirm, onPay)
-                        PaymentPhase.PAID ->
-                            ButtonSpec("HEAR RECEIPT", palette.onBackground, onPay)
-                    },
-                    secondary = if (payment?.phase == PaymentPhase.AWAITING) {
-                        ButtonSpec("DECLINE", palette.danger, onDeclinePayment)
-                    } else null
-                )
+                    // -----------------------------------------------------------------
+                    // 9. Driver Arrived State & Boarding Verification (Arrived)
+                    // -----------------------------------------------------------------
+                    is RiderState.Arrived -> {
+                        when {
+                            ride.codeVerified -> {
+                                VoiceOrb(
+                                    state = VoiceOrbState.SUCCESS,
+                                    customGlyph = "✓",
+                                    customLabel = "CODE VERIFIED",
+                                    customAccent = palette.confirm
+                                )
+                                Spacer(Modifier.height(CabEyeSpacing.lg))
+                                StateHeadline(
+                                    text = "CODE VERIFIED",
+                                    color = palette.confirm
+                                )
+                                Spacer(Modifier.height(CabEyeSpacing.sm))
+                                SupportingText(
+                                    text = "This is your driver. You may enter the vehicle.",
+                                    color = palette.onBackground
+                                )
+                                Spacer(Modifier.height(CabEyeSpacing.md))
+                                DriverCard(
+                                    driver = ride.driver,
+                                    statusText = "Verified & Ready"
+                                )
+                            }
+                            ride.verificationFailed -> {
+                                VoiceOrb(
+                                    state = VoiceOrbState.ERROR,
+                                    customGlyph = "!",
+                                    customLabel = "CODE INCORRECT",
+                                    customAccent = palette.danger
+                                )
+                                Spacer(Modifier.height(CabEyeSpacing.lg))
+                                StateHeadline(
+                                    text = "CODE INCORRECT",
+                                    color = palette.danger
+                                )
+                                Spacer(Modifier.height(CabEyeSpacing.sm))
+                                SupportingText(
+                                    text = "Please do not enter the vehicle.",
+                                    color = palette.danger
+                                )
+                                Spacer(Modifier.height(CabEyeSpacing.lg))
+                                PrimaryAction(
+                                    label = "REPEAT CODE",
+                                    onClick = onCodeConfirmed,
+                                    accentColor = palette.confirm
+                                )
+                                Spacer(Modifier.height(CabEyeSpacing.sm))
+                                SecondaryAction(
+                                    label = "NOT MY DRIVER (SOS)",
+                                    onClick = onSos,
+                                    accentColor = palette.danger
+                                )
+                            }
+                            uiState.micOpen -> {
+                                VoiceOrb(
+                                    state = VoiceOrbState.LISTENING,
+                                    customGlyph = "◉",
+                                    customLabel = "LISTENING...",
+                                    customAccent = palette.listening
+                                )
+                                Spacer(Modifier.height(CabEyeSpacing.lg))
+                                StateHeadline(
+                                    text = "VERIFY CODE",
+                                    color = palette.listening
+                                )
+                                Spacer(Modifier.height(CabEyeSpacing.sm))
+                                SupportingText(
+                                    text = "Ask the driver to say the 4-digit code.",
+                                    color = palette.onBackground
+                                )
+                                Spacer(Modifier.height(CabEyeSpacing.md))
+                                Row(
+                                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    repeat(4) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(18.dp)
+                                                .background(palette.listening, CircleShape)
+                                        )
+                                    }
+                                }
+                                Spacer(Modifier.height(CabEyeSpacing.lg))
+                                DriverCard(
+                                    driver = ride.driver,
+                                    statusText = "Waiting at pickup"
+                                )
+                            }
+                            else -> {
+                                StatusIndicator(
+                                    label = "DRIVER ARRIVED",
+                                    icon = "🚕",
+                                    accent = palette.confirm
+                                )
+                                Spacer(Modifier.height(CabEyeSpacing.md))
+                                StateHeadline(
+                                    text = "YOUR DRIVER\nHAS ARRIVED",
+                                    color = palette.confirm
+                                )
+                                Spacer(Modifier.height(CabEyeSpacing.sm))
+                                SupportingText(
+                                    text = if (ride.headphonesConnected)
+                                        "${ride.driver.name} is waiting nearby. (Expected: ${ride.expectedCode})"
+                                    else
+                                        "${ride.driver.name} is waiting nearby. Ask for the four-digit boarding code.",
+                                    color = palette.onBackground
+                                )
+                                Spacer(Modifier.height(CabEyeSpacing.md))
+                                DriverCard(
+                                    driver = ride.driver,
+                                    statusText = "Waiting at pickup"
+                                )
+                                Spacer(Modifier.height(CabEyeSpacing.lg))
+                                PrimaryAction(
+                                    label = "VERIFY BOARDING CODE",
+                                    onClick = onCodeConfirmed,
+                                    accentColor = palette.confirm
+                                )
+                                Spacer(Modifier.height(CabEyeSpacing.sm))
+                                SecondaryAction(
+                                    label = "CALL DRIVER",
+                                    onClick = onCallDriver,
+                                    accentColor = palette.clarify
+                                )
+                                Spacer(Modifier.height(CabEyeSpacing.sm))
+                                SecondaryAction(
+                                    label = "NOT MY DRIVER (SOS)",
+                                    onClick = onSos,
+                                    accentColor = palette.danger
+                                )
+                            }
+                        }
+                    }
+
+                    // -----------------------------------------------------------------
+                    // 10. In Trip State (InTrip)
+                    // -----------------------------------------------------------------
+                    is RiderState.InTrip -> {
+                        StatusIndicator(
+                            label = "ON TRIP",
+                            icon = "↗",
+                            accent = palette.listening
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.md))
+                        StateHeadline(
+                            text = "YOU'RE ON YOUR WAY",
+                            color = palette.onBackground
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.md))
+                        DestinationCard(
+                            destinationName = ride.destination,
+                            showMapPreview = false
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.md))
+                        SupportingText(
+                            text = "About ${ride.etaMinutes} minutes remaining to destination.",
+                            color = palette.listening
+                        )
+                        if (ride.stops.isNotEmpty()) {
+                            val current = ride.currentStop
+                            Spacer(Modifier.height(CabEyeSpacing.md))
+                            SupportingText(
+                                text = ride.stops.joinToString("\n") { s ->
+                                    val mark = when (s.status) {
+                                        "DONE" -> "✓"
+                                        "SKIPPED" -> "–"
+                                        "WAITING", "ARRIVED" -> "●"
+                                        else -> "○"
+                                    }
+                                    "$mark ${s.index}. ${s.name}" + if (s.isWait) " (driver waits)" else ""
+                                } + "\nThen ${ride.destination}",
+                                color = palette.onBackground
+                            )
+                            if (current != null && current.status == "WAITING" && !current.riderBack) {
+                                Spacer(Modifier.height(CabEyeSpacing.md))
+                                PrimaryAction(
+                                    label = "I'M BACK — CHECK CODE",
+                                    onClick = { onPostRideAction("im-back") }
+                                )
+                                Spacer(Modifier.height(CabEyeSpacing.sm))
+                                SecondaryAction(
+                                    label = "CODE IS RIGHT",
+                                    onClick = onCodeConfirmed
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(CabEyeSpacing.md))
+                        DriverCard(driver = ride.driver)
+                    }
+
+                    // -----------------------------------------------------------------
+                    // Walking route: recording it, or being guided along it
+                    // -----------------------------------------------------------------
+                    is RiderState.Walking -> {
+                        StatusIndicator(
+                            label = if (ride.recording) "RECORDING WALK" else "GUIDING",
+                            icon = if (ride.recording) "●" else "➜",
+                            accent = if (ride.recording) palette.danger else palette.listening
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.md))
+                        StateHeadline(text = ride.prompt, color = palette.onBackground)
+                        Spacer(Modifier.height(CabEyeSpacing.md))
+                        SupportingText(text = ride.lines.joinToString("\n"), color = palette.listening)
+                        Spacer(Modifier.height(CabEyeSpacing.xl))
+                        if (ride.recording) {
+                            PrimaryAction(label = "MARK A LANDMARK", onClick = { onPostRideAction("walk-mark") })
+                            Spacer(Modifier.height(CabEyeSpacing.sm))
+                            SecondaryAction(label = "TURNING LEFT", onClick = { onPostRideAction("walk-left") })
+                            Spacer(Modifier.height(CabEyeSpacing.sm))
+                            SecondaryAction(label = "TURNING RIGHT", onClick = { onPostRideAction("walk-right") })
+                            Spacer(Modifier.height(CabEyeSpacing.sm))
+                            PrimaryAction(label = "I'M THERE", onClick = { onPostRideAction("walk-done") })
+                        } else {
+                            PrimaryAction(label = "NEXT", onClick = { onPostRideAction("walk-next") })
+                            Spacer(Modifier.height(CabEyeSpacing.sm))
+                            SecondaryAction(label = "REPEAT", onClick = { onPostRideAction("walk-repeat") })
+                            Spacer(Modifier.height(CabEyeSpacing.sm))
+                            PrimaryAction(label = "I'M THERE", onClick = { onPostRideAction("walk-done") })
+                        }
+                        Spacer(Modifier.height(CabEyeSpacing.sm))
+                        SecondaryAction(
+                            label = if (ride.recording) "DISCARD" else "STOP GUIDING",
+                            onClick = { onPostRideAction("walk-stop") },
+                            accentColor = palette.danger
+                        )
+                    }
+
+                    // -----------------------------------------------------------------
+                    // Multi-stop planning: the route as read back, for a sighted helper
+                    // -----------------------------------------------------------------
+                    is RiderState.Planning -> {
+                        StatusIndicator(
+                            label = "PLANNING STOPS",
+                            icon = "⋯",
+                            accent = palette.processing
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.md))
+                        StateHeadline(
+                            text = ride.prompt,
+                            color = palette.onBackground
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.md))
+                        SupportingText(
+                            text = ride.lines.joinToString("\n"),
+                            color = palette.listening
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.xl))
+                        PrimaryAction(
+                            label = "BOOK",
+                            onClick = { onPostRideAction("plan-yes") }
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.sm))
+                        SecondaryAction(
+                            label = "CHANGE",
+                            onClick = { onPostRideAction("plan-no") }
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.sm))
+                        SecondaryAction(
+                            label = "CANCEL",
+                            onClick = onCancel,
+                            accentColor = palette.danger
+                        )
+                    }
+
+                    // -----------------------------------------------------------------
+                    // 11. Trip Completed State (Done)
+                    // -----------------------------------------------------------------
+                    is RiderState.Done -> {
+                        val payment = uiState.payment
+                        val paid = payment?.phase == PaymentPhase.PAID
+
+                        VoiceOrb(
+                            state = VoiceOrbState.SUCCESS,
+                            customGlyph = "✓",
+                            customLabel = if (paid) "PAID" else "COMPLETED",
+                            customAccent = palette.confirm
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.lg))
+                        StateHeadline(
+                            text = "TRIP COMPLETED",
+                            color = palette.confirm
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.sm))
+                        SupportingText(
+                            text = "You have arrived at ${ride.destination}",
+                            color = palette.onBackground
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.md))
+
+                        // Fare & Duration Card
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(CabEyeShapes.card)
+                                .background(palette.surface)
+                                .border(2.dp, palette.outline, CabEyeShapes.card)
+                                .padding(CabEyeSpacing.md)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceAround
+                            ) {
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Text(text = "FARE", style = CabEyeType.badgeText, color = palette.muted)
+                                    Text(
+                                        text = "₹${ride.fareRupees}",
+                                        style = CabEyeType.stateTitleLarge.copy(fontSize = 32.sp),
+                                        color = palette.confirm
+                                    )
+                                }
+                                Box(
+                                    modifier = Modifier
+                                        .width(1.dp)
+                                        .height(50.dp)
+                                        .background(palette.outline)
+                                )
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Text(text = "DURATION", style = CabEyeType.badgeText, color = palette.muted)
+                                    Text(
+                                        text = "${ride.durationMinutes} min",
+                                        style = CabEyeType.stateTitleLarge.copy(fontSize = 32.sp),
+                                        color = palette.onBackground
+                                    )
+                                }
+                            }
+                        }
+
+                        if (payment != null) {
+                            Spacer(Modifier.height(CabEyeSpacing.md))
+                            PaymentPanel(payment, onPaymentMethod)
+                        }
+
+                        Spacer(Modifier.height(CabEyeSpacing.lg))
+
+                        // Payment & Next steps actions
+                        when (payment?.phase) {
+                            null, PaymentPhase.ERROR -> PrimaryAction(
+                                label = "PAY ₹${ride.fareRupees}",
+                                onClick = onPay,
+                                accentColor = palette.confirm
+                            )
+                            PaymentPhase.AWAITING -> {
+                                PrimaryAction(
+                                    label = "PAY ₹${payment.amountRupees}",
+                                    onClick = onPay,
+                                    accentColor = palette.confirm
+                                )
+                                Spacer(Modifier.height(CabEyeSpacing.sm))
+                                SecondaryAction(
+                                    label = "DECLINE",
+                                    onClick = onDeclinePayment,
+                                    accentColor = palette.danger
+                                )
+                            }
+                            PaymentPhase.STARTING, PaymentPhase.PROCESSING -> {
+                                SupportingText(text = "Processing payment with gateway...", color = palette.muted)
+                            }
+                            PaymentPhase.FAILED -> PrimaryAction(
+                                label = "TRY PAYMENT AGAIN",
+                                onClick = onPay,
+                                accentColor = palette.confirm
+                            )
+                            PaymentPhase.PAID -> PrimaryAction(
+                                label = "HEAR RECEIPT",
+                                onClick = onPay,
+                                accentColor = palette.onBackground
+                            )
+                        }
+
+                        Spacer(Modifier.height(CabEyeSpacing.md))
+                        SecondaryAction(
+                            label = "BOOK ANOTHER RIDE",
+                            onClick = { onPostRideAction("now") },
+                            accentColor = palette.onBackground
+                        )
+                    }
+
+                    // -----------------------------------------------------------------
+                    // 12. Feedback State
+                    // -----------------------------------------------------------------
+                    is RiderState.Feedback -> when (ride.step) {
+                        FeedbackStep.RATING -> {
+                            StatusIndicator(label = "RIDE FEEDBACK", icon = "★", accent = palette.clarify)
+                            Spacer(Modifier.height(CabEyeSpacing.md))
+                            StateHeadline(text = "How was\nyour ride?", color = palette.onBackground)
+                            Spacer(Modifier.height(CabEyeSpacing.sm))
+                            SupportingText(text = "Say 1 to 5, “report a problem”, or “skip”", color = palette.muted)
+                            Spacer(Modifier.height(CabEyeSpacing.lg))
+                            PrimaryAction(label = "SKIP", onClick = { onPostRideAction("skip") }, accentColor = palette.onBackground)
+                            Spacer(Modifier.height(CabEyeSpacing.sm))
+                            SecondaryAction(label = "REPORT A PROBLEM", onClick = { onPostRideAction("report") }, accentColor = palette.danger)
+                        }
+                        FeedbackStep.RATING_CHECK -> {
+                            StatusIndicator(label = "CHECK RATING", icon = "?", accent = palette.clarify)
+                            Spacer(Modifier.height(CabEyeSpacing.md))
+                            StateHeadline(text = "${ride.rating ?: "?"} out of 5?", color = palette.clarify)
+                            Spacer(Modifier.height(CabEyeSpacing.sm))
+                            SupportingText(text = "Say yes, no, or the correct number", color = palette.muted)
+                            Spacer(Modifier.height(CabEyeSpacing.lg))
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                                PrimaryAction(label = "YES", onClick = { onPostRideAction("rating-yes") }, accentColor = palette.confirm, modifier = Modifier.weight(1f))
+                                SecondaryAction(label = "NO", onClick = { onPostRideAction("rating-no") }, accentColor = palette.onBackground, modifier = Modifier.weight(1f))
+                            }
+                        }
+                        FeedbackStep.REPORT -> {
+                            StatusIndicator(label = "REPORT PROBLEM", icon = "!", accent = palette.danger)
+                            Spacer(Modifier.height(CabEyeSpacing.md))
+                            StateHeadline(text = "What went wrong?", color = palette.danger)
+                            Spacer(Modifier.height(CabEyeSpacing.sm))
+                            SupportingText(text = ride.rating?.let { "Rating $it of 5 · say it or “skip”" } ?: "Say what went wrong, or “skip”", color = palette.muted)
+                            Spacer(Modifier.height(CabEyeSpacing.lg))
+                            SecondaryAction(label = "SKIP", onClick = { onPostRideAction("skip") }, accentColor = palette.onBackground)
+                        }
+                        FeedbackStep.CONFIRM -> {
+                            StatusIndicator(label = "SEND REPORT", icon = "?", accent = palette.clarify)
+                            Spacer(Modifier.height(CabEyeSpacing.md))
+                            StateHeadline(text = "“${ride.report}”", color = palette.onBackground)
+                            Spacer(Modifier.height(CabEyeSpacing.sm))
+                            SupportingText(text = "Category: ${ride.category}", color = palette.muted)
+                            Spacer(Modifier.height(CabEyeSpacing.lg))
+                            PrimaryAction(label = "SEND REPORT", onClick = { onPostRideAction("send") }, accentColor = palette.confirm)
+                            Spacer(Modifier.height(CabEyeSpacing.sm))
+                            SecondaryAction(label = "SKIP", onClick = { onPostRideAction("skip") }, accentColor = palette.onBackground)
+                        }
+                        FeedbackStep.SENT -> {
+                            VoiceOrb(state = VoiceOrbState.SUCCESS, customLabel = "THANK YOU", customAccent = palette.confirm)
+                            Spacer(Modifier.height(CabEyeSpacing.lg))
+                            StateHeadline(text = "Thank You", color = palette.confirm)
+                        }
+                    }
+
+                    // -----------------------------------------------------------------
+                    // 13. Next Journey State
+                    // -----------------------------------------------------------------
+                    is RiderState.NextJourney -> when (ride.step) {
+                        NextStep.CHOOSE -> {
+                            StatusIndicator(label = "NEXT JOURNEY", icon = "↻", accent = palette.onBackground)
+                            Spacer(Modifier.height(CabEyeSpacing.md))
+                            StateHeadline(text = "Another ride?", color = palette.onBackground)
+                            Spacer(Modifier.height(CabEyeSpacing.sm))
+                            SupportingText(text = "“book now” · “schedule for later” · “done”", color = palette.muted)
+                            Spacer(Modifier.height(CabEyeSpacing.lg))
+                            PrimaryAction(label = "BOOK ANOTHER RIDE", onClick = { onPostRideAction("now") }, accentColor = palette.confirm)
+                            Spacer(Modifier.height(CabEyeSpacing.sm))
+                            SecondaryAction(label = "I'M DONE", onClick = { onPostRideAction("done") }, accentColor = palette.onBackground)
+                        }
+                        NextStep.WHEN -> {
+                            StatusIndicator(label = "SCHEDULE RIDE", icon = "◷", accent = palette.listening)
+                            Spacer(Modifier.height(CabEyeSpacing.md))
+                            StateHeadline(text = "When?", color = palette.listening)
+                            Spacer(Modifier.height(CabEyeSpacing.sm))
+                            SupportingText(text = "“tomorrow at 8:30” · “in two hours”", color = palette.muted)
+                            Spacer(Modifier.height(CabEyeSpacing.lg))
+                            SecondaryAction(label = "CANCEL", onClick = { onPostRideAction("done") }, accentColor = palette.onBackground)
+                        }
+                        NextStep.WHERE -> {
+                            StatusIndicator(label = "SCHEDULE RIDE", icon = "◷", accent = palette.listening)
+                            Spacer(Modifier.height(CabEyeSpacing.md))
+                            StateHeadline(text = "Where to?", color = palette.listening)
+                            Spacer(Modifier.height(CabEyeSpacing.sm))
+                            SupportingText(text = ride.scheduledAtText, color = palette.muted)
+                            Spacer(Modifier.height(CabEyeSpacing.lg))
+                            SecondaryAction(label = "CANCEL", onClick = { onPostRideAction("done") }, accentColor = palette.onBackground)
+                        }
+                        NextStep.CONFIRM -> {
+                            StatusIndicator(label = "CONFIRM SCHEDULE", icon = "?", accent = palette.clarify)
+                            Spacer(Modifier.height(CabEyeSpacing.md))
+                            StateHeadline(text = ride.scheduledTo, color = palette.clarify)
+                            Spacer(Modifier.height(CabEyeSpacing.sm))
+                            SupportingText(text = ride.scheduledAtText, color = palette.muted)
+                            Spacer(Modifier.height(CabEyeSpacing.lg))
+                            PrimaryAction(label = "SCHEDULE IT", onClick = { onPostRideAction("confirm") }, accentColor = palette.confirm)
+                            Spacer(Modifier.height(CabEyeSpacing.sm))
+                            SecondaryAction(label = "CANCEL", onClick = { onPostRideAction("done") }, accentColor = palette.onBackground)
+                        }
+                        NextStep.SCHEDULED -> {
+                            VoiceOrb(state = VoiceOrbState.SUCCESS, customLabel = "SCHEDULED", customAccent = palette.confirm)
+                            Spacer(Modifier.height(CabEyeSpacing.lg))
+                            StateHeadline(text = "Ride Scheduled", color = palette.confirm)
+                            Spacer(Modifier.height(CabEyeSpacing.sm))
+                            SupportingText(text = "${ride.scheduledTo} · ${ride.scheduledAtText}", color = palette.muted)
+                        }
+                    }
+                }
             }
 
-            // Optional feedback. Skip is always the big button: feedback must never be the
-            // thing standing between a rider and getting on with their day.
-            is RiderState.Feedback -> when (ride.step) {
-                FeedbackStep.RATING -> StateScaffold(
-                    icon = "☆",
-                    word = "Feedback",
-                    headline = "How was\nyour ride?",
-                    support = "Say 1 to 5  ·  “report a problem”  ·  “skip”",
-                    accent = palette.clarify,
-                    micOpen = uiState.micOpen,
-                    primary = ButtonSpec("SKIP", palette.onBackground) { onPostRideAction("skip") },
-                    secondary = ButtonSpec("REPORT A PROBLEM", palette.danger) { onPostRideAction("report") }
-                )
-                FeedbackStep.RATING_CHECK -> StateScaffold(
-                    icon = "?",
-                    word = "Check rating",
-                    headline = "${ride.rating ?: "?"} out of 5?",
-                    support = "Say yes, no, or the right number",
-                    accent = palette.clarify,
-                    micOpen = uiState.micOpen,
-                    primary = ButtonSpec("YES", palette.confirm) { onPostRideAction("rating-yes") },
-                    secondary = ButtonSpec("NO", palette.onBackground) { onPostRideAction("rating-no") }
-                )
-                FeedbackStep.REPORT -> StateScaffold(
-                    icon = "!",
-                    word = "Report",
-                    headline = "What went\nwrong?",
-                    support = ride.rating?.let { "Rating $it of 5  ·  say it, or “skip”" } ?: "Say it, or “skip”",
-                    accent = palette.clarify,
-                    micOpen = uiState.micOpen,
-                    primary = ButtonSpec("SKIP", palette.onBackground) { onPostRideAction("skip") }
-                )
-                FeedbackStep.CONFIRM -> StateScaffold(
-                    icon = "?",
-                    word = "Send report?",
-                    headline = "“${ride.report}”",
-                    support = ride.category.lowercase().replaceFirstChar { it.uppercase() },
-                    accent = if (ride.category == "SAFETY") palette.danger else palette.clarify,
-                    micOpen = uiState.micOpen,
-                    primary = ButtonSpec("SEND", palette.confirm) { onPostRideAction("send") },
-                    secondary = ButtonSpec("SKIP", palette.onBackground) { onPostRideAction("skip") }
-                )
-                FeedbackStep.SENT -> StateScaffold(
-                    icon = "✓",
-                    word = "Thank you",
-                    headline = "Thank you",
-                    support = null,
-                    accent = palette.confirm,
-                    micOpen = uiState.micOpen
-                )
-            }
-
-            // The end of one journey is the start of the next.
-            is RiderState.NextJourney -> when (ride.step) {
-                NextStep.CHOOSE -> StateScaffold(
-                    icon = "↻",
-                    word = "Next journey",
-                    headline = "Another\nride?",
-                    support = "“book now”  ·  “schedule for later”  ·  “done”",
-                    accent = palette.onBackground,
-                    micOpen = uiState.micOpen,
-                    primary = ButtonSpec("BOOK ANOTHER RIDE", palette.confirm) { onPostRideAction("now") },
-                    secondary = ButtonSpec("I'M DONE", palette.onBackground) { onPostRideAction("done") }
-                )
-                NextStep.WHEN -> StateScaffold(
-                    icon = "◷",
-                    word = "Schedule",
-                    headline = "When?",
-                    support = "“tomorrow at 8 30”  ·  “in two hours”",
-                    accent = palette.listening,
-                    micOpen = uiState.micOpen,
-                    secondary = ButtonSpec("CANCEL", palette.onBackground) { onPostRideAction("done") }
-                )
-                NextStep.WHERE -> StateScaffold(
-                    icon = "◷",
-                    word = "Schedule",
-                    headline = "Where to?",
-                    support = ride.scheduledAtText,
-                    accent = palette.listening,
-                    micOpen = uiState.micOpen,
-                    secondary = ButtonSpec("CANCEL", palette.onBackground) { onPostRideAction("done") }
-                )
-                NextStep.CONFIRM -> StateScaffold(
-                    icon = "?",
-                    word = "Schedule",
-                    headline = ride.scheduledTo,
-                    support = ride.scheduledAtText,
-                    accent = palette.clarify,
-                    micOpen = uiState.micOpen,
-                    primary = ButtonSpec("SCHEDULE IT", palette.confirm) { onPostRideAction("confirm") },
-                    secondary = ButtonSpec("CANCEL", palette.onBackground) { onPostRideAction("done") }
-                )
-                NextStep.SCHEDULED -> StateScaffold(
-                    icon = "✓",
-                    word = "Scheduled",
-                    headline = ride.scheduledTo,
-                    support = ride.scheduledAtText,
-                    accent = palette.confirm,
-                    micOpen = uiState.micOpen
+            // Bottom bar with Help & SOS button
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = CabEyeSpacing.screenPadding, vertical = CabEyeSpacing.md)
+            ) {
+                if (uiState.ride is RiderState.Idle) {
+                    SecondaryAction(
+                        label = "HELP",
+                        onClick = onHelp,
+                        accentColor = palette.muted,
+                        modifier = Modifier
+                            .align(Alignment.CenterStart)
+                            .defaultMinSize(minWidth = 110.dp)
+                    )
+                }
+                SosButton(
+                    onSos = onSos,
+                    modifier = Modifier.align(Alignment.CenterEnd)
                 )
             }
         }
 
-        // Connection state, and the hidden way into settings.
-        //
-        // The warning half is the point: a dropped socket must be visible AND audible, because
-        // on its own it presents as silence — and silence is reserved for "working normally".
-        // The audible half is the view model's job; this is the visible one, for the sighted
-        // helper looking over the rider's shoulder.
-        ConnectionChip(
-            connected = uiState.connected,
-            onOpenSettings = onOpenSettings,
-            modifier = Modifier.align(Alignment.TopEnd)
-        )
-
-        SosButton(onSos = onSos, modifier = Modifier.align(Alignment.BottomEnd))
-
-        // The live camera, in a corner: the ride screen underneath is left exactly as it was.
+        // Live camera assist in top corner
         CameraPanel(
             camera = uiState.camera,
             onAnswer = onCameraAnswer,
@@ -488,374 +981,84 @@ fun RiderSurface(
             modifier = Modifier.align(Alignment.TopStart)
         )
 
+        // Emergency Overlay
         if (uiState.sosActive) {
-            SosOverlay(onDismiss = onDismissSos)
+            EmergencyOverlay(
+                onDismiss = onDismissSos,
+                modifier = Modifier.fillMaxSize()
+            )
         }
     }
 }
 
-// =====================================================================================
-//  The scaffold every state renders through
-// =====================================================================================
-
-/** One button: its label, its accent, and what it does. */
-private data class ButtonSpec(
-    val label: String,
-    val accent: Color,
-    val onClick: () -> Unit
-)
-
 /**
- * The shape of every state.
+ * Visual proximity radar animation for Driver Approaching state.
  *
- * Taking these as parameters rather than trusting eleven hand-written screens is what makes the
- * brief's per-state rules structural instead of aspirational: there is no third button
- * parameter, so no state can grow a third button.
- *
- * Note that [icon] and [word] are **not decoration**. The brief requires that no meaning is
- * carried by colour alone, and these are how that requirement is met on screen — the accent
- * colour is the third signal, not the first. A rider with a colour vision deficiency, or one
- * using the high-contrast yellow theme where several accents are the same yellow, still gets
- * the state from the glyph and the word. The audio layer carries the fourth signal.
- *
- * @param icon a single glyph, sized large. Text rather than a vector so it scales with the
- *   system font setting for free and can never go missing from a drawable folder.
- * @param word one word naming the state, for the same reason
- * @param headline the one huge line. Line breaks are authored, not wrapped, so the break lands
- *   somewhere meaningful at every font size.
- * @param support at most one supporting line, or null
- * @param micOpen drives the pulsing indicator. Deliberately *not* derived from the ride state:
- *   the mic is also open during `confirming` and during the recovery ladder, and a helper
- *   watching the screen needs to know that.
- * @param inputLevel 0..1 mic level, which nudges the indicator so sound reaching the recogniser
- *   is visible and not merely asserted
+ * Renders expanding sound/proximity rings and vehicle heading,
+ * visually reinforcing the audio beacon without requiring a complex map.
  */
 @Composable
-private fun StateScaffold(
-    icon: String,
-    word: String,
-    headline: String,
-    support: String?,
+private fun ProximityBeaconVisualization(
+    distanceMeters: Int,
+    bearingDegrees: Float,
     accent: Color,
-    micOpen: Boolean,
-    inputLevel: Float = 0f,
-    primary: ButtonSpec? = null,
-    secondary: ButtonSpec? = null,
-    extraContent: (@Composable () -> Unit)? = null
+    modifier: Modifier = Modifier
 ) {
-    val palette = LocalPalette.current
+    val reducedMotion = LocalReducedMotion.current
+    val transition = rememberInfiniteTransition(label = "proximityTransition")
 
-    // States that carry extra content below the headline (today: the destination map) have to
-    // fit a genuinely long place name AND the map on one screen. "PSG College Of Technology"
-    // wraps to three lines at displayLarge and pushes the map off the bottom — and the surface
-    // cannot be scrolled without opening the microphone, so off the bottom means gone. Long
-    // names are the normal case now that Google supplies the candidates, not the exception.
-    val hasExtra = extraContent != null
+    val pulseScale by transition.animateFloat(
+        initialValue = 1f,
+        targetValue = 1.35f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1200),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "proximityRingScale"
+    )
 
-    CenteredColumn(verticalPadding = if (hasExtra) 24.dp else 40.dp) {
-        ListeningIndicator(micOpen = micOpen, accent = accent, inputLevel = inputLevel)
+    val pulseAlpha by transition.animateFloat(
+        initialValue = 0.6f,
+        targetValue = 0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1200),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "proximityRingAlpha"
+    )
 
-        Spacer(Modifier.height(20.dp))
+    Box(
+        modifier = modifier
+            .size(160.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        if (!reducedMotion) {
+            Box(
+                modifier = Modifier
+                    .size(120.dp)
+                    .scale(pulseScale)
+                    .alpha(pulseAlpha)
+                    .border(3.dp, accent, CircleShape)
+            )
+        }
 
-        Text(
-            text = "$icon  ${word.uppercase()}",
-            style = MaterialTheme.typography.labelLarge,
-            color = accent,
-            textAlign = TextAlign.Center
-        )
-
-        Spacer(Modifier.height(20.dp))
-
-        // The primary target: one huge headline filling the bulk of the surface. The whole
-        // screen is pressable, so this is what the rider is aiming at when they aim at all.
-        //
-        // A MINIMUM height derived from the real screen, not `fillMaxHeight(0.6f)`. Inside the
-        // scroll container above, the height constraint is unbounded, and `fillMaxHeight`
-        // silently does nothing against an unbounded constraint — the 60% floor would have
-        // looked correct in the source and been absent on the device. A minimum also degrades
-        // the right way at 200% font: the block grows past 60% and scrolls, rather than
-        // capping and clipping the headline.
-        // When a state carries extra content — today, the destination map — the 60% floor is
-        // yielded down to a smaller one. Not cosmetic: the whole screen is a hold-to-talk
-        // target, so anything pushed below the fold is genuinely unreachable. A swipe to scroll
-        // to it registers as a press and opens the microphone instead, which is how a sighted
-        // user checking the map ends up re-triggering the recogniser. Content that cannot be
-        // scrolled to must therefore fit without scrolling.
-        val screenHeightDp = LocalConfiguration.current.screenHeightDp
-        val targetFraction =
-            if (hasExtra) PRIMARY_TARGET_FRACTION_WITH_EXTRA else PRIMARY_TARGET_FRACTION
         Box(
             modifier = Modifier
-                .fillMaxWidth()
-                .defaultMinSize(minHeight = (screenHeightDp * targetFraction).dp),
+                .size(110.dp)
+                .background(accent.copy(alpha = 0.15f), CircleShape)
+                .border(3.dp, accent, CircleShape),
             contentAlignment = Alignment.Center
         ) {
             Text(
-                text = headline,
-                // 48sp rather than 60sp when a map is also on screen. Still twice the 24sp
-                // body floor and still the largest thing on the surface, but a three-line
-                // name now costs 168dp instead of 198dp, which is the difference between
-                // the map being visible and being unreachable.
-                style = if (hasExtra) {
-                    MaterialTheme.typography.displayMedium
-                } else {
-                    MaterialTheme.typography.displayLarge
-                },
-                color = accent,
-                textAlign = TextAlign.Center
+                text = "🚕",
+                fontSize = 38.sp
             )
         }
-
-        if (support != null) {
-            Spacer(Modifier.height(16.dp))
-            Text(
-                text = support,
-                style = MaterialTheme.typography.bodyLarge,
-                color = palette.muted,
-                textAlign = TextAlign.Center
-            )
-        }
-
-        extraContent?.invoke()
-
-        if (primary != null || secondary != null) {
-            Spacer(Modifier.height(if (hasExtra) 16.dp else 28.dp))
-            ActionRow(primary, secondary)
-        }
-    }
-}
-
-/** At most two buttons, side by side when there are two. */
-@Composable
-private fun ActionRow(primary: ButtonSpec?, secondary: ButtonSpec?) {
-    if (primary != null && secondary != null) {
-        Row(Modifier.fillMaxWidth()) {
-            ChoiceButton(primary.label, primary.accent, Modifier.weight(1f), primary.onClick)
-            Spacer(Modifier.width(16.dp))
-            ChoiceButton(secondary.label, secondary.accent, Modifier.weight(1f), secondary.onClick)
-        }
-    } else {
-        val only = primary ?: secondary ?: return
-        ChoiceButton(only.label, only.accent, Modifier.fillMaxWidth(), only.onClick)
     }
 }
 
 /**
- * The pulsing microphone indicator.
- *
- * Pulses **only while the microphone is genuinely open**, which is the entire point: a sighted
- * helper standing next to the rider needs to be able to tell, at a glance and without asking,
- * whether the app is waiting for speech. Animating it whenever the screen is on would make it a
- * decoration and destroy the signal.
- *
- * When the mic is closed the ring is still drawn, dimmed and static. Removing it entirely would
- * make the layout jump by 140 dp every time the app starts or stops listening — reflowing text
- * under someone who is mid-read, which the brief forbids.
- */
-@Composable
-private fun ListeningIndicator(micOpen: Boolean, accent: Color, inputLevel: Float) {
-    val palette = LocalPalette.current
-    val reducedMotion = LocalReducedMotion.current
-
-    val transition = rememberInfiniteTransition(label = "mic-pulse")
-    val animatedPulse by transition.animateFloat(
-        initialValue = 1f,
-        targetValue = 1.16f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 900),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "pulse-scale"
-    )
-
-    // Under reduced motion the ring holds still and stays fully opaque instead. The
-    // information is carried by the earcon and the haptic regardless, so removing the
-    // animation costs the rider nothing — and this animation only ever scales a ring, never
-    // moves or reflows text.
-    val pulse = if (micOpen && !reducedMotion) animatedPulse else 1f
-    val levelScale = 1f + (inputLevel.coerceIn(0f, 1f) * 0.12f)
-
-    Box(
-        modifier = Modifier
-            .size(140.dp)
-            .scale(pulse * levelScale)
-            .alpha(if (micOpen) 1f else 0.25f)
-            .border(
-                width = if (micOpen) 10.dp else 4.dp,
-                color = if (micOpen) accent else palette.outline,
-                shape = CircleShape
-            )
-    )
-}
-
-// =====================================================================================
-//  The two states that ask a question
-// =====================================================================================
-
-/**
- * `clarify` — the app is asking a question, and is therefore listening for the answer.
- *
- * Two shapes share this state:
- *
- *  - **Ambiguity**: two candidates within DELTA on score *and* more than DIVERGE apart on the
- *    map. Both numbers are shown, because they are also logged on every decision and having
- *    them on screen makes a demo inspectable without a logcat window open.
- *  - **Near miss**: one candidate in the 0.30–0.50 band. Plausible, not actionable. This is the
- *    case that used to book silently, and the question costs the rider about two seconds
- *    against a wrong booking costing them twenty minutes.
- *
- * The buttons are the sighted-helper fallback. The rider answers out loud, and neither path is
- * second-class: the same two options are on screen and in the spoken prompt, in the same order.
- */
-@Composable
-private fun ClarifyContent(
-    state: RiderState.Clarify,
-    micOpen: Boolean,
-    onChoice: (PlaceOption) -> Unit,
-    onNearMissAnswer: (Boolean) -> Unit
-) {
-    val palette = LocalPalette.current
-
-    if (state.isNearMiss) {
-        StateScaffold(
-            icon = "?",
-            word = "Check",
-            headline = "Did you mean\n${state.optionA.name}?",
-            support = "Say yes or no",
-            accent = palette.clarify,
-            micOpen = micOpen,
-            primary = ButtonSpec("Yes", palette.confirm) { onNearMissAnswer(true) },
-            secondary = ButtonSpec("No", palette.danger) { onNearMissAnswer(false) }
-        )
-        return
-    }
-
-    StateScaffold(
-        icon = "?",
-        word = "Which one",
-        headline = "Which\none?",
-        // Diagnostics, deliberately on screen. gap < 0.16 AND divergence > 1.5 km is what
-        // justified interrupting the rider at all.
-        support = "gap ${"%.3f".format(state.scoreGap)}  ·  " +
-                "${"%.2f".format(state.divergenceKm)} km apart",
-        accent = palette.clarify,
-        micOpen = micOpen,
-        primary = ButtonSpec(state.optionA.name, palette.clarify) { onChoice(state.optionA) },
-        secondary = ButtonSpec(state.optionB.name, palette.clarify) { onChoice(state.optionB) }
-    )
-}
-
-/**
- * `confirming` — the ride is **already being booked**.
- *
- * This is optimistic execution, so there is no question on screen and none asked aloud. The app
- * states what it is doing and gives a real, honoured five-second window in which the microphone
- * is open and saying "cancel" genuinely aborts. A confirmation prompt would add a full
- * conversational turn to every single booking to guard against a rare mistake.
- *
- * Note the mic indicator is pulsing throughout this state. That is not a bug — the window only
- * means anything because the app is genuinely listening for the whole of it, and the pulse is
- * the visible proof.
- */
-@Composable
-private fun ConfirmingContent(
-    state: RiderState.Confirming,
-    micOpen: Boolean,
-    destination: PlaceOption?,
-    onCancel: () -> Unit
-) {
-    val palette = LocalPalette.current
-    val secondsLeft = (state.cancelWindowMillisRemaining / 1000.0).roundToInt()
-
-    StateScaffold(
-        icon = "✓",
-        word = "Booking ${state.rideType.spokenName}",
-        headline = state.destination,
-        support = buildString {
-            append("Say “cancel”  ·  ${secondsLeft}s")
-            destination?.formattedAddress?.takeIf { it.isNotBlank() }?.let { append("\n$it") }
-        },
-        accent = palette.confirm,
-        micOpen = micOpen,
-        primary = ButtonSpec("Cancel", palette.danger, onCancel),
-        extraContent = destination
-            ?.takeIf { BuildConfig.GOOGLE_MAPS_API_KEY.isNotBlank() }
-            ?.let { place -> { DestinationMapPreview(place = place) } }
-    )
-}
-
-/**
- * Non-interactive map preview of the exact place returned by Places SDK. Voice remains the
- * primary interaction; disabling map clicks keeps the existing whole-screen hold-to-talk target.
- */
-@Composable
-private fun DestinationMapPreview(place: PlaceOption) {
-    val context = LocalContext.current
-    val lifecycleOwner = LocalLifecycleOwner.current
-    val mapView = remember { MapView(context).apply { onCreate(null) } }
-    var configuredKey by remember { mutableStateOf("") }
-
-    androidx.compose.runtime.DisposableEffect(lifecycleOwner, mapView) {
-        val observer = LifecycleEventObserver { _, event ->
-            when (event) {
-                Lifecycle.Event.ON_START -> mapView.onStart()
-                Lifecycle.Event.ON_RESUME -> mapView.onResume()
-                Lifecycle.Event.ON_PAUSE -> mapView.onPause()
-                Lifecycle.Event.ON_STOP -> mapView.onStop()
-                else -> Unit
-            }
-        }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose {
-            lifecycleOwner.lifecycle.removeObserver(observer)
-            mapView.onDestroy()
-        }
-    }
-
-    val key = "${place.placeId}:${place.latitude}:${place.longitude}"
-    AndroidView(
-        factory = {
-            mapView.apply {
-                isClickable = false
-                isFocusable = false
-                isFocusableInTouchMode = false
-            }
-        },
-        update = { view ->
-            if (configuredKey != key) {
-                configuredKey = key
-                view.getMapAsync { map ->
-                    map.uiSettings.isZoomControlsEnabled = false
-                    map.uiSettings.isScrollGesturesEnabled = false
-                    map.uiSettings.isZoomGesturesEnabled = false
-                    map.uiSettings.isRotateGesturesEnabled = false
-                    map.uiSettings.isTiltGesturesEnabled = false
-                    val target = LatLng(place.latitude, place.longitude)
-                    map.clear()
-                    map.addMarker(MarkerOptions().position(target).title(place.name))
-                    map.moveCamera(CameraUpdateFactory.newLatLngZoom(target, 15f))
-                }
-            }
-        },
-        modifier = Modifier
-            .fillMaxWidth()
-            // 150dp, not 180dp: the map has to share one non-scrollable screen with a
-            // three-line place name, the address line and the Cancel button.
-            .height(150.dp)
-            .border(1.dp, LocalPalette.current.outline, RoundedCornerShape(16.dp))
-    )
-}
-
-// =====================================================================================
-//  Live camera
-// =====================================================================================
-
-/**
- * The corner panel for the "help my driver find me" camera.
- *
- * For the sighted helper and the low-vision rider. The blind rider hears the question and
- * answers by voice; this panel and the TalkBack actions are the same controls by touch. It
- * never covers the ride screen, and it shows no picture: the rider's phone has nothing to see.
+ * Live camera corner panel for driver assist.
  */
 @Composable
 private fun CameraPanel(
@@ -872,189 +1075,60 @@ private fun CameraPanel(
         modifier = modifier
             .padding(12.dp)
             .width(230.dp)
-            .background(palette.background, RoundedCornerShape(18.dp))
-            .border(FocusIndicatorWidth, if (live) palette.danger else palette.clarify, RoundedCornerShape(18.dp))
+            .background(palette.surface, CabEyeShapes.card)
+            .border(2.dp, if (live) palette.danger else palette.clarify, CabEyeShapes.card)
             .padding(12.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Text(
-            text = if (live) "● CAMERA ON" else "Driver asks to see your camera",
-            style = MaterialTheme.typography.labelLarge,
+            text = if (live) "● CAMERA ON" else "Driver asks to see camera",
+            style = CabEyeType.badgeText,
             color = if (live) palette.danger else palette.clarify,
             textAlign = TextAlign.Center
         )
         Text(
-            text = if (live) "Shown to your driver only. Not recorded." else "Say yes or no",
-            style = MaterialTheme.typography.bodyMedium,
+            text = if (live) "Shown to driver only." else "Say yes or no",
+            style = CabEyeType.secondaryInfo.copy(fontSize = 13.sp),
             color = palette.muted,
             textAlign = TextAlign.Center
         )
         Spacer(Modifier.height(8.dp))
         if (live) {
-            ChoiceButton("STOP CAMERA", palette.danger, Modifier.fillMaxWidth(), onStop)
+            SecondaryAction(label = "STOP CAMERA", onClick = onStop, accentColor = palette.danger)
         } else {
-            ChoiceButton("SHARE", palette.confirm, Modifier.fillMaxWidth()) { onAnswer(true) }
+            PrimaryAction(label = "SHARE", onClick = { onAnswer(true) }, accentColor = palette.confirm)
             Spacer(Modifier.height(8.dp))
-            ChoiceButton("NO", palette.onBackground, Modifier.fillMaxWidth()) { onAnswer(false) }
-        }
-    }
-}
-
-// =====================================================================================
-//  SOS
-// =====================================================================================
-
-/**
- * SOS is an overlay, not a state — it can be raised on top of any point in the ride and
- * dismissing it must return the rider exactly where they were.
- */
-@Composable
-private fun SosOverlay(onDismiss: () -> Unit) {
-    val palette = LocalPalette.current
-
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(palette.background)
-    ) {
-        CenteredColumn {
-            Text(
-                text = "SOS",
-                style = MaterialTheme.typography.displayLarge,
-                color = palette.danger,
-                textAlign = TextAlign.Center
-            )
-            Spacer(Modifier.height(20.dp))
-            Text(
-                text = "Sharing your location",
-                style = MaterialTheme.typography.bodyLarge,
-                color = palette.onBackground,
-                textAlign = TextAlign.Center
-            )
-            Spacer(Modifier.height(40.dp))
-            ChoiceButton("Dismiss", palette.danger, Modifier.fillMaxWidth(), onDismiss)
+            SecondaryAction(label = "NO", onClick = { onAnswer(false) }, accentColor = palette.onBackground)
         }
     }
 }
 
 /**
- * The connection indicator, which doubles as the hidden entrance to settings.
- *
- * ## Why the gesture is deliberately awkward
- * Settings must be reachable — the ngrok URL changes every time the tunnel restarts, and
- * someone has to be able to paste the new one. But the rider must not be able to get there by
- * accident: the whole screen is a press target, and a blind rider who lands on a settings form
- * has no way to know where they are or how to leave. So it takes [SETTINGS_TAP_COUNT] taps on
- * a small chip in a corner, within a short window — a gesture nobody performs unintentionally,
- * and one that a helper can be told over the phone.
- *
- * ## Why it is `clearAndSetSemantics`
- * The surface is one merged accessibility node with an assertive live region. Leaving this chip
- * in the tree would add a second focusable thing to swipe to, which is precisely the traversal
- * this product exists to remove. Its information — offline — reaches the rider as speech from
- * the view model, which is the channel that actually works for them.
- */
-@Composable
-private fun ConnectionChip(
-    connected: Boolean,
-    onOpenSettings: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    val palette = LocalPalette.current
-    var taps by remember { mutableIntStateOf(0) }
-    var firstTapAt by remember { mutableLongStateOf(0L) }
-
-    // The visual glyph stays a single unobtrusive character, but the actual touch target is
-    // the full MinTouchTarget square anchored at the same corner. Landing 5 taps on a bare
-    // "·" glyph's own pixels is not reliable on a real screen — the tap kept missing onto
-    // the full-screen hold-to-talk surface behind it, which is a size bug, not a Compose
-    // dispatch-order one: a hit inside this box's bounds already takes priority over the
-    // surface's pointerInput, same as any button placed over a scrollable background does.
-    Box(
-        modifier = modifier
-            .defaultMinSize(minWidth = MinTouchTarget, minHeight = MinTouchTarget)
-            .clearAndSetSemantics { }
-            .clickable {
-                val now = System.currentTimeMillis()
-                if (now - firstTapAt > SETTINGS_TAP_WINDOW_MS) {
-                    firstTapAt = now
-                    taps = 1
-                } else {
-                    taps++
-                }
-                if (taps >= SETTINGS_TAP_COUNT) {
-                    taps = 0
-                    onOpenSettings()
-                }
-            },
-        contentAlignment = Alignment.TopEnd
-    ) {
-        Text(
-            text = if (connected) "·" else "offline",
-            style = MaterialTheme.typography.bodyMedium,
-            color = if (connected) palette.muted else palette.danger,
-            modifier = Modifier.padding(20.dp)
-        )
-    }
-}
-
-/** Always-available SOS control, comfortably above the 88.dp floor. */
-@Composable
-private fun SosButton(onSos: () -> Unit, modifier: Modifier = Modifier) {
-    val palette = LocalPalette.current
-
-    Button(
-        onClick = onSos,
-        shape = RoundedCornerShape(20.dp),
-        colors = ButtonDefaults.buttonColors(
-            containerColor = palette.background,
-            contentColor = palette.danger
-        ),
-        modifier = modifier
-            .padding(20.dp)
-            .size(MinTouchTarget)
-            .border(FocusIndicatorWidth, palette.danger, RoundedCornerShape(20.dp))
-    ) {
-        Text("SOS", style = MaterialTheme.typography.labelLarge)
-    }
-}
-
-// =====================================================================================
-//  Shared pieces
-// =====================================================================================
-
-// =====================================================================================
-//  Payment hand-off
-// =====================================================================================
-
-/**
- * The payment panel on the Done screen: amount, how to pay, status, receipt.
- *
- * Entirely in-app. Every phase has its own words, so colour is never the only signal, and
- * everything shown here is also spoken by the view model.
+ * Payment controls on Done screen.
  */
 @Composable
 private fun PaymentPanel(payment: PaymentUi, onPaymentMethod: (String) -> Unit) {
     val palette = LocalPalette.current
 
-    Spacer(Modifier.height(16.dp))
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .border(2.dp, palette.muted, RoundedCornerShape(20.dp))
-            .padding(16.dp),
+            .clip(CabEyeShapes.card)
+            .background(palette.surface)
+            .border(2.dp, palette.outline, CabEyeShapes.card)
+            .padding(CabEyeSpacing.md),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Text(
             text = when (payment.phase) {
-                PaymentPhase.PAID -> "✓ PAID  ₹${payment.amountRupees}"
+                PaymentPhase.PAID -> "✓ PAID ₹${payment.amountRupees}"
                 PaymentPhase.FAILED -> "✕ NOT PAID"
                 PaymentPhase.ERROR -> "PAYMENT UNAVAILABLE"
                 PaymentPhase.STARTING -> "PREPARING…"
                 PaymentPhase.PROCESSING -> "PROCESSING…"
                 PaymentPhase.AWAITING -> "₹${payment.amountRupees}"
             },
-            style = MaterialTheme.typography.headlineMedium,
+            style = CabEyeType.stateTitleLarge.copy(fontSize = 28.sp),
             color = when (payment.phase) {
                 PaymentPhase.PAID -> palette.confirm
                 PaymentPhase.FAILED, PaymentPhase.ERROR -> palette.danger
@@ -1064,10 +1138,10 @@ private fun PaymentPanel(payment: PaymentUi, onPaymentMethod: (String) -> Unit) 
         )
 
         if (payment.phase == PaymentPhase.AWAITING) {
-            Spacer(Modifier.height(12.dp))
+            Spacer(Modifier.height(10.dp))
             Text(
                 text = "Pay by",
-                style = MaterialTheme.typography.bodyLarge,
+                style = CabEyeType.secondaryInfo,
                 color = palette.muted
             )
             Spacer(Modifier.height(8.dp))
@@ -1085,21 +1159,21 @@ private fun PaymentPanel(payment: PaymentUi, onPaymentMethod: (String) -> Unit) 
         }
 
         if (payment.message.isNotBlank()) {
-            Spacer(Modifier.height(10.dp))
+            Spacer(Modifier.height(8.dp))
             Text(
                 text = payment.message,
-                style = MaterialTheme.typography.bodyLarge,
+                style = CabEyeType.secondaryInfo,
                 color = palette.muted,
                 textAlign = TextAlign.Center
             )
         }
 
         if (payment.phase == PaymentPhase.PAID && payment.bankRef.isNotBlank()) {
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(6.dp))
             Text(
                 text = "Ref ${payment.bankRef.chunked(4).joinToString(" ")}" +
-                    if (payment.method.isNotBlank()) "  ·  ${payment.method}" else "",
-                style = MaterialTheme.typography.bodyLarge,
+                    if (payment.method.isNotBlank()) " · ${payment.method}" else "",
+                style = CabEyeType.secondaryInfo.copy(fontWeight = FontWeight.SemiBold),
                 color = palette.onBackground,
                 textAlign = TextAlign.Center
             )
@@ -1109,7 +1183,7 @@ private fun PaymentPanel(payment: PaymentUi, onPaymentMethod: (String) -> Unit) 
             Spacer(Modifier.height(6.dp))
             Text(
                 text = "TEST MODE · no real money",
-                style = MaterialTheme.typography.labelLarge,
+                style = CabEyeType.secondaryInfo.copy(fontSize = 12.sp),
                 color = palette.muted,
                 textAlign = TextAlign.Center
             )
@@ -1117,346 +1191,60 @@ private fun PaymentPanel(payment: PaymentUi, onPaymentMethod: (String) -> Unit) 
     }
 }
 
-/** One payment-method choice. The selected one says so in words ("✓ UPI"), not only colour. */
 @Composable
 private fun MethodChip(label: String, selected: Boolean, modifier: Modifier, onClick: () -> Unit) {
     val palette = LocalPalette.current
     val accent = if (selected) palette.confirm else palette.muted
     Button(
         onClick = onClick,
-        shape = RoundedCornerShape(16.dp),
+        shape = CabEyeShapes.small,
         colors = ButtonDefaults.buttonColors(
-            containerColor = palette.background,
+            containerColor = if (selected) palette.surfaceElevated else palette.surface,
             contentColor = accent
         ),
         modifier = modifier
-            .defaultMinSize(minHeight = MinTouchTarget)
-            .border(if (selected) 3.dp else 1.dp, accent, RoundedCornerShape(16.dp))
+            .defaultMinSize(minHeight = CabEyeSpacing.preferredTouchTarget)
+            .border(if (selected) 2.5.dp else 1.dp, accent, CabEyeShapes.small)
     ) {
         Text(
             text = if (selected) "✓ $label" else label,
-            style = MaterialTheme.typography.bodyLarge,
+            style = CabEyeType.buttonText.copy(fontSize = 15.sp),
             textAlign = TextAlign.Center
         )
     }
 }
 
-/** Code the gateway records, and the label shown. */
 private val PAYMENT_METHODS = listOf(
     "UPI" to "UPI",
     "CARD" to "Card",
     "NETBANKING" to "Net banking"
 )
 
-
-/** How much of the surface the headline block occupies. The brief's floor is 60%. */
-private const val PRIMARY_TARGET_FRACTION = 0.60f
-
-/**
- * The floor used when a state also renders extra content below the headline.
- *
- * The 60% floor plus a 180dp map does not fit on a phone, and the surface cannot be scrolled
- * without opening the microphone, so the map would be unreachable in practice. The headline
- * stays the largest single element on screen and the whole surface stays pressable, so the
- * hold-to-talk target is unchanged — only the reserved minimum shrinks.
- */
-private const val PRIMARY_TARGET_FRACTION_WITH_EXTRA = 0.24f
-
-/** Taps on the connection chip that open settings. See [ConnectionChip]. */
-private const val SETTINGS_TAP_COUNT = 5
-
-/** They must land within this window of each other, so a stray tap cannot accumulate. */
-private const val SETTINGS_TAP_WINDOW_MS = 3_000L
-
-/**
- * Full-bleed centred column with generous padding, used by every state.
- *
- * `verticalScroll` is what makes 200% system font survivable. At that setting a 60sp headline
- * renders at 120sp and a two-button row grows to match; without a scroll container the bottom
- * of the column is simply clipped off, and the buttons that get clipped are the ones the
- * low-vision user turned the font up in order to use.
- */
-@Composable
-private fun CenteredColumn(
-    verticalPadding: Dp = 40.dp,
-    content: @Composable () -> Unit
-) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 24.dp, vertical = verticalPadding),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-    ) {
-        content()
-    }
-}
-
-/**
- * A discrete control.
- *
- * `defaultMinSize` rather than a fixed `height` so the button still grows when the user has
- * a large system font set — pinning the height would clip the label for exactly the
- * low-vision users this screen exists for.
- *
- * The border is [FocusIndicatorWidth] thick and carries the accent, so the control is bounded
- * by shape as well as by colour and never relies on hue alone to be findable.
- */
-@Composable
-private fun ChoiceButton(
-    label: String,
-    accent: Color,
-    modifier: Modifier = Modifier,
-    onClick: () -> Unit
-) {
-    val palette = LocalPalette.current
-
-    Button(
-        onClick = onClick,
-        shape = RoundedCornerShape(24.dp),
-        colors = ButtonDefaults.buttonColors(
-            containerColor = palette.background,
-            contentColor = accent
-        ),
-        modifier = modifier
-            .defaultMinSize(minHeight = MinTouchTarget)
-            .border(FocusIndicatorWidth, accent, RoundedCornerShape(24.dp))
-    ) {
-        Text(
-            text = label,
-            style = MaterialTheme.typography.headlineMedium,
-            textAlign = TextAlign.Center,
-            modifier = Modifier.padding(vertical = 16.dp)
-        )
-    }
-}
-
-/**
- * A real place from the active city, so the idle hint is never a place the app cannot book.
- *
- * Uses the city's curated examples rather than the head of its place list, for the same reason
- * the recovery ladder does: the list happens to start with the deliberately ambiguous pair, and
- * an on-screen hint that steers the rider into a clarification question is a bad hint.
- */
 private fun firstExample(): String =
     Gazetteer.activeCity.examples.firstOrNull() ?: "the airport"
 
-// =====================================================================================
-//  Accessibility helpers
-// =====================================================================================
-
-/**
- * The single sentence TalkBack announces for the whole surface.
- *
- * Because the node is an assertive live region, this string is spoken whenever it changes.
- * It is written to be heard, not read: short, no abbreviations, and no punctuation that a
- * screen reader will spell out.
- *
- * Note this runs in parallel with the app's own narrator. A rider using TalkBack hears
- * this; a rider who is not hears the [com.cabeye.rider.audio.AudioEngine]. Keeping the two
- * texts close in wording keeps the product one product.
- */
-private fun announcementFor(uiState: RiderUiState): String {
-    if (uiState.sosActive) return "S O S active. Sharing your location."
-
-    return when (val ride = uiState.ride) {
-        is RiderState.Idle ->
-            "Ready. Hold anywhere and say where you want to go in ${uiState.activeCityName}."
-
-        is RiderState.Listening ->
-            if (ride.isFollowUp) "Listening for your answer." else "Listening."
-
-        is RiderState.Resolving ->
-            "Working that out."
-
-        is RiderState.Clarify ->
-            if (ride.isNearMiss) "Did you mean ${ride.optionA.name}? Say yes or no."
-            else "Did you mean ${ride.optionA.name} or ${ride.optionB.name}?"
-
-        is RiderState.Confirming ->
-            "Booking ${ride.rideType.spokenName} to ${ride.destination}. Say cancel to stop."
-
-        is RiderState.Finding ->
-            "Finding a driver."
-
-        is RiderState.Assigned ->
-            "${ride.driver.name} is coming, ${ride.etaMinutes} minutes away."
-
-        // No spoken distance during approach — the earcon carries it. This description
-        // exists only for the TalkBack case, where an earcon alone would be ambiguous.
-        is RiderState.Approaching ->
-            "Your driver is approaching."
-
-        is RiderState.Arrived ->
-            "Your driver has arrived. Wait for the driver to say the code."
-
-        is RiderState.InTrip ->
-            "On the way to ${ride.destination}, ${ride.etaMinutes} minutes."
-
-        is RiderState.Done -> when (uiState.payment?.phase) {
-            PaymentPhase.PAID ->
-                "Paid ${uiState.payment?.amountRupees ?: ride.fareRupees} rupees. Action: hear receipt."
-            PaymentPhase.AWAITING ->
-                "Pay ${uiState.payment?.amountRupees ?: ride.fareRupees} rupees by " +
-                    "${uiState.payment?.method.orEmpty()}. Actions: pay, change method, or decline."
-            PaymentPhase.PROCESSING ->
-                "Processing payment."
-            PaymentPhase.FAILED ->
-                "Payment not completed. ${uiState.payment?.message.orEmpty()}. Action: try again."
-            else ->
-                "You have arrived at ${ride.destination}. Fare ${ride.fareRupees} rupees. Action: pay."
-        }
-
-        is RiderState.Feedback -> when (ride.step) {
-            FeedbackStep.RATING -> "How was your ride with ${ride.driverName}? Say a number from one to five, report a problem, or skip."
-            FeedbackStep.RATING_CHECK -> "${ride.rating} out of 5. Is that right? Say yes or no."
-            FeedbackStep.REPORT -> "What went wrong? Say it, or skip."
-            FeedbackStep.CONFIRM -> "Send this report: ${ride.report}? Say yes or no."
-            FeedbackStep.SENT -> "Thank you."
-        }
-
-        is RiderState.NextJourney -> when (ride.step) {
-            NextStep.CHOOSE -> "Book another ride now, schedule one for later, or done?"
-            NextStep.WHEN -> "When should I book it?"
-            NextStep.WHERE -> "${ride.scheduledAtText}. Where should the ride go?"
-            NextStep.CONFIRM -> "A ride to ${ride.scheduledTo}, ${ride.scheduledAtText}. Schedule it?"
-            NextStep.SCHEDULED -> "Scheduled: ${ride.scheduledTo}, ${ride.scheduledAtText}."
-        }
-    }
-}
-
-/** The haptic that accompanies entering a state. */
 private fun hapticFor(uiState: RiderUiState): HapticPattern {
     if (uiState.sosActive) return HapticPattern.SOS
 
-    return when (uiState.ride) {
+    return when (val ride = uiState.ride) {
         is RiderState.Idle -> HapticPattern.LISTENING_END
         is RiderState.Listening -> HapticPattern.LISTENING_START
         is RiderState.Resolving -> HapticPattern.LISTENING_END
         is RiderState.Clarify -> HapticPattern.CLARIFY
         is RiderState.Confirming -> HapticPattern.CONFIRMED
         is RiderState.Finding -> HapticPattern.LISTENING_END
-        is RiderState.Assigned -> HapticPattern.CONFIRMED
+        is RiderState.Assigned -> HapticPattern.DRIVER_ASSIGNED
         is RiderState.Approaching -> HapticPattern.LISTENING_END
-        // The one pattern a rider must recognise through a coat pocket.
-        is RiderState.Arrived -> HapticPattern.ARRIVED
+        is RiderState.Arrived -> when {
+            ride.codeVerified -> HapticPattern.BOARDING_VERIFIED
+            ride.verificationFailed -> HapticPattern.WRONG_CODE
+            else -> HapticPattern.ARRIVED
+        }
         is RiderState.InTrip -> HapticPattern.CONFIRMED
-        is RiderState.Done -> HapticPattern.CONFIRMED
+        is RiderState.Done -> HapticPattern.TRIP_COMPLETED
         is RiderState.Feedback -> HapticPattern.CLARIFY
         is RiderState.NextJourney -> HapticPattern.CLARIFY
+        is RiderState.Planning -> HapticPattern.CLARIFY
+        is RiderState.Walking -> HapticPattern.LISTENING_END
     }
-}
-
-/**
- * Custom accessibility actions for the merged node.
- *
- * Merging descendants is what makes the surface one target, but it also removes the child
- * buttons from TalkBack's traversal. These actions restore those affordances without
- * reintroducing a list to swipe through — a TalkBack user reaches them from the
- * local-context menu on the single node.
- */
-private fun buildCustomActions(
-    uiState: RiderUiState,
-    onCancel: () -> Unit,
-    onClarifyChoice: (PlaceOption) -> Unit,
-    onNearMissAnswer: (Boolean) -> Unit,
-    onSos: () -> Unit,
-    onPay: () -> Unit = {},
-    onPaymentMethod: (String) -> Unit = {},
-    onDeclinePayment: () -> Unit = {},
-    onPostRideAction: (String) -> Unit = {},
-    onCameraAnswer: (Boolean) -> Unit = {},
-    onStopCamera: () -> Unit = {},
-    onCodeConfirmed: () -> Unit = {}
-): List<CustomAccessibilityAction> {
-    val actions = mutableListOf<CustomAccessibilityAction>()
-
-    // First in the list: while the camera question is open or the camera is on, controlling
-    // it is the most time-sensitive thing a TalkBack user can do on this screen.
-    when (uiState.camera) {
-        CameraShare.ASKING -> {
-            actions += CustomAccessibilityAction("Share camera with driver") { onCameraAnswer(true); true }
-            actions += CustomAccessibilityAction("Don't share camera") { onCameraAnswer(false); true }
-        }
-        CameraShare.LIVE -> actions += CustomAccessibilityAction("Stop camera") { onStopCamera(); true }
-        CameraShare.OFF -> Unit
-    }
-
-    when (val ride = uiState.ride) {
-        is RiderState.Clarify -> {
-            if (ride.isNearMiss) {
-                actions += CustomAccessibilityAction("Yes, ${ride.optionA.name}") {
-                    onNearMissAnswer(true); true
-                }
-                actions += CustomAccessibilityAction("No") { onNearMissAnswer(false); true }
-            } else {
-                actions += CustomAccessibilityAction(ride.optionA.name) {
-                    onClarifyChoice(ride.optionA); true
-                }
-                actions += CustomAccessibilityAction(ride.optionB.name) {
-                    onClarifyChoice(ride.optionB); true
-                }
-            }
-        }
-        is RiderState.Confirming -> {
-            actions += CustomAccessibilityAction("Cancel booking") { onCancel(); true }
-        }
-        is RiderState.Assigned, is RiderState.Approaching -> {
-            actions += CustomAccessibilityAction("Cancel ride") { onCancel(); true }
-        }
-        // The same two buttons the Arrived screen shows, for a TalkBack user.
-        is RiderState.Arrived -> {
-            actions += CustomAccessibilityAction("Code is right") { onCodeConfirmed(); true }
-            actions += CustomAccessibilityAction("Not my driver") { onSos(); true }
-        }
-        is RiderState.Done -> {
-            val payment = uiState.payment
-            when (payment?.phase) {
-                PaymentPhase.AWAITING -> {
-                    actions += CustomAccessibilityAction("Pay ${payment?.amountRupees ?: ride.fareRupees} rupees") {
-                        onPay(); true
-                    }
-                    actions += CustomAccessibilityAction("Pay by UPI") { onPaymentMethod("UPI"); true }
-                    actions += CustomAccessibilityAction("Pay by card") { onPaymentMethod("CARD"); true }
-                    actions += CustomAccessibilityAction("Pay by net banking") {
-                        onPaymentMethod("NETBANKING"); true
-                    }
-                    actions += CustomAccessibilityAction("Decline payment") { onDeclinePayment(); true }
-                }
-                PaymentPhase.PAID ->
-                    actions += CustomAccessibilityAction("Hear receipt") { onPay(); true }
-                PaymentPhase.STARTING, PaymentPhase.PROCESSING -> Unit
-                PaymentPhase.FAILED ->
-                    actions += CustomAccessibilityAction("Try payment again") { onPay(); true }
-                null, PaymentPhase.ERROR ->
-                    actions += CustomAccessibilityAction("Pay ${ride.fareRupees} rupees") { onPay(); true }
-            }
-        }
-        is RiderState.Feedback -> {
-            if (ride.step == FeedbackStep.CONFIRM) {
-                actions += CustomAccessibilityAction("Send report") { onPostRideAction("send"); true }
-            } else if (ride.step == FeedbackStep.RATING_CHECK) {
-                actions += CustomAccessibilityAction("Rating is right") { onPostRideAction("rating-yes"); true }
-                actions += CustomAccessibilityAction("Rating is wrong") { onPostRideAction("rating-no"); true }
-            } else if (ride.step == FeedbackStep.RATING) {
-                actions += CustomAccessibilityAction("Report a problem") { onPostRideAction("report"); true }
-            }
-            actions += CustomAccessibilityAction("Skip feedback") { onPostRideAction("skip"); true }
-        }
-        is RiderState.NextJourney -> {
-            if (ride.step == NextStep.CHOOSE) {
-                actions += CustomAccessibilityAction("Book another ride now") { onPostRideAction("now"); true }
-                actions += CustomAccessibilityAction("Schedule a ride for later") { onPostRideAction("schedule"); true }
-            }
-            if (ride.step == NextStep.CONFIRM) {
-                actions += CustomAccessibilityAction("Schedule it") { onPostRideAction("confirm"); true }
-            }
-            actions += CustomAccessibilityAction("Done") { onPostRideAction("done"); true }
-        }
-        else -> Unit
-    }
-
-    actions += CustomAccessibilityAction("Emergency S O S") { onSos(); true }
-    return actions
 }

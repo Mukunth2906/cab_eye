@@ -18,6 +18,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 
+import com.razorpay.RazorpayException;
+
 /**
  * A sandbox payment gateway. No bank, no money, no credentials — but the same shape as a real
  * one, so the rest of the app is built against the real contract:
@@ -51,6 +53,7 @@ public class MockPaymentGateway {
     private final RideService rides;
     private final Clock clock;
     private final SecureRandom random = new SecureRandom();
+    private final RazorpayService razorpay;
 
     private final Map<String, PaymentOrder> orders = new ConcurrentHashMap<>();
     private final Map<String, String> latestOrderByRide = new ConcurrentHashMap<>();
@@ -90,15 +93,29 @@ public class MockPaymentGateway {
     }
 
     @Autowired
+    public MockPaymentGateway(RideService rides, RazorpayService razorpay) {
+        this(rides, Clock.systemUTC(), razorpay);
+    }
+
     public MockPaymentGateway(RideService rides) {
-        this(rides, Clock.systemUTC());
+        this(rides, Clock.systemUTC(), null);
     }
 
     /** Test seam: lets expiry be tested without sleeping for ten minutes. */
     public MockPaymentGateway(RideService rides, Clock clock) {
+        this(rides, clock, null);
+    }
+
+    public MockPaymentGateway(RideService rides, Clock clock, RazorpayService razorpay) {
         this.rides = rides;
         this.clock = clock;
+        this.razorpay = razorpay;
     }
+
+    /** True when real Razorpay keys are configured and the SDK initialised. */
+    public boolean isRazorpayEnabled() { return razorpay != null && razorpay.isEnabled(); }
+
+    public RazorpayService razorpay() { return razorpay; }
 
     /** Why a request was refused, in words the rider's app can speak. */
     public static final class PaymentException extends RuntimeException {
@@ -151,12 +168,29 @@ public class MockPaymentGateway {
         PaymentOrder order = new PaymentOrder(
                 "order_" + randomToken(14), rideId, ride.fareRupees(), PAYEE_VPA, PAYEE_NAME,
                 "Cab Eye ride to " + ride.destination(), now, now.plus(ORDER_TTL));
+
+        // When Razorpay is enabled, create a real order on Razorpay's side.
+        if (isRazorpayEnabled()) {
+            try {
+                org.json.JSONObject rzpOrder = razorpay.createOrder(
+                        order.amountRupees(), order.orderId(), order.note());
+                order.setRazorpayOrderId(rzpOrder.getString("id"));
+                log.info("PAYMENT_RAZORPAY_ORDER order={} rzp_order={}",
+                        order.orderId(), order.razorpayOrderId());
+            } catch (RazorpayException e) {
+                log.error("PAYMENT_RAZORPAY_ORDER_FAILED order={}: {}",
+                        order.orderId(), e.getMessage());
+                throw new PaymentException(PaymentException.Kind.CONFLICT,
+                        "Could not create payment. Please try again.");
+            }
+        }
+
         orders.put(order.orderId(), order);
         latestOrderByRide.put(rideId, order.orderId());
         save(order);
 
-        log.info("PAYMENT_ORDER_CREATED order={} ride={} amount=₹{}",
-                order.orderId(), rideId, order.amountRupees());
+        log.info("PAYMENT_ORDER_CREATED order={} ride={} amount=₹{} razorpay={}",
+                order.orderId(), rideId, order.amountRupees(), isRazorpayEnabled());
         return order;
     }
 
@@ -227,6 +261,63 @@ public class MockPaymentGateway {
         rides.failPayment(order.rideId(), order.failureReason());
         log.info("PAYMENT_FAILED order={} ride={} reason=\"{}\"",
                 orderId, order.rideId(), order.failureReason());
+        return order;
+    }
+
+    // ===================================================================================
+    //  Razorpay callback — verify signature and settle
+    // ===================================================================================
+
+    /**
+     * Called by the Razorpay checkout callback after the rider pays through the Razorpay
+     * modal. Verifies the signature, then marks the order PAID.
+     *
+     * @return the order, now PAID, or throws on bad signature / missing order
+     */
+    public PaymentOrder verifyAndPay(String orderId, String razorpayPaymentId,
+                                     String razorpayOrderId, String razorpaySignature) {
+        PaymentOrder order = require(orderId);
+
+        if (order.status() == PaymentOrder.Status.PAID) return order;
+
+        if (!isRazorpayEnabled()) {
+            throw new PaymentException(PaymentException.Kind.CONFLICT,
+                    "Razorpay is not enabled on this server.");
+        }
+
+        // Verify the signature: the ONLY way to trust that the payment is genuine.
+        if (!razorpay.verifySignature(razorpayOrderId, razorpayPaymentId, razorpaySignature)) {
+            log.warn("PAYMENT_RAZORPAY_SIGNATURE_INVALID order={} rzp_payment={}",
+                    orderId, razorpayPaymentId);
+            throw new PaymentException(PaymentException.Kind.CONFLICT,
+                    "Payment verification failed. Please try again.");
+        }
+
+        // Fetch payment details from Razorpay to get method, bank reference, etc.
+        String method = "UPI";
+        String bankRef = razorpayPaymentId; // fallback
+        org.json.JSONObject paymentDetails = razorpay.fetchPayment(razorpayPaymentId);
+        if (paymentDetails != null) {
+            method = paymentDetails.optString("method", "UPI").toUpperCase();
+            // Try acquirer_data.upi_transaction_id for UPI, else rrn, else payment ID
+            org.json.JSONObject acq = paymentDetails.optJSONObject("acquirer_data");
+            if (acq != null) {
+                String upiTxnId = acq.optString("upi_transaction_id", "");
+                String rrn = acq.optString("rrn", "");
+                bankRef = !upiTxnId.isEmpty() ? upiTxnId : !rrn.isEmpty() ? rrn : razorpayPaymentId;
+            }
+        }
+
+        if (!order.markPaid(normaliseMethod(method), razorpayPaymentId, bankRef, clock.instant())) {
+            if (order.status() == PaymentOrder.Status.PAID) return order;
+            throw new PaymentException(PaymentException.Kind.CONFLICT, conflictFor(order));
+        }
+
+        save(order);
+        rides.confirmPayment(order.rideId(), bankRef);
+        log.info("PAYMENT_RAZORPAY_PAID order={} ride={} amount=₹{} method={} rzp_payment={} ref={}",
+                orderId, order.rideId(), order.amountRupees(), method,
+                razorpayPaymentId, bankRef);
         return order;
     }
 
