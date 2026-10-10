@@ -165,6 +165,10 @@
     return when(t);
   };
   const tel = (p) => p ? h("a", { href: "tel:" + p }, p) : "—";
+  // "5.6 km · ₹124 · 14 min", or "about 5.2 km (straight line)" when the GPS measured nothing.
+  const km = (m, source) => m ? (source === "ESTIMATE" ? "about " : "") + (m / 1000).toFixed(1) + " km" + (source === "ESTIMATE" ? " (straight line)" : "") : "";
+  const trip = (o) => o && o.fareRupees ? [km(o.distanceMeters || o.tripDistanceMeters, o.distanceSource), "₹" + o.fareRupees, o.durationMinutes ? o.durationMinutes + " min" : ""].filter(Boolean).join(" · ") : "";
+  const caseLabel = (c) => c.kind === "SOS" ? "SOS" : c.kind === "DRIVER_REPORT" ? "Driver's report on rider" : c.kind === "STOP_OVERDUE" ? "Rider not back at a stop" : "Feedback";
   function announce(msg) { $("live").textContent = ""; setTimeout(() => $("live").textContent = msg, 50); }
 
   // ---------- API ----------
@@ -243,9 +247,9 @@
     if (fresh.length) {
       beep();
       const c = casesCache.find(x => x.id === fresh[0]);
-      announce("New urgent " + (c.kind === "SOS" ? "S O S" : c.kind === "STOP_OVERDUE" ? "alert: rider not back at a stop" : "feedback") + " on " + (c.rideId || "a ride"));
+      announce("New urgent " + (c.kind === "SOS" ? "S O S" : caseLabel(c).toLowerCase()) + " on " + (c.rideId || "a ride"));
       if ("Notification" in window && Notification.permission === "granted") {
-        new Notification("Cab Eye: urgent " + (c.kind === "SOS" ? "SOS" : "feedback"), { body: c.text || c.rideId || "" });
+        new Notification("Cab Eye: urgent " + caseLabel(c).toLowerCase(), { body: c.text || c.rideId || "" });
       }
     }
   }
@@ -297,13 +301,13 @@
         h("label", { for: "inboxFilter", class: "muted small" }, "Show"), sel,
         h("span", { class: "spacer" }), notifyBtn),
       list.length ? h("div", { class: "cases" }, list.map(caseCard))
-                  : h("p", { class: "empty" }, "Nothing here. Feedback and SOS alerts will appear as they arrive."));
+                  : h("p", { class: "empty" }, "Nothing here. Feedback, drivers' reports and SOS alerts will appear as they arrive."));
   }
 
   function caseCard(c) {
     const statusChip = c.status === "RESOLVED" ? h("span", { class: "chip ok" }, "Resolved")
       : c.status === "ACKNOWLEDGED" ? h("span", { class: "chip warn" }, "Acknowledged") : h("span", { class: "chip" }, "New");
-    const title = c.kind === "SOS" ? "SOS" : c.kind === "STOP_OVERDUE" ? "Rider not back at a stop" : "Feedback" + (c.category ? " · " + c.category.toLowerCase() : "");
+    const title = c.kind === "SOS" ? "SOS" : caseLabel(c) + (c.category ? " · " + c.category.toLowerCase() : "");
     const noteBox = h("textarea", { "aria-label": "Note for " + c.id, placeholder: "Add a note (what you did, who you called)…",
       onfocus: () => busy = true, onblur: () => busy = false });
     const setStatus = (s) => async () => { await api("cases/" + c.id + "/status", { method: "POST", body: { status: s } }); await refresh(); render(); };
@@ -320,6 +324,8 @@
         c.driverName ? [h("dt", {}, "Driver"), h("dd", {}, c.driverName + " · ", tel(c.driverPhone))] : null,
         c.vehiclePlate ? [h("dt", {}, "Vehicle"), h("dd", {}, c.vehiclePlate + (c.vehicle ? " · " + c.vehicle : ""))] : null,
         c.rideId ? [h("dt", {}, "Ride"), h("dd", {}, h("a", { href: "#", onclick: (e) => { e.preventDefault(); openRide(c.rideId); } }, c.rideId), c.destination ? " · to " + c.destination : "")] : null,
+        // What the trip measured — so "overcharged" or "long route" can be checked at a glance.
+        trip(c) ? [h("dt", {}, "Trip"), h("dd", {}, trip(c))] : null,
         c.alertResult ? [h("dt", {}, "Alert"), h("dd", { class: "small" }, c.alertResult)] : null),
       c.notes && c.notes.length ? h("ul", { class: "notes" }, c.notes.map(n => h("li", {}, h("span", { class: "muted" }, when(n.at) + " · " + (n.by || "") + ": "), n.text))) : null,
       h("div", { class: "actions" },
@@ -346,7 +352,7 @@
     return h("div", {},
       h("div", { class: "toolbar" }, h("h2", { style: "margin:0;font-size:18px" }, "Rides"), h("span", { class: "muted small" }, "Newest first. Choose a ride to see everything that happened.")),
       h("div", { class: "table-wrap" }, h("table", {},
-        h("thead", {}, h("tr", {}, ["Ride", "Booked", "Status", "To", "Driver", "Plate", "Code checked", "Fare", "Payment"].map(t => h("th", { scope: "col" }, t)))),
+        h("thead", {}, h("tr", {}, ["Ride", "Booked", "Status", "To", "Driver", "Plate", "Code checked", "Distance", "Fare", "Payment"].map(t => h("th", { scope: "col" }, t)))),
         h("tbody", {}, rides.map(r => h("tr", { class: "clickable", tabindex: "0",
           onclick: () => openRide(r.rideId), onkeydown: (e) => { if (e.key === "Enter") openRide(r.rideId); } },
           h("td", {}, h("a", { href: "#", onclick: (e) => e.preventDefault() }, r.rideId)),
@@ -356,13 +362,14 @@
           h("td", {}, r.driverName || "—"),
           h("td", {}, r.vehiclePlate || "—"),
           h("td", {}, r.codeConfirmed ? h("span", { class: "chip ok" }, "Yes") : (r.driverId ? h("span", { class: "chip urgent" }, "No") : "—")),
-          h("td", {}, r.fareRupees ? "₹" + r.fareRupees : "—"),
+          h("td", {}, km(r.tripDistanceMeters, r.distanceSource) || "—"),
+          h("td", {}, r.fareRupees ? "₹" + r.fareRupees : (r.liveFareRupees ? "₹" + r.liveFareRupees + " so far" : "—")),
           h("td", {}, r.paymentStatus || "—")))))));
   }
   async function rideView(id) {
     const d = await api("rides/" + encodeURIComponent(id));
     const r = d.ride;
-    const quiet = new Set(["DRIVER_LOCATION", "BEACON"]);
+    const quiet = new Set(["DRIVER_LOCATION", "BEACON", "TRIP_PROGRESS"]);
     const events = d.events.filter(e => !quiet.has(e.type));
     const hidden = d.events.length - events.length;
     return h("div", {},
@@ -375,9 +382,11 @@
         h("dt", {}, "Driver"), h("dd", {}, (r.driverName || "—") + " · ", tel(r.driverPhone)),
         h("dt", {}, "Vehicle"), h("dd", {}, (r.vehiclePlate || "—") + (r.vehicleModel ? " · " + r.vehicleModel : "")),
         h("dt", {}, "Boarding code"), h("dd", {}, (r.boardingCode || "—") + " · ", r.codeConfirmed ? h("span", { class: "chip ok" }, "confirmed by the rider's phone") : h("span", { class: "chip urgent" }, "NOT confirmed")),
-        h("dt", {}, "Fare"), h("dd", {}, r.fareRupees ? "₹" + r.fareRupees + " · " + r.durationMinutes + " min · payment " + r.paymentStatus : "—")),
+        h("dt", {}, "Fare"), h("dd", {}, r.fareRupees ? "₹" + r.fareRupees + " · " + r.durationMinutes + " min · payment " + r.paymentStatus
+          : r.liveFareRupees ? "₹" + r.liveFareRupees + " so far (trip in progress)" : "—"),
+        h("dt", {}, "Distance"), h("dd", {}, km(r.tripDistanceMeters, r.distanceSource) || "—")),
       h("h3", { style: "margin-top:18px" }, "What happened"),
-      hidden ? h("p", { class: "muted small" }, hidden + " location updates not shown.") : null,
+      hidden ? h("p", { class: "muted small" }, hidden + " location and trip-meter updates not shown.") : null,
       h("ol", { class: "timeline" }, events.map(e => h("li", {},
         h("span", { class: "muted small" }, e.ts ? new Date(e.ts).toLocaleTimeString() : "#" + e.seq),
         h("div", {}, h("b", {}, e.type.replace(/_/g, " ").toLowerCase()), " ",
@@ -422,10 +431,12 @@
     return h("div", {},
       h("div", { class: "toolbar" }, h("h2", { style: "margin:0;font-size:18px" }, "Riders")),
       h("div", { class: "table-wrap" }, h("table", {},
-        h("thead", {}, h("tr", {}, ["Name", "Phone", "Emergency contact", "Joined", "Last sign-in"].map(t => h("th", { scope: "col" }, t)))),
+        h("thead", {}, h("tr", {}, ["Name", "Phone", "Emergency contact", "Rating from drivers", "Drivers' reports", "Joined", "Last sign-in"].map(t => h("th", { scope: "col" }, t)))),
         h("tbody", {}, list.map(r => h("tr", {},
           h("td", {}, r.name || "—"), h("td", {}, tel(r.phone)),
           h("td", {}, r.emergencyContactPhone ? [(r.emergencyContactName || "") + " · ", tel(r.emergencyContactPhone)] : h("span", { class: "chip warn" }, "Not set")),
+          h("td", {}, r.ratingCount ? r.ratingAverage + " (" + r.ratingCount + ")" : "—"),
+          h("td", {}, r.driverReports ? h("span", { class: "chip warn" }, r.driverReports) : "0"),
           h("td", {}, when(r.createdAt)), h("td", {}, when(r.lastLoginAt))))))));
   }
 

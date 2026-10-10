@@ -21,5 +21,14 @@ public class FeedbackRecord {
     public boolean urgent;
     public long createdAt;
 
+    // The trip the feedback is about, copied from the ride so a complaint like "overcharged"
+    // or "took a long route" can be checked against what was actually measured.
+    /** Metres the trip covered, or null for feedback saved before this existed. */
+    public Integer distanceMeters;
+    /** "GPS" (measured) or "ESTIMATE" (straight line); null if unknown. */
+    public String distanceSource;
+    public Integer fareRupees;
+    public Integer durationMinutes;
+
     public FeedbackRecord() {}
 }

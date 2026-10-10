@@ -41,6 +41,9 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -48,6 +51,7 @@ import com.cabeye.rider.net.StopInfo
 import com.cabeye.rider.ui.QrCode
 import com.cabeye.rider.ui.theme.LocalPalette
 import com.cabeye.rider.ui.theme.MinTouchTarget
+import java.util.Locale
 
 /**
  * The driver's surface: seven screens, none of which make a sound.
@@ -92,6 +96,8 @@ fun DriverSurface(
     onStopCamera: () -> Unit = {},
     onStopArrived: () -> Unit = {},
     onStopDone: () -> Unit = {},
+    /** The driver's feedback about the passenger: (rating 1–5 or null, category or null, note). */
+    onRateRider: (Int?, String?, String) -> Unit = { _, _, _ -> },
     modifier: Modifier = Modifier
 ) {
     val palette = LocalPalette.current
@@ -127,7 +133,7 @@ fun DriverSurface(
                 )
                 is DriverState.Seated -> SeatedScreen(onStartTrip)
                 is DriverState.InTrip -> InTripScreen(state, onComplete, onMessage, onStopArrived, onStopDone)
-                is DriverState.Complete -> CompleteScreen(state, onFinish)
+                is DriverState.Complete -> CompleteScreen(state, onFinish, onRateRider)
             }
 
             if (uiState.banner.isNotBlank()) {
@@ -663,6 +669,21 @@ private fun InTripScreen(
     Spacer(Modifier.height(8.dp))
     Text("${state.etaMinutes} min", style = MaterialTheme.typography.bodyLarge, color = palette.muted)
 
+    // The trip meter: the server measures the distance from this phone's GPS and prices it.
+    Spacer(Modifier.height(12.dp))
+    Text(
+        when {
+            state.distanceMeters > 0 ->
+                kmText(state.distanceMeters) +
+                    (if (state.fareSoFarRupees > 0) "  ·  ₹${state.fareSoFarRupees} so far" else "")
+            state.gpsLive -> "Measuring distance…"
+            else -> "Waiting for GPS… If location is off, the fare uses a straight-line estimate."
+        },
+        style = MaterialTheme.typography.titleLarge,
+        color = palette.onBackground,
+        textAlign = TextAlign.Center
+    )
+
     if (state.destinationAddress.isNotBlank()) {
         Spacer(Modifier.height(8.dp))
         Text(
@@ -916,7 +937,11 @@ private fun dialContact(context: Context, phone: String) {
 private const val MAX_MESSAGE_CHARS = 120
 
 @Composable
-private fun CompleteScreen(state: DriverState.Complete, onFinish: () -> Unit) {
+private fun CompleteScreen(
+    state: DriverState.Complete,
+    onFinish: () -> Unit,
+    onRateRider: (Int?, String?, String) -> Unit
+) {
     val palette = LocalPalette.current
 
     Spacer(Modifier.height(60.dp))
@@ -927,6 +952,16 @@ private fun CompleteScreen(state: DriverState.Complete, onFinish: () -> Unit) {
         style = MaterialTheme.typography.bodyLarge,
         color = palette.muted
     )
+    if (state.distanceMeters > 0) {
+        Spacer(Modifier.height(4.dp))
+        Text(
+            if (state.distanceSource == "ESTIMATE") "About ${kmText(state.distanceMeters)} (straight-line estimate — no GPS)"
+            else kmText(state.distanceMeters),
+            style = MaterialTheme.typography.bodyLarge,
+            color = palette.muted,
+            textAlign = TextAlign.Center
+        )
+    }
     Spacer(Modifier.height(24.dp))
 
     // Live payment line. Words carry the meaning, colour only reinforces it.
@@ -972,8 +1007,128 @@ private fun CompleteScreen(state: DriverState.Complete, onFinish: () -> Unit) {
             color = palette.muted
         )
     }
+    RateRiderPanel(state.rideId, state.riderFeedbackSent, onRateRider)
+
     Spacer(Modifier.height(32.dp))
     DriverButton("BACK ONLINE", palette.listening, onClick = onFinish)
+}
+
+/** "5.6 km" — one decimal, a dot as the separator whatever the phone's language. */
+private fun kmText(metres: Int): String = "%.1f km".format(Locale.ROOT, metres / 1000.0)
+
+/** What a driver can report about a passenger: (button label, category the server files it under). */
+private val RIDER_REPORT_REASONS = listOf(
+    "Rude or abusive" to "BEHAVIOUR",
+    "Felt unsafe" to "SAFETY",
+    "Not at the pickup point" to "PICKUP",
+    "Payment problem" to "PAYMENT",
+    "Something else" to "OTHER"
+)
+
+/**
+ * The driver rates the passenger, after the trip. Entirely optional — "BACK ONLINE" works
+ * without it. Only Cab Eye support sees it; nothing here ever changes what the rider hears.
+ *
+ * Choices are kept on screen until sent; they reset for the next ride because the panel is
+ * keyed on the ride id.
+ */
+@Composable
+private fun RateRiderPanel(rideId: String, sent: Boolean, onRateRider: (Int?, String?, String) -> Unit) {
+    val palette = LocalPalette.current
+    var stars by remember(rideId) { mutableStateOf<Int?>(null) }
+    var reason by remember(rideId) { mutableStateOf<String?>(null) }
+    var note by remember(rideId) { mutableStateOf("") }
+
+    Spacer(Modifier.height(28.dp))
+    Text("Rate your passenger", style = MaterialTheme.typography.titleLarge, color = palette.onBackground)
+    if (sent) {
+        Spacer(Modifier.height(8.dp))
+        Text(
+            "✓ Feedback sent. Thank you.",
+            style = MaterialTheme.typography.bodyLarge,
+            color = palette.confirm,
+            textAlign = TextAlign.Center
+        )
+        return
+    }
+    Spacer(Modifier.height(4.dp))
+    Text(
+        "Optional. Only Cab Eye support sees this.",
+        style = MaterialTheme.typography.bodyMedium,
+        color = palette.muted,
+        textAlign = TextAlign.Center
+    )
+    Spacer(Modifier.height(12.dp))
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+        for (n in 1..5) {
+            ChoiceButton(
+                label = "$n",
+                spoken = "$n out of 5",
+                selected = stars == n,
+                modifier = Modifier.weight(1f)
+            ) { stars = n }
+        }
+    }
+    Spacer(Modifier.height(12.dp))
+    Text("Anything to report?", style = MaterialTheme.typography.bodyLarge, color = palette.clarify)
+    Spacer(Modifier.height(8.dp))
+    for ((label, category) in RIDER_REPORT_REASONS) {
+        ChoiceButton(
+            label = label,
+            spoken = label,
+            selected = reason == category,
+            modifier = Modifier.fillMaxWidth()
+        ) { reason = if (reason == category) null else category }
+        Spacer(Modifier.height(6.dp))
+    }
+    OutlinedTextField(
+        value = note,
+        onValueChange = { if (it.length <= MAX_RIDER_NOTE_CHARS) note = it },
+        placeholder = { Text("Note for support (optional)") },
+        singleLine = false,
+        maxLines = 3,
+        colors = OutlinedTextFieldDefaults.colors(
+            focusedTextColor = palette.onBackground,
+            unfocusedTextColor = palette.onBackground,
+            focusedBorderColor = palette.clarify,
+            unfocusedBorderColor = palette.outline
+        ),
+        modifier = Modifier.fillMaxWidth()
+    )
+    Spacer(Modifier.height(8.dp))
+    DriverButton("SEND FEEDBACK", palette.clarify) { onRateRider(stars, reason, note) }
+}
+
+/** Longest note a driver can attach; the server keeps at most 500 characters. */
+private const val MAX_RIDER_NOTE_CHARS = 300
+
+/** A selectable button: filled when chosen. The words carry the meaning; colour only reinforces it. */
+@Composable
+private fun ChoiceButton(
+    label: String,
+    spoken: String,
+    selected: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit
+) {
+    val palette = LocalPalette.current
+    Button(
+        onClick = onClick,
+        shape = RoundedCornerShape(16.dp),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = if (selected) palette.clarify else palette.background,
+            contentColor = if (selected) palette.background else palette.clarify
+        ),
+        modifier = modifier
+            .defaultMinSize(minHeight = MinTouchTarget)
+            .border(2.dp, palette.clarify, RoundedCornerShape(16.dp))
+            .semantics {
+                contentDescription = spoken
+                this.selected = selected
+            }
+    ) {
+        Text(label, style = MaterialTheme.typography.titleMedium, textAlign = TextAlign.Center)
+    }
 }
 
 // =====================================================================================

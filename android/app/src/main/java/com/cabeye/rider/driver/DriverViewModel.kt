@@ -68,6 +68,8 @@ class DriverViewModel(application: Application) : AndroidViewModel(application) 
     private var pollJob: Job? = null
     private var paymentJob: Job? = null
     private var bannerJob: Job? = null
+    /** Sends GPS fixes to the server for the whole trip. Null when no trip is running. */
+    private var tripMeterJob: Job? = null
 
     /** The ride this driver is currently on. */
     private var rideId: String? = null
@@ -89,6 +91,12 @@ class DriverViewModel(application: Application) : AndroidViewModel(application) 
     private companion object {
         const val TAG = "CabEye.Driver"
         const val PAYMENT_POLL_MS = 3_000L
+
+        /**
+         * How often the trip meter asks for a GPS fix. The server only publishes progress every
+         * 100 m, so a fix every few seconds is plenty for an auto or a cab in city traffic.
+         */
+        const val TRIP_FIX_INTERVAL_MS = 4_000L
 
         /**
          * How often to poll for open requests while online.
@@ -486,6 +494,7 @@ class DriverViewModel(application: Application) : AndroidViewModel(application) 
                         ),
                         banner = ""
                     )
+                    startTripMeter(id)
                 }
                 is ApiResult.Failed ->
                     // The 409 path. Says what has to happen rather than just refusing, because
@@ -504,11 +513,15 @@ class DriverViewModel(application: Application) : AndroidViewModel(application) 
         Telemetry.logDriverAction("COMPLETE", id)
 
         viewModelScope.launch {
-            when (val result = api.complete(id, fareRupees = 148, durationMinutes = 12)) {
+            // The server prices the trip from what it measured; this phone sends no fare.
+            when (val result = api.complete(id)) {
                 is ApiResult.Ok -> {
+                    stopTripMeter()
                     uiState = uiState.copy(
                         state = DriverState.Complete(
-                            id, result.value.fareRupees, result.value.durationMinutes
+                            id, result.value.fareRupees, result.value.durationMinutes,
+                            distanceMeters = result.value.tripDistanceMeters,
+                            distanceSource = result.value.distanceSource
                         ),
                         banner = ""
                     )
@@ -555,6 +568,79 @@ class DriverViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch {
             val result = api.snapshot(id)
             if (result is ApiResult.Ok) applyStops(result.value.stops)
+        }
+    }
+
+    // =================================================================================
+    //  Trip meter — real km and a live fare
+    // =================================================================================
+
+    /**
+     * Streams this phone's GPS to the server for the whole trip. The server adds up the
+     * distance and prices the trip; this screen only shows what the server answers.
+     *
+     * No location permission means no fixes: the trip still completes and the server uses a
+     * straight-line estimate, which the Complete screen labels as such.
+     */
+    private fun startTripMeter(id: String) {
+        tripMeterJob?.cancel()
+        tripMeterJob = viewModelScope.launch {
+            app.locationProvider.updates(TRIP_FIX_INTERVAL_MS).collect { fix ->
+                val result = api.tripLocation(id, fix.latitude, fix.longitude, fix.time)
+                if (result is ApiResult.Ok) {
+                    applyTripProgress(id, result.value.tripDistanceMeters, result.value.liveFareRupees, gps = true)
+                }
+            }
+        }
+    }
+
+    private fun stopTripMeter() {
+        tripMeterJob?.cancel()
+        tripMeterJob = null
+    }
+
+    /** Updates the In-trip screen's km and fare. Ignores news about any other ride. */
+    private fun applyTripProgress(id: String, metres: Int, fareRupees: Int, gps: Boolean) {
+        val current = uiState.state as? DriverState.InTrip ?: return
+        if (current.rideId != id) return
+        uiState = uiState.copy(
+            state = current.copy(
+                distanceMeters = maxOf(current.distanceMeters, metres),
+                fareSoFarRupees = if (fareRupees > 0) fareRupees else current.fareSoFarRupees,
+                gpsLive = current.gpsLive || gps
+            )
+        )
+    }
+
+    // =================================================================================
+    //  Rate the passenger
+    // =================================================================================
+
+    /**
+     * The driver's feedback about the passenger, from the Complete screen. All optional, but
+     * at least one must be given.
+     *
+     * @param category SAFETY, BEHAVIOUR, PICKUP, PAYMENT or OTHER, or null
+     */
+    fun sendRiderFeedback(rating: Int?, category: String?, note: String) {
+        val current = uiState.state as? DriverState.Complete ?: return
+        if (current.riderFeedbackSent) return
+        if (rating == null && category == null && note.isBlank()) {
+            showBanner("Choose a rating or a reason first.")
+            return
+        }
+        Telemetry.logDriverAction("RATE_RIDER", current.rideId, "rating=$rating category=$category")
+        viewModelScope.launch {
+            when (val result = api.submitRiderFeedback(current.rideId, rating, category, note.trim().ifBlank { null })) {
+                is ApiResult.Ok -> {
+                    val now = uiState.state as? DriverState.Complete
+                    if (now != null && now.rideId == current.rideId) {
+                        uiState = uiState.copy(state = now.copy(riderFeedbackSent = true))
+                    }
+                    showBanner("Thanks — your feedback was sent.")
+                }
+                is ApiResult.Failed -> showBanner(result.spoken)
+            }
         }
     }
 
@@ -612,6 +698,7 @@ class DriverViewModel(application: Application) : AndroidViewModel(application) 
     /** Back to waiting, ready for the next request. */
     fun finishAndGoOnline() {
         endCamera()
+        stopTripMeter()
         paymentJob?.cancel()
         socket.unsubscribe("ride finished")
         rideId = null
@@ -713,6 +800,11 @@ class DriverViewModel(application: Application) : AndroidViewModel(application) 
                 }
             }
 
+            // The server's trip meter moved. Normally the trip-location answers already carry
+            // this; the event keeps the screen right if one of those answers was lost.
+            RideEventType.TRIP_PROGRESS ->
+                applyTripProgress(event.rideId, event.int("distanceMeters", 0), event.int("fareRupees", 0), gps = true)
+
             // The fare's payment moved on the server — paid, failed, or reported by the rider.
             RideEventType.PAYMENT_UPDATED ->
                 applyPayment(event.rideId, event.string("status"), event.string("paymentRef"))
@@ -777,6 +869,7 @@ class DriverViewModel(application: Application) : AndroidViewModel(application) 
     override fun onCleared() {
         pollJob?.cancel()
         paymentJob?.cancel()
+        tripMeterJob?.cancel()
         bannerJob?.cancel()
         super.onCleared()
     }
