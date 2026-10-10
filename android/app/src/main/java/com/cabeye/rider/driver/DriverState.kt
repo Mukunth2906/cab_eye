@@ -129,7 +129,13 @@ sealed interface DriverState {
         val contactPhone: String = "",
         val dropNote: String = "",
         /** Multi-stop: every stop with its status, as the server last reported it. */
-        val stops: List<com.cabeye.rider.net.StopInfo> = emptyList()
+        val stops: List<com.cabeye.rider.net.StopInfo> = emptyList(),
+        /** Metres the server has measured so far from this phone's GPS. */
+        val distanceMeters: Int = 0,
+        /** What the trip would cost if it ended now, from the server. 0 before the first 100 m. */
+        val fareSoFarRupees: Int = 0,
+        /** True once a GPS fix has reached the server; false = no GPS yet (or no permission). */
+        val gpsLive: Boolean = false
     ) : DriverState {
         /** Where the car goes next: the first open stop, or null for the destination. */
         val currentStop: com.cabeye.rider.net.StopInfo? get() = stops.firstOrNull { it.isOpen }
@@ -148,7 +154,13 @@ sealed interface DriverState {
          * Sandbox checkout URL for the open payment order, shown as a QR code so a sighted
          * companion can scan it and pay from their own phone. Blank until the order exists.
          */
-        val checkoutUrl: String = ""
+        val checkoutUrl: String = "",
+        /** Metres the trip covered, as the server measured (or estimated) it. */
+        val distanceMeters: Int = 0,
+        /** "GPS" or "ESTIMATE" (straight line — no GPS reached the server); "" = unknown. */
+        val distanceSource: String = "",
+        /** True once the driver's feedback about the passenger has been saved. */
+        val riderFeedbackSent: Boolean = false
     ) : DriverState
 }
 

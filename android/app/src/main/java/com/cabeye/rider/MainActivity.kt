@@ -68,6 +68,24 @@ class MainActivity : FragmentActivity() {
     }
 
     /**
+     * Location for the DRIVER's trip meter: the server measures the trip's km from the driver
+     * phone's GPS and prices it. Kept apart from [permissionLauncher] so asking a driver never
+     * touches the rider's microphone state. A "no" is fine — the trip still completes and the
+     * server falls back to a straight-line estimate.
+     */
+    private val driverLocationLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { }
+
+    private fun requestDriverLocationIfNeeded() {
+        if (!hasLocationPermission()) {
+            driverLocationLauncher.launch(
+                arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
+            )
+        }
+    }
+
+    /**
      * READ_CONTACTS, asked only at the moment the rider has already agreed to name someone.
      *
      * Kept apart from [permissionLauncher] on purpose. That one runs at launch for the
@@ -193,6 +211,7 @@ class MainActivity : FragmentActivity() {
                             )
                         } else {
                         val driverVm: DriverViewModel = viewModel()
+                        LaunchedEffect(Unit) { requestDriverLocationIfNeeded() }
                         DriverSurface(
                             uiState = driverVm.uiState,
                             onGoOnline = driverVm::goOnline,
@@ -216,7 +235,8 @@ class MainActivity : FragmentActivity() {
                             onRequestCamera = driverVm::requestCamera,
                             onStopCamera = driverVm::stopCamera,
                             onStopArrived = driverVm::arrivedAtStop,
-                            onStopDone = driverVm::finishStop
+                            onStopDone = driverVm::finishStop,
+                            onRateRider = driverVm::sendRiderFeedback
                         )
                         }
                     }

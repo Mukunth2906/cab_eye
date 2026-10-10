@@ -1,5 +1,7 @@
 package com.cabeye.backend.service;
 
+import com.cabeye.backend.fare.FareCalculator;
+import com.cabeye.backend.fare.TripDistanceTracker;
 import com.cabeye.backend.model.Ride;
 import com.cabeye.backend.model.RideEvent;
 import com.cabeye.backend.model.RideEventType;
@@ -8,6 +10,7 @@ import com.cabeye.backend.model.RideStop;
 import com.cabeye.backend.websocket.RideSessionManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.security.SecureRandom;
@@ -76,6 +79,24 @@ public class RideService {
         this.redisBridge = redisBridge;
         this.rideTable = data != null ? data.table("rides", com.cabeye.backend.model.RideRecord.class) : null;
     }
+
+    /**
+     * Prices trips from what they measured. Set by Spring from the configured rates (see
+     * {@code FareConfig}); a RideService built by hand in a test keeps the defaults, so the
+     * constructor above stays the one the tests already use.
+     */
+    private volatile FareCalculator fares = new FareCalculator();
+
+    @Autowired(required = false)
+    public void setFareCalculator(FareCalculator fares) {
+        if (fares != null) this.fares = fares;
+    }
+
+    /** A TRIP_PROGRESS is published each time the measured distance grows by this much. */
+    static final int PROGRESS_STEP_METERS = 100;
+
+    /** How far a phone's GPS time may be from the server's clock before it is ignored. */
+    static final long MAX_FIX_CLOCK_SKEW_MS = 10 * 60_000L;
 
     public void onCompleted(Consumer<Ride> listener) {
         completionListeners.add(listener);
@@ -452,6 +473,7 @@ public class RideService {
         }
         ride.phase(RidePhase.IN_TRIP);
         ride.etaMinutes(etaMinutes);
+        ride.startTripMeter(System.currentTimeMillis());
         publish(ride, RideEventType.TRIP_STARTED, driverId, "DRIVER", Map.of(
                 "destination", ride.destination(),
                 "etaMinutes", etaMinutes
@@ -459,7 +481,106 @@ public class RideService {
         return Optional.of(ride);
     }
 
-    /** Ends the journey. */
+    /**
+     * One GPS fix from the driver's phone during the trip.
+     *
+     * <p>Only counted while IN_TRIP: fixes from the approach are not part of the journey the
+     * rider pays for. Like {@link #location} it does not change the phase. Every
+     * {@value #PROGRESS_STEP_METERS} m it publishes TRIP_PROGRESS with the distance so far and
+     * the fare that would be charged now, which is also when the ride (and its meter) is saved.
+     *
+     * @return empty when there is no such ride or it is not in a trip
+     */
+    public Optional<Ride> tripLocation(String rideId, String driverId, double lat, double lng) {
+        return tripLocation(rideId, driverId, lat, lng, null);
+    }
+
+    /**
+     * @param fixAtMillis when the phone took the fix (its GPS time), or null for "now". Phones
+     *                    can send several fixes at once after losing signal; timing them by
+     *                    arrival would make real movement look like a teleport and drop it. A
+     *                    time more than {@value #MAX_FIX_CLOCK_SKEW_MS} ms from the server's
+     *                    clock is not trusted and "now" is used instead.
+     */
+    public Optional<Ride> tripLocation(String rideId, String driverId, double lat, double lng, Long fixAtMillis) {
+        Ride ride = rides.get(rideId);
+        if (ride == null || ride.phase() != RidePhase.IN_TRIP) {
+            return Optional.empty();
+        }
+        long now = System.currentTimeMillis();
+        long at = fixAtMillis != null && Math.abs(fixAtMillis - now) <= MAX_FIX_CLOCK_SKEW_MS ? fixAtMillis : now;
+        ride.addTripFix(lat, lng, at);
+        int metres = ride.gpsMeters();
+        if (metres - ride.lastProgressMeters() >= PROGRESS_STEP_METERS) {
+            int minutes = minutesSince(ride.tripStartedAt(), now);
+            int fare = fares.fareRupees(ride.rideType(), metres, minutes);
+            ride.liveFare(fare, metres);
+            publish(ride, RideEventType.TRIP_PROGRESS, driverId, "DRIVER", Map.of(
+                    "distanceMeters", metres,
+                    "fareRupees", fare,
+                    "minutes", minutes
+            ));
+        }
+        return Optional.of(ride);
+    }
+
+    /**
+     * Ends the journey and prices it on the server from what the trip measured.
+     *
+     * <p>This is what the {@code /complete} endpoint calls. The driver's phone no longer names
+     * the fare — a fare the client sends could be anything, so it is ignored.
+     *
+     * <ul>
+     *   <li><b>Distance</b>: the GPS meter when it measured anything ("GPS"); otherwise the
+     *       straight line from pickup to destination when both are known ("ESTIMATE" — a lower
+     *       bound, since roads are never shorter than a straight line); otherwise 0.</li>
+     *   <li><b>Minutes</b>: from trip start to now, rounded up, at least 1; 0 if the trip was
+     *       never started.</li>
+     * </ul>
+     */
+    public Optional<Ride> completeTrip(String rideId, String driverId) {
+        Ride ride = rides.get(rideId);
+        if (ride == null || ride.phase().isTerminal()) {
+            return Optional.empty();
+        }
+        long now = System.currentTimeMillis();
+        int minutes = minutesSince(ride.tripStartedAt(), now);
+        int metres = ride.gpsMeters();
+        String source = "GPS";
+        if (metres <= 0) {
+            metres = straightLineMeters(ride);
+            source = metres > 0 ? "ESTIMATE" : "";
+        }
+        ride.tripDistance(metres, source);
+        int fare = fares.fareRupees(ride.rideType(), metres, minutes);
+        log.info("FARE ride={} type={} distance={}m ({}) minutes={} fare=Rs{}",
+                rideId, ride.rideType(), metres, source.isEmpty() ? "none" : source, minutes, fare);
+        return complete(rideId, driverId, fare, minutes);
+    }
+
+    /** Whole minutes from {@code startMillis} to {@code now}, rounded up; 0 when never started. */
+    static int minutesSince(Long startMillis, long now) {
+        if (startMillis == null || startMillis <= 0) return 0;
+        long ms = Math.max(0, now - startMillis);
+        return (int) Math.max(1, (ms + 59_999) / 60_000);
+    }
+
+    private static int straightLineMeters(Ride ride) {
+        if (ride.pickupLatitude() == null || ride.pickupLongitude() == null
+                || ride.destinationLatitude() == null || ride.destinationLongitude() == null) {
+            return 0;
+        }
+        return (int) Math.round(TripDistanceTracker.haversineMeters(
+                ride.pickupLatitude(), ride.pickupLongitude(),
+                ride.destinationLatitude(), ride.destinationLongitude()));
+    }
+
+    /**
+     * Ends the journey with the given fare and duration.
+     *
+     * <p>Kept for callers and tests that set the numbers themselves; the app's {@code /complete}
+     * goes through {@link #completeTrip}, which measures them.
+     */
     public Optional<Ride> complete(String rideId, String driverId, int fareRupees, int durationMinutes) {
         Ride ride = getRide(rideId);
         if (ride == null || ride.phase().isTerminal()) {
@@ -477,7 +598,9 @@ public class RideService {
         publish(ride, RideEventType.TRIP_COMPLETED, driverId, "DRIVER", Map.of(
                 "destination", ride.destination(),
                 "fareRupees", fareRupees,
-                "durationMinutes", durationMinutes
+                "durationMinutes", durationMinutes,
+                "distanceMeters", ride.tripDistanceMeters(),
+                "distanceSource", ride.distanceSource()
         ));
         for (Consumer<Ride> listener : completionListeners) {
             // A memory or stats failure must never undo a finished ride.

@@ -161,14 +161,29 @@ public class AlertService {
     String subjectFor(AdminCase c) {
         String what = c.kind == AdminCase.Kind.SOS ? "SOS"
                 : c.kind == AdminCase.Kind.STOP_OVERDUE ? "Rider not back at a stop"
-                : "Feedback" + (c.category == null ? "" : " (" + c.category + ")");
+                : (c.kind == AdminCase.Kind.DRIVER_REPORT ? "Driver's report on rider" : "Feedback")
+                + (c.category == null ? "" : " (" + c.category + ")");
         return (c.urgent ? "URGENT · " : "") + what + " · " + (c.rideId == null ? "no ride" : c.rideId);
     }
 
     String bodyFor(AdminCase c) {
         StringBuilder b = new StringBuilder();
         if (c.rating != null) b.append("Rating: ").append(c.rating).append("/5\n");
-        if (c.text != null) b.append("Rider said: \"").append(c.text).append("\"\n");
+        if (c.text != null) {
+            b.append(c.kind == AdminCase.Kind.DRIVER_REPORT ? "Driver said: \"" : "Rider said: \"")
+                    .append(c.text).append("\"\n");
+        }
+        if (c.fareRupees != null && c.fareRupees > 0) {
+            b.append("Trip: ");
+            if (c.distanceMeters != null && c.distanceMeters > 0) {
+                b.append(String.format(java.util.Locale.ROOT, "%.1f km", c.distanceMeters / 1000.0));
+                if ("ESTIMATE".equals(c.distanceSource)) b.append(" (estimate)");
+                b.append(" · ");
+            }
+            b.append("Rs ").append(c.fareRupees);
+            if (c.durationMinutes != null && c.durationMinutes > 0) b.append(" · ").append(c.durationMinutes).append(" min");
+            b.append('\n');
+        }
         if (c.latitude != null && c.longitude != null) {
             b.append("Location: https://maps.google.com/?q=").append(c.latitude).append(',').append(c.longitude).append('\n');
         }

@@ -7,7 +7,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * One item in the admin inbox: a rider's feedback today, an SOS next.
+ * One item in the admin inbox: a rider's feedback, a driver's report about a rider, or an SOS.
  *
  * <p>It copies the who/what at the time it was opened (rider name and phone, driver, plate) so
  * the admin can act on it — call the rider, find the car — even if a profile changes later.
@@ -16,11 +16,13 @@ import java.util.List;
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class AdminCase {
 
-    public enum Kind {
-        FEEDBACK, SOS,
-        /** Multi-stop: the rider did not come back to the car within the WAIT stop's limit. */
-        STOP_OVERDUE
-    }
+    /**
+     * FEEDBACK: a rider about their trip. DRIVER_REPORT: a driver about their passenger (only
+     * low ratings, safety words or written notes become cases). SOS: an emergency.
+     * STOP_OVERDUE: multi-stop — the rider did not come back to the car within the WAIT
+     * stop's limit.
+     */
+    public enum Kind { FEEDBACK, SOS, DRIVER_REPORT, STOP_OVERDUE }
 
     public enum Status { NEW, ACKNOWLEDGED, RESOLVED }
 
@@ -47,6 +49,13 @@ public class AdminCase {
     public String category;
     /** The rider's own words, exactly as they confirmed them. */
     public String text;
+
+    /** What the trip measured, from the ride: lets a fare or route complaint be checked. */
+    public Integer distanceMeters;
+    /** "GPS" or "ESTIMATE"; null when unknown. */
+    public String distanceSource;
+    public Integer fareRupees;
+    public Integer durationMinutes;
 
     /** SOS only (next step). */
     public Double latitude;

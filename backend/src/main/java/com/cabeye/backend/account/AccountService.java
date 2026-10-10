@@ -125,6 +125,18 @@ public class AccountService {
         });
     }
 
+    /** Adds a driver's rating of this rider (once per ride — the caller makes sure of that). */
+    public void recordRiderRating(String riderId, int rating) {
+        if (rating < 1 || rating > 5) return;
+        accounts.update(riderId, a -> {
+            if (a.rider == null) return a;
+            double total = a.rider.ratingAverage * a.rider.ratingCount + rating;
+            a.rider.ratingCount++;
+            a.rider.ratingAverage = Math.round(total / a.rider.ratingCount * 10.0) / 10.0;
+            return a;
+        });
+    }
+
     /** Every account with this role, newest first. For the admin console. */
     public List<Account> all(Role role) {
         List<Account> out = accounts.where(a -> a.role == role);

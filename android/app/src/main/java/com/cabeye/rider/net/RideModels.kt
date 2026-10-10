@@ -134,6 +134,14 @@ enum class RideEventType(
      */
     PAYMENT_UPDATED(NarrationTier.EARCON_ONLY),
 
+    /**
+     * The trip meter moved (payload: distanceMeters, fareRupees, minutes), about every 100 m.
+     * Silent — "silence means all is fine". The rider hears the km and fare when they ask
+     * ("status", "how far") and once at the end; the driver's screen shows them live. Not a
+     * phase change, so it sits after RIDE_CANCELLED and outside [isRideLifecycle].
+     */
+    TRIP_PROGRESS(NarrationTier.EARCON_ONLY),
+
     // ---- Multi-stop rides -----------------------------------------------------------
     // Outside [isRideLifecycle] on purpose: the phase stays IN_TRIP throughout; these say
     // where in the route the car is. The rider's view model speaks its own sentences.
@@ -257,7 +265,14 @@ data class RideSnapshot(
     /** Multi-stop: every stop with its status, in order. Empty for an A-to-B ride. */
     val stops: List<StopInfo> = emptyList(),
     /** 1-based index of the stop being headed to or visited; null once all are behind. */
-    val currentStop: Int? = null
+    val currentStop: Int? = null,
+    // ---- Trip meter (the server measures these; the app only shows and speaks them) ----
+    /** Metres travelled: live during the trip, final once completed. 0 = not measured. */
+    val tripDistanceMeters: Int = 0,
+    /** "GPS" (measured) or "ESTIMATE" (straight line, no GPS reached the server); "" = none. */
+    val distanceSource: String = "",
+    /** What the trip would cost if it ended now. 0 before the first 100 m. */
+    val liveFareRupees: Int = 0
 ) {
     companion object {
         fun parse(json: String): RideSnapshot? = runCatching {
@@ -291,7 +306,10 @@ data class RideSnapshot(
                 paymentRef = o.optString("paymentRef"),
                 lastSeq = o.optLong("lastSeq", 0L),
                 stops = StopInfo.parseList(o.optJSONArray("stops")),
-                currentStop = if (o.has("currentStop") && !o.isNull("currentStop")) o.optInt("currentStop") else null
+                currentStop = if (o.has("currentStop") && !o.isNull("currentStop")) o.optInt("currentStop") else null,
+                tripDistanceMeters = o.optInt("tripDistanceMeters", 0),
+                distanceSource = o.optString("distanceSource"),
+                liveFareRupees = o.optInt("liveFareRupees", 0)
             )
         }.getOrNull()
     }

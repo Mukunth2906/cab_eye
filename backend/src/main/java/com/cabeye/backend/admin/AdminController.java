@@ -227,7 +227,10 @@ public class AdminController {
                 m.put("language", a.rider.language);
                 m.put("emergencyContactName", a.rider.emergencyContactName);
                 m.put("emergencyContactPhone", a.rider.emergencyContactPhone);
+                m.put("ratingAverage", a.rider.ratingAverage);
+                m.put("ratingCount", a.rider.ratingCount);
             }
+            m.put("driverReports", cases.reportsAbout(a.id));
             return m;
         }).toList();
     }
