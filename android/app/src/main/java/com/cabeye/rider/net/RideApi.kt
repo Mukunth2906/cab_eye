@@ -549,6 +549,30 @@ class RideApi(private val settings: AppSettings, private val auth: AuthStore) {
     suspend fun routeUsed(name: String): ApiResult<String> =
         call(post("${base()}/me/memory/routes/used?name=" + java.net.URLEncoder.encode(name, "UTF-8"), JSONObject()))
 
+    /**
+     * The mind map's optional free-form reader: one sentence, read by Grok on the server.
+     * Fails with "HTTP 404" when the server has no Grok key — the app then stays rules-only.
+     */
+    suspend fun interpret(body: JSONObject): ApiResult<String> =
+        call(post("${base()}/me/mindmap/interpret", body))
+
+    /**
+     * The area a point is in ("RS Puram"), from OpenStreetMap through the backend — no key.
+     * Ok(null) when it can't be named; Failed when the server is off or unreachable.
+     */
+    suspend fun placesArea(lat: Double, lng: Double): ApiResult<String?> =
+        when (val r = call(Request.Builder().url(String.format(java.util.Locale.ROOT, "%s/me/places/area?lat=%.5f&lng=%.5f", base(), lat, lng)).get().build())) {
+            is ApiResult.Ok -> ApiResult.Ok(runCatching { JSONObject(r.value).optString("area").takeIf { it.isNotBlank() && it != "null" } }.getOrNull())
+            is ApiResult.Failed -> r
+        }
+
+    /** Well-known places near a point, from OpenStreetMap through the backend — no key. */
+    suspend fun placesNearby(lat: Double, lng: Double, radiusM: Int): ApiResult<List<com.cabeye.rider.mindmap.NearbyPlace>> =
+        when (val r = call(Request.Builder().url(String.format(java.util.Locale.ROOT, "%s/me/places/nearby?lat=%.5f&lng=%.5f&radius=%d", base(), lat, lng, radiusM)).get().build(), slow = true)) {
+            is ApiResult.Ok -> ApiResult.Ok(com.cabeye.rider.mindmap.NearbyJson.osm(r.value))
+            is ApiResult.Failed -> r
+        }
+
     suspend fun forgetMemory(): ApiResult<String> =
         call(Request.Builder().url("${base()}/me/memory").delete().build())
 
@@ -588,9 +612,18 @@ class RideApi(private val settings: AppSettings, private val auth: AuthStore) {
      * which one it is: "the address is wrong" and "the server is not running" lead to opposite
      * next actions.
      */
-    private suspend fun call(request: Request): ApiResult<String> = withContext(Dispatchers.IO) {
+    /**
+     * For the one call that waits on someone else's busy server: well-known places from
+     * OpenStreetMap can take the backend ~10–30 s on a bad day. Everything else keeps the short
+     * timeouts above. The backend caches the answer, so the next ask is instant either way.
+     */
+    private val slowClient: OkHttpClient by lazy {
+        client.newBuilder().readTimeout(35, TimeUnit.SECONDS).callTimeout(40, TimeUnit.SECONDS).build()
+    }
+
+    private suspend fun call(request: Request, slow: Boolean = false): ApiResult<String> = withContext(Dispatchers.IO) {
         suspendCoroutine { continuation ->
-            client.newCall(request).enqueue(object : Callback {
+            (if (slow) slowClient else client).newCall(request).enqueue(object : Callback {
 
                 override fun onFailure(call: Call, e: IOException) {
                     Log.w(TAG, "${request.method} ${request.url} failed: $e")

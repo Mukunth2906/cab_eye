@@ -18,6 +18,13 @@ Read [What actually works right now](#what-actually-works-right-now) before demo
 server, km + fare attached to every complaint, and drivers rating riders — see
 [Real-time km, server-side fare and feedback](#real-time-km-server-side-fare-and-feedback).
 
+**New on branch `feature/mind-map`:** a personal mind map that joins the rider's rides, walks
+and their own notes ("Ravi's tea shop, where I stop on Fridays"); a ride guide that says the
+rider's remembered cues and the areas the cab passes through; and well-known places offered
+after a ride somewhere new — see [docs/MIND-MAP-AGENT.md](docs/MIND-MAP-AGENT.md). No paid
+services: Coimbatore's places and area names ship inside the app (real OpenStreetMap data,
+offline), and "simulate a ride" plays a ride through the guide on a phone without a cab.
+
 ---
 
 ## Table of contents

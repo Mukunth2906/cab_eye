@@ -122,7 +122,7 @@
         <service
             android:name=".service.NarrationService"
             android:exported="false"
-            android:foregroundServiceType="mediaPlayback" />
+            android:foregroundServiceType="mediaPlayback|location" />
 
         <service
             android:name=".walk.WalkRecordingService"

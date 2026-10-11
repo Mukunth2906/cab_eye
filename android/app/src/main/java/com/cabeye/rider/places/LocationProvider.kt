@@ -45,6 +45,32 @@ class LocationProvider(private val context: Context) {
     }
 
     /**
+     * Where the phone is now, for "remember this place" and "what's around here": the last fix
+     * when it is younger than [maxAgeMs], otherwise a fresh high-accuracy one. Null without
+     * permission, or when no fix comes within [timeoutMs].
+     */
+    @SuppressLint("MissingPermission")
+    suspend fun fresh(maxAgeMs: Long = 60_000, timeoutMs: Long = 6_000): Location? {
+        if (!hasPermission(context = context)) return null
+        val last = suspendCoroutine<Location?> { c ->
+            client.lastLocation.addOnSuccessListener { c.resume(it) }.addOnFailureListener { c.resume(null) }
+        }
+        if (last != null && System.currentTimeMillis() - last.time <= maxAgeMs) return last
+        val fix = kotlinx.coroutines.withTimeoutOrNull(timeoutMs) {
+            kotlinx.coroutines.suspendCancellableCoroutine<Location?> { c ->
+                val token = CancellationTokenSource()
+                c.invokeOnCancellation { token.cancel() }
+                client.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, token.token)
+                    .addOnSuccessListener { if (c.isActive) c.resume(it) }
+                    .addOnFailureListener { if (c.isActive) c.resume(null) }
+            }
+        }
+        // Nothing fresh in time: a fix from the last few minutes is still a fair "here"; an old
+        // one would put a remembered place somewhere the rider was hours ago.
+        return fix ?: last?.takeIf { System.currentTimeMillis() - it.time <= STALE_FALLBACK_MS }
+    }
+
+    /**
      * A stream of GPS fixes, for the driver's trip meter. Empty when location permission has
      * not been granted — the server then falls back to a straight-line estimate, so a missing
      * permission never blocks finishing a trip.
@@ -67,6 +93,10 @@ class LocationProvider(private val context: Context) {
                 .addOnFailureListener { close(it) }
             awaitClose { client.removeLocationUpdates(callback) }
         }
+    }
+
+    private companion object {
+        const val STALE_FALLBACK_MS = 5 * 60_000L
     }
 
     private fun hasPermission(context: Context): Boolean =

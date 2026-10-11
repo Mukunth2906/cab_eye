@@ -30,7 +30,7 @@ object LandmarkParser {
     }
 
     // Order matters: the first matching kind wins ("tactile tiles" is tactile, not texture).
-    private val KINDS: List<Pair<LandmarkKind, Regex>> = listOf(
+    internal val KINDS: List<Pair<LandmarkKind, Regex>> = listOf(
         LandmarkKind.SMELL to Regex("\\b(smell|smells|smelly|scent|aroma|fragrance|perfume|stink)\\b"),
         LandmarkKind.SOUND to Regex("\\b(sound|sounds|noise|noisy|hear|hum|humming|music|bell|bells|fountain|horn|beep|beeping|chirping|birds|generator|announcement|loudspeaker)\\b"),
         LandmarkKind.TACTILE to Regex("\\b(tactile|bumpy tiles|raised tiles|guiding tiles|guide tiles|warning tiles|dotted tiles)\\b"),
@@ -47,13 +47,13 @@ object LandmarkParser {
         LandmarkKind.OTHER to Regex("\\b(tree|bench|counter|shop front|corner|pillar box|water tap|tap|bin|dustbin|parked)\\b")
     )
 
-    private val VISUAL = Regex(
+    internal val VISUAL = Regex(
         "\\b(sign|signs|signboard|board|billboard|hoarding|poster|posters|banner|logo|written|writing|" +
             "display|screen|picture|painting|painted|colou?r|colou?red|red|blue|green|yellow|white|black|orange|" +
             "pink|purple|grey|gray|brown|bright|lit|neon|look|looks|see|visible)\\b"
     )
 
-    private val COLOURS = Regex(
+    internal val COLOURS = Regex(
         "\\b(red|blue|green|yellow|white|black|orange|pink|purple|grey|gray|brown|colou?red|painted|bright)\\b"
     )
 
@@ -119,7 +119,7 @@ object LandmarkParser {
         return Result.Found(kind, cleaned, side, cue)
     }
 
-    private fun clean(s: String): String = s
+    internal fun clean(s: String): String = s
         .replace(Regex("\\s+"), " ").trim()
         .replace(LEAD, "")
         .replace(Regex("\\b(here|right here|over here|just here|now)$"), "")

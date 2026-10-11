@@ -67,11 +67,26 @@ class NarrationService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         runCatching {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                startForeground(
-                    NOTIFICATION_ID,
-                    buildNotification(),
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
-                )
+                // Location too, when the rider allowed it: the ride guide follows the ride from
+                // this phone's GPS with the screen off (cues, area names, an unusual route).
+                val located = checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED ||
+                    checkSelfPermission(android.Manifest.permission.ACCESS_COARSE_LOCATION) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+                val withLocation = located && runCatching {
+                    startForeground(
+                        NOTIFICATION_ID,
+                        buildNotification(),
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+                    )
+                }.onFailure {
+                    // A restart from the background may not take the location type (Android 14+).
+                    // Narration matters more than the ride guide: start without it.
+                    Log.w(TAG, "startForeground with location refused: ${it.message}")
+                }.isSuccess
+                if (!withLocation) {
+                    startForeground(NOTIFICATION_ID, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+                }
             } else {
                 startForeground(NOTIFICATION_ID, buildNotification())
             }

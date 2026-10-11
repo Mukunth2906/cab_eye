@@ -1,0 +1,87 @@
+{
+  "version": 0.6,
+  "generator": "Overpass API 0.7.62.11 87bfad18",
+  "osm3s": {
+    "timestamp_osm_base": "2026-10-11T06:51:21Z",
+    "copyright": "The data included in this document is from www.openstreetmap.org. The data is made available under ODbL."
+  },
+  "elements": [
+
+{
+  "type": "node",
+  "id": 330080948,
+  "lat": 11.0136544,
+  "lon": 76.9628953,
+  "tags": {
+    "name": "Ram Nagar",
+    "name:ml": "രാം നഗർ",
+    "name:ta": "ராம் நகர்",
+    "place": "suburb"
+  }
+},
+{
+  "type": "node",
+  "id": 330081172,
+  "lat": 11.0080177,
+  "lon": 76.9501661,
+  "tags": {
+    "name": "RS Puram",
+    "name:ml": "ആർഎസ് പുരം",
+    "name:ta": "ஆர்எஸ் புரம்",
+    "place": "suburb",
+    "wikidata": "Q6988747",
+    "wikipedia": "en:R. S. Puram, Coimbatore"
+  }
+},
+{
+  "type": "node",
+  "id": 778242947,
+  "lat": 11.0151807,
+  "lon": 76.9536792,
+  "tags": {
+    "alt_name": "North Coimbatore",
+    "name": "Vadakovai",
+    "name:ml": "വടക്കോവൈ",
+    "name:ta": "வடகோவை",
+    "place": "suburb"
+  }
+},
+{
+  "type": "node",
+  "id": 803091150,
+  "lat": 11.0194943,
+  "lon": 76.9572601,
+  "tags": {
+    "name": "Tatabad",
+    "name:ml": "ടാറ്റാബാദ്",
+    "name:ta": "டாடாபாத்",
+    "place": "suburb",
+    "wikidata": "Q7687841",
+    "wikipedia": "en:Tatabad"
+  }
+},
+{
+  "type": "node",
+  "id": 803691377,
+  "lat": 10.9967718,
+  "lon": 76.9556171,
+  "tags": {
+    "name": "Town Hall",
+    "name:ml": "ടൗൺ ഹാൾ",
+    "place": "suburb"
+  }
+},
+{
+  "type": "node",
+  "id": 1474819108,
+  "lat": 10.9953549,
+  "lon": 76.9607290,
+  "tags": {
+    "name": "Five Corner",
+    "name:ta": "ஐந்து முக்கு",
+    "place": "neighbourhood"
+  }
+}
+
+  ]
+}

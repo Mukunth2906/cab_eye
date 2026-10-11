@@ -73,6 +73,26 @@ import com.cabeye.rider.trip.PlannedLeg
 import com.cabeye.rider.trip.StopKind
 import com.cabeye.rider.trip.StopPlanParser
 import com.cabeye.rider.trip.TripPlan
+import com.cabeye.rider.memory.TextSimilarity
+import com.cabeye.rider.mindmap.AnchorParser
+import com.cabeye.rider.mindmap.Edge
+import com.cabeye.rider.mindmap.EdgeKind
+import com.cabeye.rider.mindmap.Geo
+import com.cabeye.rider.mindmap.MindMap
+import com.cabeye.rider.mindmap.MindMapAgent
+import com.cabeye.rider.mindmap.MindMapBuilder
+import com.cabeye.rider.mindmap.MindMapCommands
+import com.cabeye.rider.mindmap.MindMapInterpreter
+import com.cabeye.rider.mindmap.MindMapStore
+import com.cabeye.rider.mindmap.NearbyPlace
+import com.cabeye.rider.mindmap.NearbySuggestionAgent
+import com.cabeye.rider.mindmap.Node
+import com.cabeye.rider.mindmap.NodeKind
+import com.cabeye.rider.mindmap.RideCommands
+import com.cabeye.rider.mindmap.RideGuideAgent
+import com.cabeye.rider.mindmap.SyntheticRide
+import com.cabeye.rider.places.AreaNamer
+import com.cabeye.rider.places.AtlasStore
 import com.cabeye.rider.walk.DetailLevel
 import com.cabeye.rider.walk.Landmark
 import com.cabeye.rider.walk.RouteBuilder
@@ -194,7 +214,13 @@ private enum class MicPurpose {
      * The walking-route agent: consent, a landmark while recording, a route's name, "next" while
      * being guided, or "was it still there?". What it means depends on the walk's mode.
      */
-    WALK
+    WALK,
+
+    /** Answering the offer of well-known places nearby: more, take me to one, remember, no. */
+    NEARBY,
+
+    /** Yes or no: may this sentence go to the server to be understood? Or: did I read it right? */
+    INTERPRET
 }
 
 /**
@@ -446,6 +472,42 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
 
     private companion object {
         const val MAX_CONSECUTIVE_ERRORS = 2
+
+        /** The ride guide's GPS: a fix every 5 s, and fixes worse than 50 m are ignored. */
+        const val RIDE_FIX_MS = 5_000L
+        const val RIDE_FIX_ACCURACY_M = 50f
+
+        /** After a drop-off, "here" means that place for this long — while the rider is still this close. */
+        const val HERE_FOR_MS = 2 * 3_600_000L
+        const val HERE_NEAR_M = 300.0
+
+        /** In the cab, a press released this quickly is a tap ("where are we"), not talking. */
+        const val TAP_MS = 500L
+
+        /** The simulated ride: one synthetic fix this often (each stands for 15 s of driving). */
+        const val DEMO_FIX_MS = 700L
+        /** Where a simulated ride starts when the phone is not in Coimbatore: Saibaba Colony. */
+        val DEMO_START = 11.0244 to 76.9450
+
+        /** The offer of places near a new drop-off is only made this soon after arriving. */
+        const val NEARBY_OFFER_FOR_MS = 15 * 60_000L
+        /** "Take me there", "remember it": the place just talked about. */
+        val NEARBY_THAT = Regex("\\b(there|it|that one|this one|that place|that)\\b")
+
+        /** Answers to the nearby-places offer. */
+        val NEARBY_MORE = Regex("\\b(more|tell me|details?|about them|what are they)\\b")
+        val NEARBY_REMEMBER = Regex("^(?:please\\s+)?(?:remember|save|keep)\\b")
+        val NEARBY_ALL = Regex("\\b(them|all|those|both)\\b")
+        val NEARBY_GO = Regex("\\b(take me|go to|book|ride to|let'?s go)\\b")
+        val NEARBY_NO = Regex("^(?:no|nope|not now|done|that'?s all|nothing|no thanks)\\b")
+
+        /** A sentence meant for the mind map even when the rules can't read the rest. */
+        val REMEMBER_LEAD = Regex(
+            "^(?:please\\s+)?(?:remember|note that|make a note)\\b(?!\\s+(?:this|it|that|the|my)\\s+(?:route|trip|ride|walk)\\b)"
+        )
+        /** Questions go to status, never to the interpreter. */
+        val QUESTION_START = Regex("^(?:how|what|when|where|why|who|which|is|are|can|could|will|would|do|does|did|should|tell me)\\b")
+        const val REMEMBER_HELP = "I didn't catch what to remember. Try: remember Ravi's tea shop, where I stop on Fridays."
 
         /** Words that can follow "book" without naming anywhere. */
         val NOT_A_PLACE = setOf("other", "another", "ride", "one", "cab", "auto", "again", "now", "new", "more", "trip")
@@ -844,6 +906,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                 activeRideId?.let(::refreshStops)
                 lastSpokenPhase = RidePhase.IN_TRIP
                 engine.heartbeat(true)
+                startRideGuide()
             }
 
             // Tier 0, and one of only three things in the whole app allowed to interrupt.
@@ -873,6 +936,8 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                         speak("I have your walk from here to ${walk.name}. Say guide me when you're ready.", NarrationTier.QUEUED)
                     }
                 }
+                // Somewhere new: the best-known places close by, offered after paying and feedback.
+                prepareNearbyAfterRide(lastRidePlace)
                 endRide("completed")
                 // The server has just recorded this trip as a visit; pull the updated places so
                 // the very next booking can already use them.
@@ -918,12 +983,15 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             RideEventType.REPLAY_COMPLETE,
             RideEventType.REQUEST_TAKEN,
             RideEventType.PONG,
-            RideEventType.ERROR,
-            // The trip meter moved. Silent by design — kept for when the rider asks.
+            RideEventType.ERROR -> Unit
+
+            // The trip meter moved. Silent by design — kept for when the rider asks, and for
+            // the ride guide on a phone without GPS.
             RideEventType.TRIP_PROGRESS -> {
                 tripMeters = maxOf(tripMeters, event.int("distanceMeters", 0))
                 val fare = event.int("fareRupees", 0)
                 if (fare > 0) tripFareSoFar = fare
+                rideGuide?.onTripMeters(tripMeters.toDouble(), System.currentTimeMillis())?.forEach(::sayRideGuide)
             }
 
             // The rider learns the payment outcome from the order it is watching.
@@ -2000,10 +2068,11 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        // A multi-stop ride: a press is "I'm back" at a WAIT stop, otherwise it opens the
-        // microphone for stop words only — never for a new booking.
+        // In the cab: a press is "I'm back" at a WAIT stop, otherwise it opens the microphone for
+        // ride words only — stop commands, "where am I", a cue ("speed bump"), a note — never
+        // for a new booking. Saying nothing still answers "where are we".
         val trip = uiState.ride as? RiderState.InTrip
-        if (trip != null && activeStops.isNotEmpty()) {
+        if (trip != null) {
             trace?.tapCount = (trace?.tapCount ?: 0) + 1
             engine.stopSpeaking()
             if (stt?.isListening == true) stt?.cancel()
@@ -2097,6 +2166,30 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Rider released. Closes the microphone; a final transcript is still expected. */
     fun onHoldEnd() {
+        // In the cab the ride screen stays up while the mic is open, so the check below would
+        // ignore this release. On an ordinary ride a quick tap is "where are we", answered at
+        // once as it always was; a hold is talking ("where am I", "speed bump"), and letting go
+        // ends it, as at the main question.
+        if (micPurpose == MicPurpose.TRIP_COMMAND && uiState.micOpen && uiState.ride is RiderState.InTrip &&
+            activeStops.isEmpty()
+        ) {
+            val openedAt = micOpenedAtMillis
+            val elapsed = System.currentTimeMillis() - openedAt
+            when {
+                elapsed < TAP_MS -> {
+                    stt?.cancel()
+                    closeMic()
+                    engine.earcon(Earcon.UNDERSTOOD)
+                    speakStatus()
+                }
+                elapsed >= MIN_CAPTURE_BEFORE_STOP_MS -> stt?.stop()
+                else -> viewModelScope.launch {
+                    delay(MIN_CAPTURE_BEFORE_STOP_MS - elapsed)
+                    if (micOpenedAtMillis == openedAt) stt?.stop()
+                }
+            }
+            return
+        }
         if (uiState.ride !is RiderState.Listening) return
         // T0 — the clock the rider actually experiences starts here.
         trace?.mark(Telemetry.Stage.MIC_RELEASED)
@@ -2151,6 +2244,8 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         cancelWindowJob?.cancel()
         silenceJob?.cancel()
         demoRideJob?.cancel()
+        // A simulated ride has no server ride to end: its guide stops here, keeping nothing.
+        if (activeRideId == null) stopRideGuide(save = false)
         stt?.cancel()
         closeMic()
         engine.heartbeat(false)
@@ -2226,7 +2321,9 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         if (purpose != MicPurpose.CANCEL_WINDOW && purpose != MicPurpose.CODE_VERIFY &&
             purpose != MicPurpose.FEEDBACK && purpose != MicPurpose.NEXT_JOURNEY &&
             purpose != MicPurpose.CAMERA && purpose != MicPurpose.TRIP_COMMAND &&
-            purpose != MicPurpose.STOP_CONFIRM && purpose != MicPurpose.WALK && !planPurpose(purpose)
+            purpose != MicPurpose.STOP_CONFIRM && purpose != MicPurpose.WALK && purpose != MicPurpose.NEARBY &&
+            purpose != MicPurpose.INTERPRET &&
+            !planPurpose(purpose)
         ) {
             transition(
                 RiderState.Listening(isFollowUp = purpose != MicPurpose.BOOKING),
@@ -2279,19 +2376,30 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             }
             if (purpose == MicPurpose.NEXT_JOURNEY) {
                 Log.i(TAG, "SILENCE on next journey — finishing")
-                endPostRide("I'll wait. Hold anywhere when you need a ride.")
+                finishPostRide("I'll wait. Hold anywhere when you need a ride.")
                 return@launch
             }
             if (purpose == MicPurpose.WALK) {
                 onWalkNoAnswer()
                 return@launch
             }
-            // Mid-ride stop words: silence changes nothing, and the ride screen stays.
+            // Silence to the nearby-places offer is not a "no": it just ends.
+            if (purpose == MicPurpose.NEARBY) {
+                endNearby()
+                return@launch
+            }
+            if (purpose == MicPurpose.INTERPRET) {
+                interpretNoAnswer()
+                return@launch
+            }
+            // Mid-ride stop words: silence changes nothing, and the ride screen stays. On an
+            // ordinary ride a press with no words is still "where are we".
             if (purpose == MicPurpose.TRIP_COMMAND || purpose == MicPurpose.STOP_CONFIRM ||
                 (purpose == MicPurpose.STOP_KIND && addingStopMidTrip != null)
             ) {
                 pendingTripAction = null
                 addingStopMidTrip = null
+                if (purpose == MicPurpose.TRIP_COMMAND && activeStops.isEmpty() && uiState.ride is RiderState.InTrip) speakStatus()
                 return@launch
             }
             // Silence to the camera question is a no; silence while it is on means nothing.
@@ -2402,7 +2510,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                 alternatives.firstOrNull { StopPlanParser.kindAnswer(it) != null }
 
             micPurpose == MicPurpose.TRIP_COMMAND ->
-                alternatives.firstOrNull { StopPlanParser.tripCommand(it) != null }
+                alternatives.firstOrNull { StopPlanParser.tripCommand(it) != null || RideCommands.parse(it) != null }
 
             micPurpose == MicPurpose.PLAN_REVIEW ->
                 alternatives.firstOrNull { StopPlanParser.planEdit(it) != null }
@@ -2479,6 +2587,10 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
 
         // Walking routes: "how do I get to the clinic", "record my walk", answers while walking.
         if (handleWalkSpeech(text)) return
+
+        // The mind map: "what's around the clinic", "remember Ravi's tea shop, where I stop on
+        // Fridays", "what's famous around here", and answers to the nearby-places offer.
+        if (handleMindMapSpeech(text)) return
 
         val rideActive = uiState.ride !is RiderState.Idle
         val classification = Classifier.classify(text, rideActive)
@@ -2575,13 +2687,16 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             MicPurpose.CODE_VERIFY -> return // handled above
             MicPurpose.CAMERA -> return // handled above
             MicPurpose.PLAN_LEG, MicPurpose.STOP_KIND, MicPurpose.PLAN_REVIEW,
-            MicPurpose.TRIP_COMMAND, MicPurpose.STOP_CONFIRM, MicPurpose.WALK -> return // handled above
+            MicPurpose.TRIP_COMMAND, MicPurpose.STOP_CONFIRM, MicPurpose.WALK, MicPurpose.NEARBY,
+            MicPurpose.INTERPRET -> return // handled above
             MicPurpose.BOOKING -> Unit
         }
 
         when (classification.kind) {
             UtteranceClass.GREETING -> handleGreeting()
-            UtteranceClass.COMMAND -> runCommand(classification.intent)
+            UtteranceClass.COMMAND ->
+                // "simulate a ride to Koniamman Temple": the demo needs the words, not just the intent.
+                if (classification.intent is RiderIntent.DemoRide) startDemoRide(text) else runCommand(classification.intent)
             UtteranceClass.INCOMPLETE -> askForMissingSlot(classification)
             UtteranceClass.BOOKING -> {
                 val book = classification.intent as RiderIntent.Book
@@ -2661,6 +2776,19 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         }
         heldRideType = rideType
 
+        // A place the rider taught the app on the spot ("remember this as Ravi's tea shop"):
+        // small shops and meeting points are often on no map, so the mind map is asked first.
+        MindMapAgent.bookable(mindMap(), rawPhrase)?.let { n ->
+            Log.i(TAG, "MINDMAP direct heard=\"$rawPhrase\" place=\"${n.label}\"")
+            failureCount = 0
+            engine.earcon(Earcon.UNDERSTOOD)
+            beginOptimisticBooking(
+                PlaceOption(name = n.label, latitude = n.lat!!, longitude = n.lng!!, score = 1f, coversWholeToken = true),
+                rideType, note = "the place you told me about"
+            )
+            return
+        }
+
         // Very short/empty queries should never spend a Places request. This also preserves the
         // original recovery behaviour for speech fragments such as "to".
         val substantive = Stopwords.strip(Gazetteer.normalise(rawPhrase))
@@ -2671,27 +2799,46 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
 
         viewModelScope.launch {
             val apiKeyConfigured = BuildConfig.GOOGLE_MAPS_API_KEY.isNotBlank()
+            val location = app.locationProvider.current()
+            pickupLatitude = location?.latitude
+            pickupLongitude = location?.longitude
             val googleCandidates = if (apiKeyConfigured) {
-                val location = app.locationProvider.current()
-                pickupLatitude = location?.latitude
-                pickupLongitude = location?.longitude
                 app.placeResolver.search(query, location).getOrNull().orEmpty()
             } else {
                 emptyList()
             }
 
-            // Google is the primary resolver. If it returns no usable result (offline, quota,
-            // missing coordinates, or a genuinely unknown place), the original gazetteer is
-            // retained as a safe fallback so existing demos and tests keep working.
+            // Google is the primary resolver when there is a key. Without one (no paid service),
+            // or when it finds nothing: the built-in places, then the offline Coimbatore atlas —
+            // real places from OpenStreetMap bundled in the app, scored by the same rules.
             val candidates = if (googleCandidates.isNotEmpty()) {
                 googleCandidates
             } else {
                 if (apiKeyConfigured) Log.w(TAG, "Places returned no usable result; falling back to Gazetteer")
-                Gazetteer.score(query)
+                offlineCandidates(query, location?.latitude, location?.longitude)
             }
 
-            handleResolvedCandidates(candidates, rawPhrase, rideType, source = if (googleCandidates.isNotEmpty()) "google" else "gazetteer")
+            handleResolvedCandidates(candidates, rawPhrase, rideType, source = if (googleCandidates.isNotEmpty()) "google" else "offline")
         }
+    }
+
+    /**
+     * Destination search with no paid service: the hand-checked built-in places first (their
+     * behaviour unchanged), then the bundled Coimbatore atlas. One place named in both is kept
+     * once, as the built-in one.
+     */
+    private suspend fun offlineCandidates(query: String, lat: Double?, lng: Double?): List<PlaceOption> {
+        val builtIn = Gazetteer.score(query)
+        if (Gazetteer.activeCity != City.COIMBATORE) return builtIn
+        val atlas = AtlasStore.get(getApplication())?.search(query, lat, lng).orEmpty()
+            .filter { it.score >= Gazetteer.NEAR_MISS_FLOOR }
+        val merged = builtIn + atlas.filter { a ->
+            builtIn.none { b ->
+                TextSimilarity.normalise(b.name) == TextSimilarity.normalise(a.name) &&
+                    Gazetteer.distanceKm(a, b) < 1.5f
+            }
+        }
+        return merged.sortedByDescending { it.score }
     }
 
     private fun handleResolvedCandidates(
@@ -3325,6 +3472,8 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun forgetHistory() {
+        // The way the rider rode is ride history too, kept on this phone for the ride guide.
+        mindMapStore.clearTraces()
         if (!app.memory.enabled) {
             speak("I'm not keeping any history for you.", NarrationTier.QUEUED)
             return
@@ -3884,8 +4033,9 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             }
             StopPlanParser.TripCommand.ReadStops -> speak(remainingStopsLine(), NarrationTier.QUEUED)
             is StopPlanParser.TripCommand.AddStop -> addStopMidTrip(cmd.leg)
-            // In the car: "tell me the walk" previews the walk from the drop-off.
-            null -> if (!handleWalkCommand(text)) speakStatus()
+            // In the car: "tell me the walk" previews the walk from the drop-off; "where am I",
+            // a cue the rider marks, or a note go to the ride guide; anything else is status.
+            null -> if (!handleWalkCommand(text) && !handleRideSpeech(text)) speakStatus()
         }
     }
 
@@ -4239,7 +4389,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                 activeRideId != null -> " Say guide me after you get out, and I'll take you one part at a time."
                 else -> " Say guide me to go one part at a time."
             }
-            speak(WalkNarrator.narrate(route, level, now) + tail, NarrationTier.QUEUED)
+            speak(WalkNarrator.narrate(route, level, now, walkNotes(route)) + tail, NarrationTier.QUEUED)
             return
         }
         // Guided: one part at a time, re-recording silently when the rider has agreed to recording.
@@ -4254,7 +4404,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         speak(
             "Guiding you to ${route.name}, ${route.segments.size} ${if (route.segments.size == 1) "part" else "parts"}. " +
                 "Press the screen and say next at each turn, repeat, more detail, or I'm there. " +
-                WalkNarrator.segment(route, 0, level, now),
+                WalkNarrator.segment(route, 0, level, now, walkNotes(route)),
             NarrationTier.QUEUED
         )
     }
@@ -4264,7 +4414,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         val now = System.currentTimeMillis()
         val level = WalkNarrator.levelFor(route.copy(helpRequests = route.helpRequests + guideHelp), walkStore.profile())
         showWalk(recording = false, prompt = "Part ${guidePart + 1} of ${route.segments.size}")
-        speak(lead + WalkNarrator.segment(route, guidePart, level, now), NarrationTier.QUEUED)
+        speak(lead + WalkNarrator.segment(route, guidePart, level, now, walkNotes(route)), NarrationTier.QUEUED)
     }
 
     private fun finishGuide(stopped: Boolean) {
@@ -4327,8 +4477,13 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                     speak("I'll only keep things you can feel, hear or smell — a sign or a colour won't help when you " +
                         "walk it. What can you feel, hear or smell here?", NarrationTier.QUEUED) { openMic(MicPurpose.WALK) }
                 }
-                null -> speak("Tell me what you notice — a kerb, a smell, a sound — or say turning left, or I'm there.",
-                    NarrationTier.QUEUED)
+                null -> {
+                    val note = MindMapCommands.parse(text) as? MindMapCommands.Command.Remember
+                    val help = { speak("Tell me what you notice — a kerb, a smell, a sound — or say turning left, or I'm there.",
+                        NarrationTier.QUEUED) }
+                    if (note != null) rememberAnchor(note.anchor)
+                    else if (!tryInterpret(text, help)) help()
+                }
             }
             WalkMode.NAMING -> {
                 val name = text.lowercase()
@@ -4401,7 +4556,12 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                                 WalkRecorder.add(WalkEvent.Mark(now, text))
                                 speak("Noted.", NarrationTier.QUEUED)
                             }
-                            else -> speak("Say next, repeat, more detail, or I'm there.", NarrationTier.QUEUED)
+                            MindMapCommands.parse(text) is MindMapCommands.Command.Remember ->
+                                rememberAnchor((MindMapCommands.parse(text) as MindMapCommands.Command.Remember).anchor)
+                            else -> {
+                                val help = { speak("Say next, repeat, more detail, or I'm there.", NarrationTier.QUEUED) }
+                                if (!tryInterpret(text, help)) help()
+                            }
                         }
                     }
                 }
@@ -4516,6 +4676,712 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         speak("The walking log has ${entries.size} entries. Choose where to send it.", NarrationTier.QUEUED)
     }
 
+    // =================================================================================
+    //  The personal mind map — places, walks, rides and what they mean to the rider
+    //
+    //  One connected memory (see mindmap/MindMapModels.kt): the cab destinations, the walks
+    //  from them, the landmarks on those walks, and the rider's own notes ("Ravi's tea shop,
+    //  where I stop on Fridays"). Asked "what's around the clinic?" it gives a spoken mental
+    //  map. In the cab, the ride guide says the cues the rider marked on earlier rides as they
+    //  come up, names the areas, and says once if the cab is not on the usual way. After a ride
+    //  to somewhere new it offers the few best-known places close by.
+    //
+    //  Everything stays on the phone (MindMapStore), like the walking routes.
+    // =================================================================================
+
+    private val mindMapStore by lazy { MindMapStore(getApplication()) }
+    private val areaNamer by lazy { AreaNamer(getApplication()) }
+    private var rideGuide: RideGuideAgent? = null
+    private var rideGuideJob: Job? = null
+    /** Decided when the trip starts, from the memory as it was before this ride. */
+    private var rideToNewPlace = false
+    private var nearbyPicks: List<Pair<NearbyPlace, Double>> = emptyList()
+    private var nearbyFrom: Pair<Double, Double>? = null
+    private var nearbyNear: Node? = null
+    /** Fetched after a ride to a new place, said when the post-ride questions are over. */
+    private var nearbyOfferWaiting = false
+    private var nearbyFetchJob: Job? = null
+
+    private fun mindMap(): MindMap =
+        MindMapBuilder.build(mindMapStore.authored(), walkStore.routes(), app.memory.current.places)
+
+    /** A cab destination as a mind-map node: the one the map has, or a new one to keep. */
+    private fun placeNode(map: MindMap, place: PlaceOption): Node {
+        val key = RouteMemory.placeKey(place.placeId, place.name)
+        val norm = TextSimilarity.normalise(place.name)
+        return map.node(MindMapBuilder.placeId(key))
+            ?: map.nodes.firstOrNull { it.kind == NodeKind.PLACE && it.source == "name:$norm" }
+            ?: map.nodes.firstOrNull {
+                it.kind == NodeKind.PLACE && !it.id.startsWith("walk:") && TextSimilarity.normalise(it.label) == norm
+            }
+            ?: Node(
+                MindMapBuilder.placeId(key), NodeKind.PLACE, place.name, place.latitude, place.longitude,
+                source = key, createdAt = System.currentTimeMillis(), lastConfirmedAt = System.currentTimeMillis()
+            )
+    }
+
+    /**
+     * Where the rider is, as the map knows it: the walk being guided, or the drop-off they are
+     * still near. With a GPS fix, a drop-off the rider has since walked away from is not "here".
+     */
+    private fun hereNode(map: MindMap, lat: Double? = null, lng: Double? = null): Node? {
+        guideRoute?.let { r -> map.node(MindMapBuilder.walkId(r.id))?.let { return it } }
+        if (activeRideId != null) return null // in the cab, "here" is moving
+        val place = lastRidePlace?.takeIf { System.currentTimeMillis() - lastRideEndedAt < HERE_FOR_MS } ?: return null
+        if (lat != null && lng != null && Geo.metres(lat, lng, place.latitude, place.longitude) > HERE_NEAR_M) return null
+        return placeNode(map, place)
+    }
+
+    /** Keeps a place node the derived map lacks (a guest rider has no ride memory), so links to it last. */
+    private fun withPlace(authored: MindMap, map: MindMap, node: Node?): MindMap =
+        if (node != null && node.kind == NodeKind.PLACE && map.node(node.id) == null) authored.upsert(listOf(node)) else authored
+
+    /** Where the rider is now: the cab's last fix in a ride, else a fresh fix from the phone. */
+    private suspend fun riderPosition(): Pair<Double, Double>? =
+        rideGuide?.position ?: runCatching { app.locationProvider.fresh() }.getOrNull()?.let { it.latitude to it.longitude }
+
+    /**
+     * Mind-map words at the main question or after a ride: "what's around the clinic",
+     * "remember Ravi's tea shop, where I stop on Fridays". @return true when handled.
+     */
+    private fun handleMindMapSpeech(text: String): Boolean {
+        if (micPurpose == MicPurpose.NEARBY) {
+            handleNearbyAnswer(text)
+            return true
+        }
+        if (micPurpose == MicPurpose.INTERPRET) {
+            handleInterpretAnswer(text)
+            return true
+        }
+        if (micPurpose != MicPurpose.BOOKING && micPurpose != MicPurpose.NEXT_JOURNEY) return false
+        if (uiState.ride is RiderState.Confirming || planStage != null) return false
+        // At both questions a place may be named as a destination: only "remember …" makes
+        // "the mall where I bought shoes" a note there.
+        val cmd = MindMapCommands.parse(text, requireLead = true)
+        if (cmd == null) {
+            // "Remember …" that the rules couldn't follow: the one case at the main question
+            // where the sentence is clearly meant for the mind map, not a destination.
+            if (!REMEMBER_LEAD.containsMatchIn(text.trim().lowercase())) return false
+            leaveQuestionScreen()
+            if (!tryInterpret(text) { speak(REMEMBER_HELP, NarrationTier.QUEUED) }) speak(REMEMBER_HELP, NarrationTier.QUEUED)
+            return true
+        }
+        leaveQuestionScreen()
+        runMindMapCommand(cmd)
+        return true
+    }
+
+    /** The question the rider was answering is over: back to the idle screen. */
+    private fun leaveQuestionScreen() {
+        when (uiState.ride) {
+            is RiderState.NextJourney -> endPostRide(null)
+            is RiderState.Listening -> transition(RiderState.Idle, announce = false)
+            else -> Unit
+        }
+    }
+
+    private fun runMindMapCommand(cmd: MindMapCommands.Command) {
+        engine.earcon(Earcon.UNDERSTOOD)
+        val now = System.currentTimeMillis()
+        val map = mindMap()
+        when (cmd) {
+            is MindMapCommands.Command.Around -> if (cmd.name.isBlank()) aroundHere() else {
+                val target = MindMapAgent.find(map, cmd.name, setOf(NodeKind.PLACE, NodeKind.ANCHOR, NodeKind.AREA), near = hereNode(map))
+                speak(
+                    target?.let { MindMapAgent.around(map, it, now) }
+                        ?: "I don't know a place called ${cmd.name} yet. It joins your mind map once you ride or walk there.",
+                    NarrationTier.QUEUED
+                )
+            }
+            MindMapCommands.Command.Nearby -> offerNearby(newHere = false)
+            is MindMapCommands.Command.About -> {
+                val n = MindMapAgent.find(map, cmd.name, near = hereNode(map))
+                speak(n?.let { MindMapAgent.about(map, it, now) } ?: "I don't have anything about ${cmd.name} yet.", NarrationTier.QUEUED)
+            }
+            is MindMapCommands.Command.Remember -> rememberAnchor(cmd.anchor)
+            is MindMapCommands.Command.VisualOnly -> speak(
+                "I'll only keep what you can feel, hear or smell, or what a place means to you. A sign or a colour " +
+                    "won't help you find it.", NarrationTier.QUEUED
+            )
+            is MindMapCommands.Command.Forget -> {
+                val a = MindMapAgent.findAnchor(map, cmd.name)
+                if (a == null) speak("I don't have a note about ${cmd.name}.", NarrationTier.QUEUED)
+                else {
+                    mindMapStore.saveAuthored(mindMapStore.authored().without(a.id))
+                    speak("Done. I've forgotten ${MindMapAgent.display(a)}.", NarrationTier.QUEUED)
+                }
+            }
+            MindMapCommands.Command.ForgetAll -> {
+                mindMapStore.clear()
+                speak(
+                    "Done. I've forgotten your personal notes, ride cues and remembered places. " +
+                        "Your walking routes and ride history are kept.", NarrationTier.QUEUED
+                )
+            }
+            MindMapCommands.Command.Summary -> speak(MindMapAgent.summary(map), NarrationTier.QUEUED)
+            is MindMapCommands.Command.Suggestions -> {
+                mindMapStore.saveNearbyGuard(NearbySuggestionAgent.Guard(declines = 0, off = !cmd.on))
+                speak(
+                    if (cmd.on) "Okay. After a ride somewhere new, I'll offer well-known places nearby."
+                    else "Okay, I won't offer places by myself. Ask what's famous around here any time.",
+                    NarrationTier.QUEUED
+                )
+            }
+        }
+    }
+
+    /**
+     * "What's around here?" Near the last drop-off or on a guided walk: that place's spoken map.
+     * Anywhere else: the area and the places the rider knows nearby, from the phone's position.
+     * Knowing nothing there: the well-known places instead.
+     */
+    private fun aroundHere() {
+        viewModelScope.launch {
+            val fix = riderPosition()
+            val map = mindMap()
+            val now = System.currentTimeMillis()
+            val here = hereNode(map, fix?.first, fix?.second)
+            if (here != null) {
+                speak(MindMapAgent.around(map, here, now), NarrationTier.QUEUED)
+                return@launch
+            }
+            if (fix == null) {
+                speak("I can't tell where you are. Allow location for Cab Eye, then ask again.", NarrationTier.QUEUED)
+                return@launch
+            }
+            val area = areaName(fix.first, fix.second, orCity = true)
+            val said = MindMapAgent.nearPoint(map, fix.first, fix.second, area, now)
+            if (said == null) offerNearby(newHere = false)
+            else speak("$said Ask what's famous around here for well-known places.", NarrationTier.QUEUED)
+        }
+    }
+
+    /**
+     * A personal note, joined to what it is about. Said on foot, in the cab, or at the main
+     * question. Only a note about "this place" takes the rider's position — "Ravi's tea shop,
+     * where I stop on Fridays" said at home must not put Ravi's shop at home.
+     */
+    private fun rememberAnchor(a: AnchorParser.Anchor) {
+        viewModelScope.launch {
+            val fix = if (a.here) riderPosition() else null
+            val map = mindMap()
+            val now = System.currentTimeMillis()
+            val here = hereNode(map, fix?.first, fix?.second)
+            if (a.here && here == null && fix == null) {
+                speak(
+                    "I can't tell where here is. Allow location for Cab Eye, or name the place, like Ravi's tea shop, " +
+                        "where I stop on Fridays.", NarrationTier.QUEUED
+                )
+                return@launch
+            }
+            val r = MindMapAgent.remember(map, a, here, fix?.first, fix?.second, now, now.toString(36))
+            mindMapStore.saveAuthored(withPlace(mindMapStore.authored(), map, here).upsert(r.nodes, r.edges))
+            walkLog("", "ANCHOR", a.words)
+            val saved = r.nodes.single()
+            // A spot the rider named on the spot can be booked by that name next time.
+            val bookTip = if (a.here && here == null && saved.located && saved.sense == null)
+                " To come back by cab, say: take me to ${AnchorParser.firstPerson(saved.label)}." else ""
+            speak(r.spoken + bookTip, NarrationTier.QUEUED)
+        }
+    }
+
+    /** The rider's notes for a walk's landmarks, for the narrator. */
+    private fun walkNotes(route: WalkRoute): Map<String, String> =
+        runCatching { MindMapAgent.notesFor(mindMap(), route.id) }.getOrDefault(emptyMap())
+
+    /**
+     * Books straight to a place the mind map knows exactly — a nearby place the rider picked, or
+     * a spot they taught the app. The normal announcement and cancel window still apply.
+     */
+    private fun bookKnownPlace(name: String, lat: Double, lng: Double, placeId: String, note: String, from: Pair<Double, Double>?) {
+        val rideType = preferredRideType()
+        pendingSpokenAs = name
+        heldRideType = rideType
+        failureCount = 0
+        if (from != null) {
+            pickupLatitude = from.first
+            pickupLongitude = from.second
+        }
+        engine.earcon(Earcon.UNDERSTOOD)
+        beginOptimisticBooking(
+            PlaceOption(name = name, latitude = lat, longitude = lng, score = 1f, coversWholeToken = true, placeId = placeId),
+            rideType, note
+        )
+    }
+
+    // ---- the ride guide ---------------------------------------------------------------
+
+    /** @param synthetic a simulated ride feeds the guide itself: the phone's real GPS is not followed. */
+    private fun startRideGuide(resumed: Boolean = false, synthetic: Boolean = false) {
+        val place = lastBookingPlace ?: return
+        val key = RouteMemory.placeKey(place.placeId, place.name)
+        // The same ride's start heard twice (a reconnect): keep following it, don't start over.
+        if (rideGuide?.placeKey == key) return
+        stopRideGuide(save = false)
+        // A new ride: an offer left from the last one is no longer about where the rider is.
+        nearbyOfferWaiting = false
+        val map = mindMap()
+        val dest = placeNode(map, place)
+        val cues = map.nodes.filter { n ->
+            n.kind == NodeKind.RIDE_CUE && (n.source == key || map.edges.any { it.from == n.id && it.to == dest.id })
+        }
+        rideToNewPlace = NearbySuggestionAgent.isNew(
+            key, app.memory.current.places, hasWalk = RouteMemory.forPlace(walkStore.routes(), key) != null,
+            name = place.name, countsThisVisit = false
+        )
+        val guide = RideGuideAgent(
+            key, place.name, mindMapStore.traces(), cues, quiet = mindMapStore.rideQuiet,
+            destLat = place.latitude, destLng = place.longitude
+        )
+        rideGuide = guide
+        if (!resumed) {
+            guide.preview()?.let { speak(it, NarrationTier.QUEUED) }
+            // Said once, on the first ride: nothing on screen would ever tell a blind rider this.
+            if (!mindMapStore.rideIntroDone) {
+                mindMapStore.rideIntroDone = true
+                speak(
+                    // On a multi-stop ride a tap already opens the microphone for stop words.
+                    (if (activeStops.isEmpty()) "On the way, tap the screen to hear where we are. Hold it" else "On the way, press the screen") +
+                        " and tell me what you notice, like speed bump or flyover, and I'll remind you next time.",
+                    NarrationTier.QUEUED
+                )
+            }
+        }
+        if (synthetic) return
+        rideGuideJob = viewModelScope.launch {
+            var fixes = 0
+            try {
+                app.locationProvider.updates(RIDE_FIX_MS).collect { loc ->
+                    if (loc.hasAccuracy() && loc.accuracy > RIDE_FIX_ACCURACY_M) return@collect
+                    val t = System.currentTimeMillis()
+                    guide.onFix(loc.latitude, loc.longitude, t).forEach(::sayRideGuide)
+                    // The area every fourth fix (about 20 s): enough to notice a change, few lookups.
+                    if (fixes++ % 4 == 0) {
+                        areaName(loc.latitude, loc.longitude)?.let { area -> guide.onArea(area, t)?.let(::sayRideGuide) }
+                    }
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "RIDE_GUIDE gps stopped: ${e.message}")
+            }
+        }
+    }
+
+    private fun sayRideGuide(say: RideGuideAgent.Say) {
+        if (uiState.ride !is RiderState.InTrip || rideGuide == null) return
+        // While the rider is talking, a cue or an area name would only be heard by the
+        // microphone. Safety and arrival are said anyway.
+        if (uiState.micOpen && (say.kind == RideGuideAgent.Kind.CUE || say.kind == RideGuideAgent.Kind.AREA)) return
+        Log.i(TAG, "RIDE_GUIDE ${say.kind} \"${say.text}\"")
+        val text = if (say.kind == RideGuideAgent.Kind.ARRIVING) say.text + walkAhead() else say.text
+        speak(text, NarrationTier.QUEUED)
+    }
+
+    /** Said with "almost there": the first moves of the saved walk from this drop-off, so the rider can get ready. */
+    private fun walkAhead(): String {
+        val place = lastBookingPlace ?: return " Get ready to step out."
+        val walk = RouteMemory.forPlace(walkStore.routes(), RouteMemory.placeKey(place.placeId, place.name))
+            ?: return " Get ready to step out."
+        return " Your walk to ${walk.name}: ${WalkNarrator.cueLine(walk)}. Say guide me when you're out."
+    }
+
+    /** Ends the guide. A completed ride keeps its trace and the areas it passed through. */
+    private fun stopRideGuide(save: Boolean) {
+        // Read by the nearby offer before the ride ends; never carried into the next ride.
+        rideToNewPlace = false
+        rideGuideJob?.cancel()
+        rideGuideJob = null
+        val g = rideGuide ?: return
+        rideGuide = null
+        if (!save) return
+        val now = System.currentTimeMillis()
+        val tr = g.trace(now) ?: return
+        mindMapStore.addTrace(tr)
+        val map = mindMap()
+        val dest = lastRidePlace?.let { placeNode(map, it) } ?: return
+        val areas = tr.areas.distinct().map { name ->
+            val id = "area:" + TextSimilarity.normalise(name).replace(' ', '-')
+            (map.node(id) ?: Node(id, NodeKind.AREA, name, createdAt = now)).copy(lastConfirmedAt = now)
+        }
+        val edges = areas.map { Edge(it.id, dest.id, EdgeKind.ON_RIDE) } +
+            listOfNotNull(areas.lastOrNull()?.let { Edge(dest.id, it.id, EdgeKind.IN_AREA) })
+        mindMapStore.saveAuthored(withPlace(mindMapStore.authored(), map, dest).upsert(areas, edges))
+    }
+
+    /**
+     * Ride words that are not stop commands: "where am I", "quiet ride", "undo", a note, or a
+     * cue the rider marks ("speed bump", "that was the flyover"). @return true when handled.
+     */
+    private fun handleRideSpeech(text: String): Boolean {
+        val g = rideGuide
+        when (RideCommands.parse(text)) {
+            RideCommands.Command.WHERE_AM_I -> {
+                speakWhereAmI()
+                return true
+            }
+            RideCommands.Command.QUIET -> {
+                mindMapStore.rideQuiet = true
+                g?.quiet = true
+                speak("Okay, a quiet ride. I'll still tell you if the cab leaves your usual way, and when you're almost there.",
+                    NarrationTier.QUEUED)
+                return true
+            }
+            RideCommands.Command.TALK -> {
+                mindMapStore.rideQuiet = false
+                g?.quiet = false
+                speak("Okay. I'll tell you your cues as we go.", NarrationTier.QUEUED)
+                return true
+            }
+            RideCommands.Command.PREVIEW -> {
+                speak(
+                    g?.preview() ?: ("This is the first ride there I've followed, so I don't know your usual way yet. " +
+                        "Hold the screen and tell me what you notice, like a speed bump, a flyover or a sound, and I'll remember it."),
+                    NarrationTier.QUEUED
+                )
+                return true
+            }
+            RideCommands.Command.UNDO -> {
+                val u = g?.undo()
+                when {
+                    u?.removed != null -> {
+                        mindMapStore.saveAuthored(mindMapStore.authored().without(u.removed.id))
+                        speak("Okay, I've taken out ${MindMapAgent.the(u.removed.label)}.", NarrationTier.QUEUED)
+                    }
+                    u?.restored != null -> {
+                        mindMapStore.saveAuthored(mindMapStore.authored().upsert(listOf(u.restored)))
+                        speak("Okay, undone.", NarrationTier.QUEUED)
+                    }
+                    else -> speak("There's nothing to undo on this ride.", NarrationTier.QUEUED)
+                }
+                return true
+            }
+            null -> Unit
+        }
+        when (val cmd = MindMapCommands.parse(text)) {
+            null -> Unit
+            // In the cab "here" is moving and no ride may be booked from the offer: say where we are.
+            MindMapCommands.Command.Nearby -> { speakWhereAmI(); return true }
+            is MindMapCommands.Command.Around -> {
+                if (cmd.name.isBlank()) speakWhereAmI() else runMindMapCommand(cmd)
+                return true
+            }
+            else -> { runMindMapCommand(cmd); return true }
+        }
+        if (g == null) return tryInterpret(text) { speakStatus() }
+        if (markRideCue(text)) return true
+        return tryInterpret(text) { speakStatus() }
+    }
+
+    private fun speakWhereAmI() {
+        speak(
+            rideGuide?.whereAmI(tripMeters.toDouble().takeIf { it > 0 })
+                ?: "I can't follow this ride, so I can't say where we are.", NarrationTier.QUEUED
+        )
+    }
+
+    /** A cue the rider marks in the cab. @return false when the words are not a cue. */
+    private fun markRideCue(text: String): Boolean {
+        val g = rideGuide ?: return false
+        val now = System.currentTimeMillis()
+        when (val m = g.mark(text, now, now.toString(36))) {
+            is RideGuideAgent.Marked.Cue -> {
+                engine.earcon(Earcon.UNDERSTOOD)
+                val map = mindMap()
+                val dest = lastBookingPlace?.let { placeNode(map, it) }
+                val edges = listOfNotNull(dest?.let { Edge(m.node.id, it.id, EdgeKind.ON_RIDE) })
+                mindMapStore.saveAuthored(withPlace(mindMapStore.authored(), map, dest).upsert(listOf(m.node), edges))
+                speak(m.spoken, NarrationTier.QUEUED)
+            }
+            is RideGuideAgent.Marked.VisualOnly -> speak(
+                "I'll only keep what you can feel, hear or smell on the way, like a bump, a climb or a sound.", NarrationTier.QUEUED
+            )
+            null -> return false
+        }
+        return true
+    }
+
+    // ---- well-known places nearby ------------------------------------------------------
+
+    /** The one place the rider is talking about, after "tell me about the temple". */
+    private var nearbyFocus: NearbyPlace? = null
+    /** "Yes" to the offer is not one of its answers: asked once what they'd like. */
+    private var nearbyReprompted = false
+
+    /**
+     * After a ride to a new place: fetch the offer now and say it when the post-ride questions
+     * end — or straight away, if they are already over by the time the answer comes back.
+     */
+    private fun prepareNearbyAfterRide(place: PlaceOption?) {
+        nearbyOfferWaiting = false
+        nearbyFetchJob?.cancel()
+        if (place == null || !rideToNewPlace || !mindMapStore.nearbyGuard().offersProactively) return
+        nearbyFetchJob = viewModelScope.launch {
+            val picks = fetchNearby(place.latitude, place.longitude, place.name)
+            if (picks.isEmpty()) return@launch
+            nearbyPicks = picks
+            nearbyFrom = place.latitude to place.longitude
+            nearbyNear = placeNode(mindMap(), place)
+            nearbyOfferWaiting = true
+            if (uiState.ride is RiderState.Idle && activeRideId == null && !uiState.micOpen &&
+                uiState.payment == null && walkMode == WalkMode.NONE
+            ) finishPostRide(null)
+        }
+    }
+
+    /** The post-ride questions are done: say the waiting offer, or just [line]. */
+    private fun finishPostRide(line: String?) {
+        val from = nearbyFrom
+        val fresh = System.currentTimeMillis() - lastRideEndedAt < NEARBY_OFFER_FOR_MS
+        if (!nearbyOfferWaiting || from == null || nearbyPicks.isEmpty() || !fresh) {
+            nearbyOfferWaiting = false
+            if (line != null) endPostRide(line)
+            return
+        }
+        nearbyOfferWaiting = false
+        nearbyFocus = null
+        nearbyReprompted = false
+        if (uiState.ride is RiderState.NextJourney) endPostRide(null)
+        speak(NearbySuggestionAgent.offer(nearbyPicks, from.first, from.second, newHere = true), NarrationTier.QUEUED) {
+            openMic(MicPurpose.NEARBY)
+        }
+    }
+
+    /** "What's famous around here": where the rider is, or the last drop-off. */
+    private fun offerNearby(newHere: Boolean) {
+        nearbyFetchJob?.cancel()
+        nearbyFetchJob = viewModelScope.launch {
+            val fix = riderPosition()
+            val lat = fix?.first ?: lastRidePlace?.latitude
+            val lng = fix?.second ?: lastRidePlace?.longitude
+            if (lat == null || lng == null) {
+                speak("I can't tell where you are. Allow location for Cab Eye, then ask again.", NarrationTier.QUEUED)
+                return@launch
+            }
+            // The map servers can take a while: say so, and keep the wait audible.
+            speak("Looking for well-known places nearby.", NarrationTier.QUEUED)
+            engine.heartbeat(true)
+            val picks = try { fetchNearby(lat, lng, hereName = "") } finally { engine.heartbeat(false) }
+            nearbyPicks = picks
+            nearbyFrom = lat to lng
+            nearbyNear = hereNode(mindMap(), lat, lng)
+            nearbyFocus = null
+            nearbyReprompted = false
+            speak(NearbySuggestionAgent.offer(picks, lat, lng, newHere), NarrationTier.QUEUED) {
+                if (picks.isNotEmpty()) openMic(MicPurpose.NEARBY)
+            }
+        }
+    }
+
+    /**
+     * The neighbourhood a point is in: the phone's own geocoder first (free, on most phones
+     * Google's), then OpenStreetMap through the backend when the phone can't name it — no key
+     * either way. [orCity] lets the phone fall back to the city name, for "what's around here".
+     */
+    private suspend fun areaName(lat: Double, lng: Double, orCity: Boolean = false): String? {
+        // In and around Coimbatore: the bundled atlas — no network, no key.
+        AtlasStore.get(getApplication())?.takeIf { it.covers(lat, lng) }?.let { atlas ->
+            atlas.areaAt(lat, lng)?.let { return it }
+        }
+        areaNamer.areaAt(lat, lng)?.let { return it }
+        (api.placesArea(lat, lng) as? ApiResult.Ok)?.value?.let { return it }
+        return if (orCity) areaNamer.areaAt(lat, lng, orCity = true) else null
+    }
+
+    private suspend fun fetchNearby(lat: Double, lng: Double, hereName: String): List<Pair<NearbyPlace, Double>> {
+        val live = if (BuildConfig.GOOGLE_MAPS_API_KEY.isNotBlank()) {
+            app.placeResolver.searchNearby(lat, lng, NearbySuggestionAgent.RADIUS_M).getOrNull().orEmpty()
+        } else emptyList()
+        val picks = NearbySuggestionAgent.pick(lat, lng, live, hereName)
+        if (picks.isNotEmpty()) return picks
+        // In and around Coimbatore: the bundled atlas of real places — offline, no key.
+        val atlas = AtlasStore.get(getApplication())?.nearby(lat, lng, NearbySuggestionAgent.RADIUS_M).orEmpty()
+        val fromAtlas = NearbySuggestionAgent.pick(lat, lng, atlas, hereName)
+        if (fromAtlas.isNotEmpty()) return fromAtlas
+        // No Google key, or nothing well rated: real places from OpenStreetMap, through the
+        // backend (no key; ranked by what the map says about them).
+        val osm = (api.placesNearby(lat, lng, NearbySuggestionAgent.RADIUS_M.toInt()) as? ApiResult.Ok)?.value.orEmpty()
+        val fromOsm = NearbySuggestionAgent.pick(lat, lng, osm, hereName)
+        if (fromOsm.isNotEmpty()) return fromOsm
+        // Offline: the app's own list of well-known places.
+        val curated = Gazetteer.places.map { NearbyPlace(it.name, it.latitude, it.longitude, curated = true) }
+        return NearbySuggestionAgent.pick(lat, lng, curated, hereName, radiusM = 1_000.0)
+    }
+
+    private fun handleNearbyAnswer(text: String) {
+        val from = nearbyFrom ?: return
+        val picks = nearbyPicks
+        val t = text.lowercase().trim()
+        val guard = mindMapStore.nearbyGuard()
+        // "it", "there", "that one": the place just talked about.
+        val pointed = nearbyFocus?.takeIf { NEARBY_THAT.containsMatchIn(t) }
+        when {
+            NEARBY_MORE.containsMatchIn(t) -> {
+                val about = NearbySuggestionAgent.choose(picks, t)?.let { c -> picks.filter { it.first == c } } ?: picks
+                if (about.size == 1) nearbyFocus = about.single().first
+                speak(
+                    NearbySuggestionAgent.more(about, from.first, from.second) +
+                        (if (about.size == 1) " Say take me there, or remember it." else " Say take me to one, or remember them."),
+                    NarrationTier.QUEUED
+                ) { openMic(MicPurpose.NEARBY) }
+            }
+            NEARBY_REMEMBER.containsMatchIn(t) -> {
+                val chosen = pointed ?: NearbySuggestionAgent.choose(picks, t)
+                val keep = if (chosen != null && !NEARBY_ALL.containsMatchIn(t)) picks.filter { it.first == chosen } else picks
+                val (nodes, edges) = NearbySuggestionAgent.remember(keep, nearbyNear, System.currentTimeMillis())
+                mindMapStore.saveAuthored(withPlace(mindMapStore.authored(), mindMap(), nearbyNear).upsert(nodes, edges))
+                mindMapStore.saveNearbyGuard(guard.copy(declines = 0))
+                endNearby()
+                speak(
+                    "Saved ${MindMapAgent.spokenList(keep.map { it.first.name })} to your mind map. " +
+                        (nearbyNear?.let { "Ask what's around ${it.label} to hear them again." } ?: "Ask what's around here to hear them again."),
+                    NarrationTier.QUEUED
+                )
+            }
+            NEARBY_GO.containsMatchIn(t) -> {
+                val chosen = pointed ?: NearbySuggestionAgent.choose(picks, t) ?: picks.singleOrNull()?.first ?: nearbyFocus
+                if (chosen == null) {
+                    speak("Which one? ${picks.joinToString(", ") { it.first.name }}.", NarrationTier.QUEUED) {
+                        openMic(MicPurpose.NEARBY)
+                    }
+                    return
+                }
+                mindMapStore.saveNearbyGuard(guard.copy(declines = 0))
+                endNearby()
+                bookKnownPlace(chosen.name, chosen.lat, chosen.lng, chosen.placeId, note = "", from = from)
+            }
+            Classifier.classify(text, false).intent is RiderIntent.No || NEARBY_NO.containsMatchIn(t) -> {
+                val declines = guard.declines + 1
+                mindMapStore.saveNearbyGuard(guard.copy(declines = declines))
+                endNearby()
+                speak(
+                    if (declines >= NearbySuggestionAgent.QUIET_AFTER_DECLINES && !guard.off)
+                        "Okay. I won't offer places by myself any more. Ask what's famous around here whenever you like."
+                    else "Okay.", NarrationTier.QUEUED
+                )
+            }
+            else -> {
+                val chosen = NearbySuggestionAgent.choose(picks, t)
+                when {
+                    chosen != null -> {
+                        nearbyFocus = chosen
+                        speak(
+                            NearbySuggestionAgent.more(picks.filter { it.first == chosen }, from.first, from.second) +
+                                " Say take me there, or remember it.", NarrationTier.QUEUED
+                        ) { openMic(MicPurpose.NEARBY) }
+                    }
+                    !nearbyReprompted -> {
+                        nearbyReprompted = true
+                        speak("Say tell me more, take me to one of them, remember them, or no.", NarrationTier.QUEUED) {
+                            openMic(MicPurpose.NEARBY)
+                        }
+                    }
+                    else -> {
+                        endNearby()
+                        speak("Okay. Ask what's famous around here any time.", NarrationTier.QUEUED)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun endNearby() {
+        nearbyOfferWaiting = false
+        nearbyFocus = null
+        nearbyReprompted = false
+        // Never during a ride: the ride screen is not this offer's to change.
+        if (activeRideId == null && uiState.ride !is RiderState.InTrip) transition(RiderState.Idle, announce = false)
+    }
+
+    // ---- the optional free-form reader -------------------------------------------------
+
+    /** The sentence waiting on the consent question, and what to do if it can't be read. */
+    private var interpretPending: Pair<String, () -> Unit>? = null
+    /** A reading the agent was unsure of, waiting for "yes". */
+    private var interpretConfirm: AnchorParser.Anchor? = null
+    /** The server has no Grok key: don't ask again this session. */
+    private var interpretUnavailable = false
+    /** Asked and not answered (silence): not asked again this session, and asked another day. */
+    private var interpretAskedThisSession = false
+
+    /**
+     * The rules didn't understand [text]. With the rider's agreement, one sentence goes to the
+     * server to be read. @return true when the sentence was taken; [fallback] then runs if it
+     * still can't be read. False means "do what you did before".
+     */
+    private fun tryInterpret(text: String, fallback: () -> Unit): Boolean {
+        val t = text.trim().lowercase()
+        if (interpretUnavailable || t.split(Regex("\\s+")).size < 3 || QUESTION_START.containsMatchIn(t)) return false
+        if (!mindMapStore.interpretConsent) {
+            if (mindMapStore.interpretAsked || interpretAskedThisSession) return false
+            interpretAskedThisSession = true
+            interpretPending = text to fallback
+            speak(
+                "I didn't follow that. I can send just that sentence, nothing else, to the Cab Eye server so it can " +
+                    "work out what you meant. Shall I, now and next time?", NarrationTier.QUEUED
+            ) { openMic(MicPurpose.INTERPRET) }
+            return true
+        }
+        runInterpret(text, fallback)
+        return true
+    }
+
+    private fun runInterpret(text: String, fallback: () -> Unit) {
+        // The server may take a few seconds: a sound now, so the wait is never silent.
+        engine.earcon(Earcon.UNDERSTOOD)
+        viewModelScope.launch {
+            val map = mindMap()
+            when (val r = api.interpret(MindMapInterpreter.request(text, map, hereNode(map)))) {
+                is ApiResult.Ok -> when (val reading = MindMapInterpreter.read(r.value, text)) {
+                    is MindMapInterpreter.Reading.Note ->
+                        if (reading.confidence >= MindMapInterpreter.SURE) rememberAnchor(reading.anchor)
+                        else {
+                            interpretConfirm = reading.anchor
+                            speak("Did you mean: ${MindMapAgent.displayLabel(reading.anchor.spoken())}? Say yes to save it.",
+                                NarrationTier.QUEUED) { openMic(MicPurpose.INTERPRET) }
+                        }
+                    is MindMapInterpreter.Reading.Cue -> if (!markRideCue(reading.words)) fallback()
+                    MindMapInterpreter.Reading.Nothing -> fallback()
+                }
+                is ApiResult.Failed -> {
+                    if (r.detail.startsWith("HTTP 404")) interpretUnavailable = true
+                    fallback()
+                }
+            }
+        }
+    }
+
+    private fun handleInterpretAnswer(text: String) {
+        val intent = Classifier.classify(text, false).intent
+        val yes = intent is RiderIntent.Yes
+        val confirm = interpretConfirm
+        if (confirm != null) {
+            interpretConfirm = null
+            if (yes) rememberAnchor(confirm) else speak("Okay, not saved.", NarrationTier.QUEUED)
+            return
+        }
+        val (sentence, fallback) = interpretPending ?: return
+        interpretPending = null
+        // An unclear answer is not consent; it is asked again another day.
+        if (!yes && intent !is RiderIntent.No) {
+            fallback()
+            return
+        }
+        mindMapStore.interpretAsked = true
+        mindMapStore.interpretConsent = yes
+        if (yes) runInterpret(sentence, fallback)
+        else {
+            speak("Okay, I'll keep everything on this phone.", NarrationTier.QUEUED)
+            fallback()
+        }
+    }
+
+    /** Silence to the question: nothing is sent, and a reading is not saved. */
+    private fun interpretNoAnswer() {
+        interpretConfirm = null
+        interpretPending?.second?.invoke()
+        interpretPending = null
+    }
 
     // =================================================================================
     //  After the ride: optional feedback, then the next journey
@@ -4744,10 +5610,10 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                         askDestinationAgain("Where would you like to go?")
                     }
                     NextJourneyChoice.Kind.LATER -> startScheduling(fromIdle = false)
-                    NextJourneyChoice.Kind.DONE -> endPostRide("Okay. Hold anywhere when you need a ride.")
+                    NextJourneyChoice.Kind.DONE -> finishPostRide("Okay. Hold anywhere when you need a ride.")
                     NextJourneyChoice.Kind.NONE -> {
                         postRideMisses++
-                        if (postRideMisses >= 2) endPostRide("I'll wait. Hold anywhere when you need a ride.")
+                        if (postRideMisses >= 2) finishPostRide("I'll wait. Hold anywhere when you need a ride.")
                         else askNext(state, "Say book now, schedule, or done.")
                     }
                 }
@@ -5412,6 +6278,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun endRide(reason: String) {
         stopCamera("RIDE_ENDED")
+        stopRideGuide(save = reason == "completed")
         socket.unsubscribe(reason)
         lastCompletedRideId = activeRideId
         activeRideId = null
@@ -5444,8 +6311,15 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
      * Kept from step 3 and still useful: it is the only way to exercise the six late ride
      * screens with no server, no driver phone and no network — which is exactly the situation
      * on a train to a demo. Guarded by [BuildConfig.DEBUG] so it cannot fire in a release build.
+     *
+     * The trip itself is a simulated ride through the real ride guide: "simulate a ride to
+     * Koniamman Temple" finds the place in the offline atlas, starts from where the phone is
+     * (or Saibaba Colony, outside Coimbatore), and plays made-up GPS along the way — a fix every
+     * 0.7 s standing for 15 s of driving — so cues, area names, "where am I", "almost there" and
+     * the nearby offer can all be heard and tried. Simulate the same ride twice to hear a repeat
+     * ride: the preview, your cues coming up, the usual time.
      */
-    private fun startDemoRide() {
+    private fun startDemoRide(said: String = "") {
         if (!BuildConfig.DEBUG) {
             speak("That command isn't available.", NarrationTier.QUEUED)
             return
@@ -5459,9 +6333,21 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             phoneNumber = "+910000000000",
             rating = 4.8f
         )
-        val destination = Gazetteer.activeCity.places.first().name
 
         demoRideJob = viewModelScope.launch {
+            val atlas = AtlasStore.get(getApplication())
+            val wanted = Regex("\\b(?:ride|mode)\\s+to\\s+(.+)$", RegexOption.IGNORE_CASE).find(said.trim())?.groupValues?.get(1)
+            val here = runCatching { app.locationProvider.current() }.getOrNull()
+            val fromLat = here?.latitude?.takeIf { atlas?.covers(it, here.longitude) == true } ?: DEMO_START.first
+            val fromLng = here?.longitude?.takeIf { atlas?.covers(here.latitude, it) == true } ?: DEMO_START.second
+            val dest: PlaceOption = wanted?.let { atlas?.search(it, fromLat, fromLng)?.firstOrNull { o -> o.score >= MatchGate.CONFIDENCE_FLOOR } }
+                ?: atlas?.search("Coimbatore Junction")?.firstOrNull()
+                ?: Gazetteer.activeCity.places.first().let { PlaceOption(it.name, it.latitude, it.longitude, 1f) }
+            val destination = dest.name
+            if (wanted != null && !dest.name.contains(wanted, ignoreCase = true)) {
+                Log.i(TAG, "DEMO heard=\"$wanted\" using=\"${dest.name}\"")
+            }
+
             transition(RiderState.Finding())
             engine.heartbeat(true)
             delay(2_500)
@@ -5482,12 +6368,38 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             onDriverArrived()
             delay(8_000)
 
-            transition(RiderState.InTrip(destination, etaMinutes = 12, driver = driver))
+            // ---- the trip: synthetic GPS through the real ride guide ----------------------
+            lastBookingPlace = dest
+            val route = SyntheticRide.route(fromLat, fromLng, dest.latitude, dest.longitude, System.currentTimeMillis())
+            val minutes = ((route.last().t - route.first().t) / 60_000).toInt()
+            transition(RiderState.InTrip(destination, etaMinutes = minutes, driver = driver))
+            speak("On the way to $destination. This is a simulated ride, about $minutes minutes, played fast.", NarrationTier.QUEUED)
             engine.heartbeat(true)
-            delay(5_000)
+            startRideGuide(synthetic = true)
+            val guide = rideGuide
+            route.forEachIndexed { i, fix ->
+                delay(DEMO_FIX_MS)
+                if (guide == null || rideGuide !== guide) return@forEachIndexed
+                tripMeters = guide.metres.toInt()
+                guide.onFix(fix.lat, fix.lng, fix.t).forEach(::sayRideGuide)
+                if (i % 4 == 0) areaName(fix.lat, fix.lng)?.let { area -> guide.onArea(area, fix.t)?.let(::sayRideGuide) }
+            }
 
             engine.heartbeat(false)
-            transition(RiderState.Done(destination, fareRupees = 148, durationMinutes = 12))
+            val metres = SyntheticRide.metres(route).toInt()
+            lastRidePlace = dest
+            lastRideEndedAt = System.currentTimeMillis()
+            transition(RiderState.Done(destination, fareRupees = 25 + metres * 15 / 1000, durationMinutes = minutes, distanceMeters = metres))
+            speak("You've arrived. ${spokenDistance(metres, estimate = false)}. Simulated ride, no fare.", NarrationTier.QUEUED)
+            prepareNearbyAfterRide(dest)
+            stopRideGuide(save = true)
+            tripMeters = 0
+            delay(4_000)
+            // No payment or feedback in a simulation: straight to what comes after them.
+            if (uiState.ride is RiderState.Done) {
+                transition(RiderState.Idle, announce = false)
+                finishPostRide(null)
+            }
         }
     }
 
@@ -5567,7 +6479,9 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             "I cover ${Gazetteer.activeCity.displayName}. Say: take me to a place. " +
                     "Or say my places, list places, status, repeat, go back, cancel, call driver, book again, " +
                     "switch city, or yellow theme. To change how I sound, say speak slower, speak faster, " +
-                    "louder, or quieter. A short press on the volume keys also changes the volume.",
+                    "louder, or quieter. A short press on the volume keys also changes the volume. " +
+                    "To teach me places, say remember this as Ravi's tea shop, or ask what's around here. " +
+                    "In the cab, hold the screen and say speed bump, or where am I.",
             NarrationTier.QUEUED
         ) { openMic(MicPurpose.BOOKING) }
     }
@@ -5595,10 +6509,12 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             // The meter is only mentioned once the server has measured something; before that,
             // "zero kilometres" would be a number that means "not known yet".
             is RiderState.InTrip ->
-                if (tripMeters > 0) {
+                (if (tripMeters > 0) {
                     "On the way to ${ride.destination}. ${spokenDistance(tripMeters, estimate = false)} so far" +
                         (if (tripFareSoFar > 0) ", about $tripFareSoFar rupees." else ".")
-                } else "On the way to ${ride.destination}."
+                } else "On the way to ${ride.destination}.") +
+                    // The ride guide's area and, on a ride taken before, the usual time left.
+                    (rideGuide?.briefStatus()?.let { " $it" } ?: "")
             is RiderState.Done -> "That ride is finished."
             is RiderState.Feedback -> "I'm asking about your last ride. Say skip to move on."
             is RiderState.NextJourney -> "Say book now, schedule, or done."
@@ -5610,6 +6526,21 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     private fun handleSpeechError(error: SpeechError) {
         if (micPurpose == MicPurpose.WALK) {
             onWalkNoAnswer()
+            return
+        }
+        if (micPurpose == MicPurpose.NEARBY) {
+            endNearby()
+            return
+        }
+        if (micPurpose == MicPurpose.INTERPRET) {
+            interpretNoAnswer()
+            return
+        }
+        // An ordinary ride: a press with nothing heard answers "where are we", as it always did.
+        if (micPurpose == MicPurpose.TRIP_COMMAND && activeStops.isEmpty() && uiState.ride is RiderState.InTrip &&
+            (error == SpeechError.NO_MATCH || error == SpeechError.NO_SPEECH)
+        ) {
+            speakStatus()
             return
         }
         // Mid-ride stop words: never a reason to leave the ride screen.
@@ -5724,7 +6655,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                 postRideMisses++
                 if (postRideMisses >= 2) {
                     if (micPurpose == MicPurpose.FEEDBACK) finishFeedback(send = true, spokenThanks = false)
-                    else endPostRide("I'll wait. Hold anywhere when you need a ride.")
+                    else finishPostRide("I'll wait. Hold anywhere when you need a ride.")
                 } else {
                     speak("Sorry, I didn't catch that. ${lastSpoken}", NarrationTier.QUEUED) {
                         openMic(micPurpose)
@@ -5738,7 +6669,8 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                 return
             }
 
-            MicPurpose.TRIP_COMMAND, MicPurpose.STOP_CONFIRM, MicPurpose.WALK -> return
+            MicPurpose.TRIP_COMMAND, MicPurpose.STOP_CONFIRM, MicPurpose.WALK, MicPurpose.NEARBY,
+            MicPurpose.INTERPRET -> return
 
             MicPurpose.MEMORY_ANSWER -> {
                 val routine = pendingRoutine
@@ -5805,6 +6737,8 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                 // Back after a dropped connection: pick the meter up from the server.
                 tripMeters = maxOf(tripMeters, snapshot.tripDistanceMeters)
                 if (snapshot.liveFareRupees > 0) tripFareSoFar = snapshot.liveFareRupees
+                // The app was restarted mid-trip: follow the rest of the ride, without the preview.
+                if (snapshot.phase == RidePhase.IN_TRIP && rideGuide == null) startRideGuide(resumed = true)
                 RiderState.InTrip(snapshot.destination, snapshot.etaMinutes, driver, snapshot.stops)
             }
             RidePhase.COMPLETED -> RiderState.Done(

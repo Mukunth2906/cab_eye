@@ -1,0 +1,236 @@
+{
+  "version": 0.6,
+  "generator": "Overpass API 0.7.62.11 87bfad18",
+  "osm3s": {
+    "timestamp_osm_base": "2026-10-11T06:44:20Z",
+    "copyright": "The data included in this document is from www.openstreetmap.org. The data is made available under ODbL."
+  },
+  "elements": [
+
+{
+  "type": "node",
+  "id": 1474413414,
+  "lat": 10.9943793,
+  "lon": 76.9664663,
+  "tags": {
+    "amenity": "hospital",
+    "healthcare": "hospital",
+    "name": "Moses Eye Hospital"
+  }
+},
+{
+  "type": "node",
+  "id": 1474451376,
+  "lat": 11.0026550,
+  "lon": 76.9673756,
+  "tags": {
+    "amenity": "place_of_worship",
+    "denomination": "shaivism",
+    "name": "Koniamaan temple",
+    "religion": "hindu"
+  }
+},
+{
+  "type": "node",
+  "id": 1474490997,
+  "lat": 10.9953044,
+  "lon": 76.9600117,
+  "tags": {
+    "amenity": "place_of_worship",
+    "name": "Amman temple",
+    "religion": "hindu"
+  }
+},
+{
+  "type": "node",
+  "id": 1474730775,
+  "lat": 10.9936861,
+  "lon": 76.9637249,
+  "tags": {
+    "amenity": "place_of_worship",
+    "name": "Koniamman Temple",
+    "religion": "hindu",
+    "wikidata": "Q19806101",
+    "wikipedia": "en:Koniamman Temple, Coimbatore"
+  }
+},
+{
+  "type": "node",
+  "id": 3933476072,
+  "lat": 10.9945526,
+  "lon": 76.9630341,
+  "tags": {
+    "amenity": "place_of_worship",
+    "denomination": "lutheran",
+    "name": "Tamil Evangelical Lutheran Church",
+    "religion": "christian"
+  }
+},
+{
+  "type": "node",
+  "id": 4235065498,
+  "lat": 10.9953065,
+  "lon": 76.9609226,
+  "tags": {
+    "amenity": "place_of_worship",
+    "building": "mosque",
+    "name": "5 Corner Mosque",
+    "religion": "muslim"
+  }
+},
+{
+  "type": "node",
+  "id": 6914937646,
+  "lat": 10.9972817,
+  "lon": 76.9598213,
+  "tags": {
+    "addr:district": "Coimbatore",
+    "addr:full": "297&298, D B Road, R S Puram",
+    "addr:postcode": "641002",
+    "addr:state": "Tamil Nadu",
+    "addr:subdistrict": "Coimbatore South",
+    "amenity": "hospital",
+    "healthcare": "hospital",
+    "name": "Sri Ramana Hospital",
+    "source": "OpenGovernmentData"
+  }
+},
+{
+  "type": "node",
+  "id": 6933038573,
+  "lat": 10.9943683,
+  "lon": 76.9642074,
+  "tags": {
+    "addr:district": "Coimbatore",
+    "addr:full": "37, Ismail Rowther Street",
+    "addr:postcode": "641001",
+    "addr:state": "Tamil Nadu",
+    "amenity": "hospital",
+    "healthcare": "hospital",
+    "name": "Immaculate Conception Convent Hospital",
+    "source": "OpenGovernmentData"
+  }
+},
+{
+  "type": "node",
+  "id": 7257183926,
+  "lat": 10.9958251,
+  "lon": 76.9634777,
+  "tags": {
+    "addr:block": "Coimbatore Corpn",
+    "addr:district": "Coimbatore",
+    "addr:full": "Town Hall, Coimbatore, Ismail Street",
+    "addr:postcode": "641001",
+    "addr:state": "Tamil Nadu",
+    "addr:subdistrict": "Coimbatore South",
+    "amenity": "hospital",
+    "healthcare": "hospital",
+    "name": "I.C.C Hospital For Women & Children, Coimbatore",
+    "source": "OpenGovernmentData"
+  }
+},
+{
+  "type": "node",
+  "id": 12830024797,
+  "lat": 10.9969574,
+  "lon": 76.9683436,
+  "tags": {
+    "name": "Tamil Nadu Police Museum",
+    "tourism": "museum"
+  }
+},
+{
+  "type": "way",
+  "id": 377992179,
+  "center": {
+    "lat": 10.9932946,
+    "lon": 76.9630147
+  },
+  "tags": {
+    "amenity": "college",
+    "name": "Govt.Womens Arts College"
+  }
+},
+{
+  "type": "way",
+  "id": 377993519,
+  "center": {
+    "lat": 10.9964129,
+    "lon": 76.9702365
+  },
+  "tags": {
+    "addr:block": "Coimbatore Corpn",
+    "addr:district": "Coimbatore",
+    "addr:full": "D.No.173, Krishnasamy Road, Near Brookfield Mall, R.S Puram, Brook Band Road",
+    "addr:postcode": "641002",
+    "addr:state": "Tamil Nadu",
+    "addr:subdistrict": "Coimbatore South",
+    "alt_name": "CMC Coimbatore",
+    "amenity": "hospital",
+    "emergency": "yes",
+    "healthcare": "hospital",
+    "name": "Coimbatore Medical College Hospital",
+    "name:ta": "கோவை மருத்துவ கல்லூரி மருத்துவமனை",
+    "source": "OpenGovernmentData",
+    "website": "https://www.cmccbe.ac.in/cmccbe/",
+    "wikidata": "Q5141507",
+    "wikipedia": "en:Coimbatore Medical College"
+  }
+},
+{
+  "type": "way",
+  "id": 405629514,
+  "center": {
+    "lat": 10.9940312,
+    "lon": 76.9629360
+  },
+  "tags": {
+    "building": "yes",
+    "historic": "yes",
+    "man_made": "tower",
+    "name": "Clock Tower",
+    "tourism": "attraction",
+    "tower:type": "clock"
+  }
+},
+{
+  "type": "way",
+  "id": 598058539,
+  "center": {
+    "lat": 11.0001203,
+    "lon": 76.9679121
+  },
+  "tags": {
+    "historic": "monument",
+    "name": "Ashok Pillar"
+  }
+},
+{
+  "type": "relation",
+  "id": 15903695,
+  "center": {
+    "lat": 10.9974912,
+    "lon": 76.9664837
+  },
+  "tags": {
+    "internet_access": "wlan",
+    "landuse": "railway",
+    "name": "Coimbatore Junction",
+    "name:en": "Coimbatore Junction",
+    "name:ml": "കോയമ്പത്തൂർ ജംഗ്ഷൻ",
+    "name:ta": "கோயம்புத்தூர் சந்திப்பு",
+    "network": "IR",
+    "operator": "SR",
+    "public_transport": "station",
+    "railway": "station",
+    "ref": "CBE",
+    "train": "yes",
+    "type": "multipolygon",
+    "wikidata": "Q3532594",
+    "wikimedia_commons": "Category:Coimbatore Junction railway station",
+    "wikipedia": "en:Coimbatore Junction railway station"
+  }
+}
+
+  ]
+}

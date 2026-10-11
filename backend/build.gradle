@@ -78,6 +78,8 @@ tasks.named('test') {
     systemProperty 'cabeye.data.dir', layout.buildDirectory.dir('test-data/default').get().asFile.path
     // ...and never read your real secrets: a test must not log in as you or message your Telegram.
     systemProperty 'cabeye.secrets.file', layout.buildDirectory.file('no-secrets.properties').get().asFile.path
+    // ...and never call OpenStreetMap: OSM tests use answers recorded in src/test/resources/osm.
+    systemProperty 'cabeye.osm.enabled', 'false'
 }
 
 // Make the console output UTF-8 on Windows so log arrows/box characters don't mojibake.

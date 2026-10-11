@@ -44,18 +44,22 @@ object WalkNarrator {
 
     // ---- the whole route ---------------------------------------------------------------
 
-    fun narrate(route: WalkRoute, level: DetailLevel, now: Long): String = buildString {
+    /**
+     * @param notes the rider's own words for landmarks on this route, by landmark id, from the
+     *   mind map ("where you buy bread for Amma") — said after the landmark at FULL and BRIEF.
+     */
+    fun narrate(route: WalkRoute, level: DetailLevel, now: Long, notes: Map<String, String> = emptyMap()): String = buildString {
         val segs = route.segments
         if (segs.isEmpty()) return "I don't have any steps saved for ${route.name}."
         when (level) {
             DetailLevel.FULL -> {
                 append(intro(route))
-                segs.indices.forEach { i -> append(' ').append(segment(route, i, DetailLevel.FULL, now)) }
+                segs.indices.forEach { i -> append(' ').append(segment(route, i, DetailLevel.FULL, now, notes)) }
                 append(' ').append(SAFETY_NOTE)
             }
             DetailLevel.BRIEF -> {
                 append(intro(route)).append(' ')
-                append(segs.mapIndexed { i, s -> briefPart(s, i == segs.lastIndex) }.joinToString("; "))
+                append(segs.mapIndexed { i, s -> briefPart(s, i == segs.lastIndex, notes) }.joinToString("; "))
                 append('.')
                 staleNote(route, now)?.let { append(' ').append(it) }
             }
@@ -67,7 +71,7 @@ object WalkNarrator {
     }.replace(Regex("\\s+"), " ").trim()
 
     /** One stretch, for step-by-step guidance ("say next at the turn"). */
-    fun segment(route: WalkRoute, index: Int, level: DetailLevel, now: Long): String {
+    fun segment(route: WalkRoute, index: Int, level: DetailLevel, now: Long, notes: Map<String, String> = emptyMap()): String {
         val s = route.segments[index]
         val last = index == route.segments.lastIndex
         val parts = mutableListOf<String>()
@@ -79,12 +83,12 @@ object WalkNarrator {
         if (level != DetailLevel.LANDMARKS) {
             for (l in passing) {
                 val where = if (level == DetailLevel.FULL && l.atMetres >= 3) " after about ${roundMetres(l.atMetres)} metres" else ""
-                parts += "You'll pass ${phrase(l)}$where."
+                parts += "You'll pass ${phrase(l)}${note(l, notes)}$where."
             }
         }
         if (s.turn != TurnDirection.NONE) {
             val cue = s.landmarks.lastOrNull { it.isTurnCue }
-            parts += "Then ${s.turn.spoken}" + (cue?.let { " ${at(it)} ${phrase(it, withSide = false)}" } ?: "") + "."
+            parts += "Then ${s.turn.spoken}" + (cue?.let { " ${at(it)} ${phrase(it, withSide = false)}${note(it, notes)}" } ?: "") + "."
         }
         if (last) {
             val end = s.landmarks.lastOrNull { it.kind in ENDINGS }
@@ -109,12 +113,12 @@ object WalkNarrator {
         return "${route.name.replaceFirstChar { it.uppercase() }}, from $from: about $total metres, $turnText."
     }
 
-    private fun briefPart(s: Segment, last: Boolean): String {
+    private fun briefPart(s: Segment, last: Boolean, notes: Map<String, String> = emptyMap()): String {
         val d = "about ${roundMetres(s.metres)} metres"
         val cue = s.landmarks.lastOrNull { it.isTurnCue }
         return when {
             s.turn != TurnDirection.NONE ->
-                "$d, then ${s.turn.spoken.removePrefix("turn ")}" + (cue?.let { " ${at(it)} ${phrase(it, withSide = false)}" } ?: "")
+                "$d, then ${s.turn.spoken.removePrefix("turn ")}" + (cue?.let { " ${at(it)} ${phrase(it, withSide = false)}${note(it, notes)}" } ?: "")
             last -> {
                 val end = s.landmarks.lastOrNull { it.kind in ENDINGS }
                 if (end != null) "$d to ${phrase(end)}" else d
@@ -138,6 +142,8 @@ object WalkNarrator {
         }
         return parts.joinToString(", ")
     }
+
+    private fun note(l: Landmark, notes: Map<String, String>): String = notes[l.id]?.let { ", $it" } ?: ""
 
     /** "at the kerb" for things you reach, "after the bakery smell" for things you pass. */
     private fun at(l: Landmark): String = when (l.kind) {

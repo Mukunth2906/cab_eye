@@ -100,13 +100,20 @@ object Gazetteer {
             }
             .maxByOrNull { it.second.score }
 
-    private fun scoreIn(city: City, spokenDestination: String): List<PlaceOption> {
+    private fun scoreIn(city: City, spokenDestination: String): List<PlaceOption> =
+        scorePlaces(city.places, spokenDestination, city.displayName)
+
+    /**
+     * The same scoring over any list of places — used for the offline Coimbatore atlas, so its
+     * thousands of real places are judged by exactly the rules [MatchGate] is calibrated for.
+     */
+    fun scorePlaces(places: List<Place>, spokenDestination: String, cityName: String): List<PlaceOption> {
         val query = normalise(spokenDestination)
         if (query.isBlank()) return emptyList()
 
         val queryWords = query.split(" ").filter { it.isNotBlank() }
 
-        return city.places.map { place ->
+        return places.map { place ->
             val forms = (place.aliases + place.name).map { normalise(it) }.distinct()
 
             // Take the best-scoring alias, and carry that alias's own token-coverage verdict
@@ -123,7 +130,7 @@ object Gazetteer {
                 longitude = place.longitude,
                 score = best.score,
                 coversWholeToken = best.coversWholeToken,
-                cityName = city.displayName
+                cityName = cityName
             )
         }
             .filter { it.score >= NEAR_MISS_FLOOR }
@@ -140,6 +147,9 @@ object Gazetteer {
     private data class FormMatch(val score: Float, val coversWholeToken: Boolean)
 
     private fun scoreForm(query: String, queryWords: List<String>, form: String): FormMatch {
+        // A name with no Latin letters normalises to nothing — and "nothing" is contained in
+        // every query. It must match nothing instead.
+        if (form.isBlank()) return FormMatch(0f, false)
         if (query == form) return FormMatch(1.0f, true)
 
         val formWords = form.split(" ").filter { it.isNotBlank() }

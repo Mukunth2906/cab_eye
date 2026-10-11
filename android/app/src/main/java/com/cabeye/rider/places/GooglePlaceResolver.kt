@@ -3,6 +3,7 @@ package com.cabeye.rider.places
 import android.content.Context
 import android.location.Location
 import android.util.Log
+import com.cabeye.rider.mindmap.NearbyPlace
 import com.cabeye.rider.state.PlaceOption
 import com.google.android.gms.common.api.ApiException
 import com.google.android.gms.maps.model.LatLng
@@ -11,6 +12,7 @@ import com.google.android.libraries.places.api.model.CircularBounds
 import com.google.android.libraries.places.api.model.Place
 import com.google.android.libraries.places.api.net.PlacesClient
 import com.google.android.libraries.places.api.net.SearchByTextRequest
+import com.google.android.libraries.places.api.net.SearchNearbyRequest
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 
@@ -153,6 +155,53 @@ class GooglePlaceResolver(context: Context) {
             }
         }
 
+    /**
+     * Well-known places around a point, most popular first — for "what's famous around here"
+     * and the offer after a ride to somewhere new. Nearby Search (New) on the same client and
+     * key; the key must allow "Places API (New)". A failure returns an empty list and the
+     * caller falls back to the gazetteer.
+     */
+    suspend fun searchNearby(latitude: Double, longitude: Double, radiusMetres: Double): Result<List<NearbyPlace>> {
+        if (!Places.isInitialized()) return Result.failure(IllegalStateException("Places SDK not initialized"))
+        return suspendCoroutine { continuation ->
+            val fields = listOf(
+                Place.Field.ID, Place.Field.DISPLAY_NAME, Place.Field.LOCATION, Place.Field.TYPES,
+                Place.Field.RATING, Place.Field.USER_RATING_COUNT
+            )
+            val request = SearchNearbyRequest.builder(
+                CircularBounds.newInstance(LatLng(latitude, longitude), radiusMetres), fields
+            )
+                .setIncludedTypes(NEARBY_TYPES)
+                .setMaxResultCount(NEARBY_MAX)
+                .setRankPreference(SearchNearbyRequest.RankPreference.POPULARITY)
+                .build()
+            Log.i(TAG, "PLACE_NEARBY radius=${radiusMetres.toInt()} types=${NEARBY_TYPES.size}")
+            try {
+                placesClient.searchNearby(request)
+                    .addOnSuccessListener { response ->
+                        val out = response.places.mapNotNull { p ->
+                            val point = p.location ?: return@mapNotNull null
+                            val name = p.displayName?.trim().orEmpty().ifBlank { return@mapNotNull null }
+                            NearbyPlace(
+                                name = name, lat = point.latitude, lng = point.longitude,
+                                types = runCatching { p.placeTypes.orEmpty() }.getOrDefault(emptyList()),
+                                rating = p.rating, ratings = p.userRatingCount ?: 0, placeId = p.id.orEmpty()
+                            )
+                        }
+                        Log.i(TAG, "PLACE_NEARBY success count=${out.size}")
+                        continuation.resume(Result.success(out))
+                    }
+                    .addOnFailureListener { error ->
+                        logFailure("nearby", error)
+                        continuation.resume(Result.failure(error))
+                    }
+            } catch (t: Throwable) {
+                logFailure("nearby", t)
+                continuation.resume(Result.failure(t))
+            }
+        }
+    }
+
     /** Never logs the API key. Only Google's own status code and message. */
     private fun logFailure(query: String, error: Throwable) {
         val code = (error as? ApiException)?.statusCode
@@ -230,6 +279,14 @@ class GooglePlaceResolver(context: Context) {
         const val MAX_RESULTS = 5
         const val REGION_CODE = "IN"
         const val SEARCH_BIAS_RADIUS_METRES = 25_000.0
+
+        const val NEARBY_MAX = 10
+
+        /** Places API (New) Table A types a visitor would call well known. */
+        val NEARBY_TYPES = listOf(
+            "tourist_attraction", "hindu_temple", "church", "mosque", "museum", "park",
+            "shopping_mall", "hospital", "train_station", "bus_station"
+        )
 
         /** Google's own type names for "this is a stretch of road, not an address". */
         val ROAD_TYPES = setOf("route", "street_address", "intersection")
