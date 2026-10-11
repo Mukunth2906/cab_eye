@@ -153,12 +153,12 @@ class RideSocket(
      * evict real ones from [seenEventIds] and let a replay repeat something. Only the newest
      * picture matters, so this keeps one and drops the rest.
      */
-    private val _frames = MutableSharedFlow<String>(
+    private val _frames = MutableSharedFlow<CameraFrame>(
         replay = 0,
         extraBufferCapacity = 1,
         onBufferOverflow = BufferOverflow.DROP_OLDEST
     )
-    val frames: Flow<String> = _frames.asSharedFlow()
+    val frames: Flow<CameraFrame> = _frames.asSharedFlow()
 
     private val _state = MutableStateFlow<ConnectionState>(ConnectionState.Idle)
     val state: StateFlow<ConnectionState> = _state.asStateFlow()
@@ -351,7 +351,7 @@ class RideSocket(
             // A camera picture: straight to [frames], never through de-duplication or seq.
             if (event.type == RideEventType.CAMERA_FRAME) {
                 val jpeg = event.string("jpeg")
-                if (jpeg.isNotEmpty()) _frames.tryEmit(jpeg)
+                if (jpeg.isNotEmpty()) _frames.tryEmit(CameraFrame(jpeg, CameraFrame.labels(text)))
                 return
             }
 
@@ -458,12 +458,26 @@ class RideSocket(
      *
      * @return true when the frame was handed to the socket
      */
-    fun sendFrame(jpegBase64: String, n: Int): Boolean {
+    /**
+     * @param labels what the rider's phone detected in this picture, so the driver sees the same
+     *   things the rider hears ({label, box:[left, top, right, bottom] 0..1, clock})
+     */
+    fun sendFrame(jpegBase64: String, n: Int, labels: List<com.cabeye.rider.vision.SceneObject> = emptyList()): Boolean {
         val ws = socket ?: return false
         if (ws.queueSize() > MAX_FRAME_BACKLOG_BYTES) return false
+        val payload = org.json.JSONObject().put("jpeg", jpegBase64).put("n", n)
+        if (labels.isNotEmpty()) {
+            payload.put("labels", org.json.JSONArray().also { a ->
+                labels.take(8).forEach { o ->
+                    val b = o.box ?: return@forEach
+                    a.put(org.json.JSONObject().put("label", o.label.take(30)).put("clock", o.clock)
+                        .put("box", org.json.JSONArray().put(b.left.toDouble()).put(b.top.toDouble()).put(b.right.toDouble()).put(b.bottom.toDouble())))
+                }
+            })
+        }
         val json = org.json.JSONObject()
             .put("type", RideEventType.CAMERA_FRAME.name)
-            .put("payload", org.json.JSONObject().put("jpeg", jpegBase64).put("n", n))
+            .put("payload", payload)
         return runCatching { ws.send(json.toString()) }.getOrDefault(false)
     }
 
@@ -473,5 +487,28 @@ class RideSocket(
             .put("type", type)
             .put("payload", org.json.JSONObject(payload))
         return runCatching { ws.send(json.toString()) }.getOrDefault(false)
+    }
+}
+
+
+/** One picture from the rider's camera, as the driver receives it, with what the rider's phone saw in it. */
+data class CameraFrame(val jpeg: String, val labels: List<com.cabeye.rider.vision.SceneObject> = emptyList()) {
+    companion object {
+        /** The labels inside a raw CAMERA_FRAME message, or none. */
+        fun labels(raw: String): List<com.cabeye.rider.vision.SceneObject> = runCatching {
+            val a = org.json.JSONObject(raw).optJSONObject("payload")?.optJSONArray("labels") ?: return emptyList()
+            (0 until a.length()).mapNotNull { i ->
+                val o = a.optJSONObject(i) ?: return@mapNotNull null
+                val b = o.optJSONArray("box") ?: return@mapNotNull null
+                if (b.length() != 4) return@mapNotNull null
+                com.cabeye.rider.vision.SceneObject(
+                    label = o.optString("label").take(30),
+                    box = com.cabeye.rider.vision.Box(
+                        b.optDouble(0).toFloat(), b.optDouble(1).toFloat(), b.optDouble(2).toFloat(), b.optDouble(3).toFloat()
+                    ),
+                    clock = o.optString("clock")
+                )
+            }
+        }.getOrDefault(emptyList())
     }
 }

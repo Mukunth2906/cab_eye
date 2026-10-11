@@ -36,7 +36,12 @@ enum class NodeKind {
     /** A neighbourhood ("Gandhipuram"), learned on rides. */
     AREA,
     /** Something felt or heard on a ride ("the flyover", "speed bump near the school"). */
-    RIDE_CUE
+    RIDE_CUE,
+    /**
+     * Something the rider's camera saw while exploring on foot ("a bench", "steps"): where, which
+     * way they faced, when, and how many times since.
+     */
+    OBSERVED
 }
 
 enum class EdgeKind {

@@ -557,6 +557,26 @@ class RideApi(private val settings: AppSettings, private val auth: AuthStore) {
         call(post("${base()}/me/mindmap/interpret", body))
 
     /**
+     * "What's in front of me", read by Gemini on the backend. Failed with "HTTP 404" when the
+     * backend has no Gemini key (the phone then uses its own detector).
+     *
+     * @param mode DESCRIBE, FIND or READ
+     */
+    suspend fun visionDescribe(jpegBase64: String, mode: String, target: String = ""): ApiResult<com.cabeye.rider.vision.Scene> {
+        val body = JSONObject().put("image", jpegBase64).put("mode", mode)
+        if (target.isNotBlank()) body.put("target", target)
+        return when (val r = call(post("${base()}/me/vision/describe", body), slow = true)) {
+            is ApiResult.Ok -> runCatching {
+                com.cabeye.rider.vision.Scene.fromServer(JSONObject(r.value), System.currentTimeMillis())
+            }.fold(
+                onSuccess = { ApiResult.Ok(it) },
+                onFailure = { ApiResult.Failed("The server sent something I couldn't read.", it.toString()) }
+            )
+            is ApiResult.Failed -> r
+        }
+    }
+
+    /**
      * The area a point is in ("RS Puram"), from OpenStreetMap through the backend — no key.
      * Ok(null) when it can't be named; Failed when the server is off or unreachable.
      */
@@ -572,6 +592,10 @@ class RideApi(private val settings: AppSettings, private val auth: AuthStore) {
             is ApiResult.Ok -> ApiResult.Ok(com.cabeye.rider.mindmap.NearbyJson.osm(r.value))
             is ApiResult.Failed -> r
         }
+
+    /** Forgets one remembered ride destination (its place key, e.g. "demo-kgh"). */
+    suspend fun forgetPlace(key: String): ApiResult<String> =
+        call(Request.Builder().url("${base()}/me/memory/places?key=" + java.net.URLEncoder.encode(key, "UTF-8")).delete().build())
 
     suspend fun forgetMemory(): ApiResult<String> =
         call(Request.Builder().url("${base()}/me/memory").delete().build())
@@ -649,11 +673,20 @@ class RideApi(private val settings: AppSettings, private val auth: AuthStore) {
                             return
                         }
                         Log.w(TAG, "${request.method} ${request.url} -> ${it.code} $body")
-                        val spoken = when (it.code) {
-                            404 -> "That ride no longer exists."
-                            409 -> "The server refused that. Something has to happen first."
-                            in 500..599 -> "The server had a problem."
-                            else -> "The server refused that request."
+                        val spoken = when {
+                            // ngrok answers for a tunnel that is no longer running. Found in use:
+                            // a driver signing in heard "that ride no longer exists".
+                            body.contains("ERR_NGROK") ->
+                                "The server address ${request.url.host} is offline. Start the tunnel again, " +
+                                    "or change the backend address in settings."
+                            it.code == 404 && request.url.encodedPath.contains("/rides/") -> "That ride no longer exists."
+                            it.code == 404 ->
+                                "The server doesn't recognise that request. Check the backend address in settings."
+                            else -> when (it.code) {
+                                409 -> "The server refused that. Something has to happen first."
+                                in 500..599 -> "The server had a problem."
+                                else -> "The server refused that request."
+                            }
                         }
                         continuation.resume(ApiResult.Failed(spoken, "HTTP ${it.code}: ${body.take(200)}"))
                     }
@@ -663,19 +696,30 @@ class RideApi(private val settings: AppSettings, private val auth: AuthStore) {
     }
 }
 
-/** `/auth/otp` reply. [devCode] is present only while the backend runs in mock-OTP mode. */
+/**
+ * `/auth/otp` reply.
+ *
+ * @param texted true when the backend sent a real SMS; the code must then be read from the
+ *   message (SMS User Consent) or said by the rider
+ * @param devCode present only when the code was not texted (no SMS provider set up on the
+ *   backend), together with [devMessage], the exact text an SMS would have carried
+ */
 data class OtpSent(
     val sent: Boolean,
     val expiresInSeconds: Int,
     val registered: Boolean,
-    val devCode: String?
+    val devCode: String?,
+    val texted: Boolean = false,
+    val devMessage: String = ""
 ) {
     companion object {
         fun parse(o: JSONObject) = OtpSent(
             sent = o.optBoolean("sent", false),
             expiresInSeconds = o.optInt("expiresInSeconds", 300),
             registered = o.optBoolean("registered", false),
-            devCode = o.optString("devCode", "").ifBlank { null }
+            devCode = o.optString("devCode", "").ifBlank { null },
+            texted = o.optString("delivery", "") == "sms",
+            devMessage = o.optString("devMessage", "")
         )
     }
 }

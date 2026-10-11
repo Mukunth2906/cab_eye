@@ -121,7 +121,9 @@ fun buildCustomActions(
     onStopCamera: () -> Unit = {},
     onCodeConfirmed: () -> Unit = {},
     onCallDriver: () -> Unit = {},
-    onHelp: () -> Unit = {}
+    onHelp: () -> Unit = {},
+    onOpenExplore: (() -> Unit)? = null,
+    onOpenMindMap: (() -> Unit)? = null
 ): List<CustomAccessibilityAction> {
     val actions = mutableListOf<CustomAccessibilityAction>()
 
@@ -138,6 +140,10 @@ fun buildCustomActions(
     when (val ride = uiState.ride) {
         is RiderState.Idle -> {
             actions += CustomAccessibilityAction("Help and spoken instructions") { onHelp(); true }
+            // What the double tap (explore) and volume down three times (mind map) do, for
+            // TalkBack, which keeps double taps for itself.
+            onOpenExplore?.let { open -> actions += CustomAccessibilityAction("Open explore") { open(); true } }
+            onOpenMindMap?.let { open -> actions += CustomAccessibilityAction("Open my mind map") { open(); true } }
         }
         is RiderState.Clarify -> {
             if (ride.isNearMiss) {

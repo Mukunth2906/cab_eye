@@ -274,8 +274,8 @@ Write-Host '     - Accept the microphone permission when the app opens.' -Foregr
 Write-Host '     - Press and HOLD anywhere, then say where you want to go.' -ForegroundColor Gray
 Write-Host ''
 Write-Host '   For the driver side, on a second phone:' -ForegroundColor White
-Write-Host '     - Tap the small dot at the TOP RIGHT five times' -ForegroundColor Gray
-Write-Host '     - Settings -> DRIVER -> Done -> GO ONLINE' -ForegroundColor Gray
+Write-Host '     - Tap Settings at the TOP RIGHT' -ForegroundColor Gray
+Write-Host '     - DRIVER -> GO ONLINE' -ForegroundColor Gray
 Write-Host ''
 Write-Host '  ---------------------------------------------------------------------' -ForegroundColor Yellow
 Write-Host '   KEEP THIS WINDOW AND THE TWO IT OPENED RUNNING.' -ForegroundColor Yellow

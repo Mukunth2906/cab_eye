@@ -57,8 +57,15 @@ object RecoveryLadder {
     /** After this rung the app stops escalating and rests. */
     const val MAX_RUNG = 3
 
-    /** How long an open microphone may hear nothing before the app checks in. Brief: 8 s. */
-    const val SILENCE_TIMEOUT_MS = 8_000L
+    /**
+     * How long an open microphone may hear nothing before the app checks in: 14 s.
+     *
+     * A backstop. The recogniser session itself waits 10 s for the rider to begin speaking
+     * (see `ListenOptions`) and reports "nothing heard", which the recovery ladder answers
+     * first; this catches a recogniser that never reports anything. It was 8 s, which cut off
+     * riders who took a moment to think before naming a place.
+     */
+    const val SILENCE_TIMEOUT_MS = 14_000L
 
     /** How many place names to speak at a time, so the list stays interruptible. */
     const val PLACES_PER_GROUP = 5
@@ -173,7 +180,7 @@ object RecoveryLadder {
      * and knows the exact word that wakes it. This is the one place in the whole design where
      * the app says something and does not then listen — and it says so.
      */
-    const val SILENCE_REST = "I'll wait. Say 'hello' when you're ready."
+    const val SILENCE_REST = "I'll wait. Hold the screen, or a volume button, when you're ready."
 
     // =================================================================================
     //  list places

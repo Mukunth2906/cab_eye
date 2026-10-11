@@ -65,6 +65,9 @@ class DriverAccountViewModel(application: Application) : AndroidViewModel(applic
     var ui by mutableStateOf(DriverAccountUi())
         private set
 
+    /** Set by the Activity: waits for the code's text message and hands back the code. */
+    var smsCodeRequest: (((String) -> Unit) -> Unit)? = null
+
     private companion object {
         const val TAG = "CabEye.DriverAccount"
     }
@@ -125,14 +128,31 @@ class DriverAccountViewModel(application: Application) : AndroidViewModel(applic
         viewModelScope.launch {
             ui = when (val result = api.sendOtp(phone, AppRole.DRIVER)) {
                 is ApiResult.Ok -> {
-                    val auto = result.value.devCode
+                    val sent = result.value
+                    val auto = sent.devCode
+                    if (auto != null) {
+                        // No SMS provider on the backend: shown as the incoming message would be.
+                        com.cabeye.rider.auth.CodeNotifier.show(
+                            getApplication(), sent.devMessage.ifBlank { "Your Cab Eye code is $auto." }
+                        )
+                    } else {
+                        // A real text: read the code from it (one tap on Allow) and sign in.
+                        smsCodeRequest?.invoke { code ->
+                            viewModelScope.launch {
+                                if (ui.step == DriverAccountStep.CODE && !ui.busy) {
+                                    onCodeChange(code)
+                                    verify()
+                                }
+                            }
+                        }
+                    }
                     ui.copy(
                         step = DriverAccountStep.CODE,
                         phone = phone,
                         code = auto ?: "",
                         busy = false,
-                        message = if (auto != null) "Test mode: the code was filled in for you."
-                        else "Enter the six digit code sent to your phone."
+                        message = if (auto != null) "Code received (demo delivery — no SMS provider set up). Tap Verify."
+                        else "We texted a six digit code to your phone. Tap Allow when asked and it fills in, or type it."
                     )
                 }
                 is ApiResult.Failed -> if (result.detail.startsWith("HTTP 429")) {

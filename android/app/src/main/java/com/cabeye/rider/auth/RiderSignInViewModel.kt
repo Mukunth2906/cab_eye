@@ -14,6 +14,7 @@ import com.cabeye.rider.net.ApiResult
 import com.cabeye.rider.net.AppRole
 import com.cabeye.rider.net.isUnauthorized
 import com.cabeye.rider.security.BiometricGate
+import com.cabeye.rider.speech.ListenOptions
 import com.cabeye.rider.speech.SpeechError
 import com.cabeye.rider.speech.SpeechInputListener
 import kotlinx.coroutines.Dispatchers
@@ -34,7 +35,7 @@ enum class SignInStep {
     CONFIRM_PHONE,
     /** Talking to the server. */
     SENDING,
-    /** "Say the six digit code." Only reached when the code could not be read automatically. */
+    /** Waiting for the code: read from the text message, or said by the rider. */
     ASK_CODE,
     VERIFYING,
     /** First sign-in only: "What should I call you?" */
@@ -49,6 +50,11 @@ enum class SignInStep {
  *   were spoken, so a helper and the rider are never looking at different instructions
  * @param heard the digits or name currently being confirmed, for the helper to check
  * @param typedFallback which kind of text the helper field accepts on this step, or null
+ * @param phoneSoFar digits of the number collected so far, while it is still being said
+ * @param phone the number the code was sent to
+ * @param code the code as it is filled in, digit by digit
+ * @param smsPreview the text message carrying the code, shown as it arrived
+ * @param smsTexted true when a real text message was sent and is being waited for
  */
 data class SignInUi(
     val step: SignInStep = SignInStep.CHECKING,
@@ -56,7 +62,12 @@ data class SignInUi(
     val heard: String = "",
     val micOpen: Boolean = false,
     val partial: String = "",
-    val typedFallback: TypedField? = null
+    val typedFallback: TypedField? = null,
+    val phoneSoFar: String = "",
+    val phone: String = "",
+    val code: String = "",
+    val smsPreview: String = "",
+    val smsTexted: Boolean = false
 )
 
 enum class TypedField { PHONE, CODE, NAME }
@@ -70,20 +81,24 @@ enum class TypedField { PHONE, CODE, NAME }
  *        │ no
  *        ▼
  *  "Say your ten digit number" ─▶ read back in two groups ─▶ yes ─▶ code sent
- *        ▲                                   │ no                      │
- *        └───────────────────────────────────┘          read automatically (mock / SMS)
- *                                                        or "say the code"
+ *        ▲      (short? "say the rest")       │ no                   │
+ *        └────────────────────────────────────┘     read from the SMS, shown as an incoming
+ *                                                    message (no SMS provider), or said
  *                                                                      ▼
  *                                   new account? ─▶ "What should I call you?" ─▶ DONE
  * ```
  * "Skip" is honoured at every step: a rider must never be trapped in sign-in to get a cab.
  *
- * ## Rules carried over from the ride surface
+ * ## Heard once, understood once
+ *  - The microphone stays open through pauses (see [ListenOptions]): a number said in two
+ *    breaths arrives as one answer, and the answer ends as soon as all ten digits are in.
+ *  - A number that comes through short is never thrown away: "I have 9 8 7 6 5. 4 3. Say the
+ *    last three." The rider only ever says the part that is missing.
  *  - The microphone is never open while the app is speaking; every question reopens it from
  *    the narrator's `onDone`.
  *  - Every failure is spoken and says what to do next. Three misses in a row and the app stops
  *    asking and says how to resume, rather than looping.
- *  - Numbers are read back in groups of five, never as one token a TTS engine would read as
+ *  - Numbers are read back in groups, never as one token a TTS engine would read as
  *    "nine billion…".
  */
 class RiderSignInViewModel(application: Application) : AndroidViewModel(application) {
@@ -100,31 +115,52 @@ class RiderSignInViewModel(application: Application) : AndroidViewModel(applicat
     /** Set by the Activity: shows the system fingerprint / screen-lock prompt. */
     var unlockRequest: ((String, (BiometricGate.Result) -> Unit) -> Unit)? = null
 
+    /** Set by the Activity: waits for the code's text message and hands back the code. */
+    var smsCodeRequest: (((String) -> Unit) -> Unit)? = null
+
+    /** Set by the Activity: stops waiting for the text message. */
+    var smsCodeCancel: (() -> Unit)? = null
+
+    /**
+     * Whether the microphone may be used. When it is granted while a question is waiting —
+     * the permission dialog is usually still up when the first question finishes — the
+     * question is asked again and the microphone opens, instead of the app going quiet.
+     */
     var micPermissionGranted: Boolean = false
+        set(value) {
+            val was = field
+            field = value
+            if (value && !was && waitingForPermission) {
+                waitingForPermission = false
+                if (listensOn(ui.step)) speakThenListen(ui.prompt)
+            }
+        }
+
+    private var waitingForPermission = false
 
     private var phone: String = ""
+    private var phoneSoFar: String = ""
     private var pendingName: String = ""
     private var account: AccountInfo? = null
     private var misses = 0
-
-    /**
-     * Two-part number entry. After a full number is misheard, the rider says the first five
-     * digits and then the last five: short groups are recognised far more reliably than ten
-     * digits in one breath.
-     */
-    private var phoneInParts = false
-    private var phoneFirstPart: String? = null
     private var micOpenedAt = 0L
     private var reopenJob: Job? = null
     private var silenceJob: Job? = null
+    private var startJob: Job? = null
 
     private companion object {
         const val TAG = "CabEye.SignIn"
         const val MAX_MISSES = 3
-        const val MIC_REOPEN_GAP_MS = 900L
         const val MIN_CAPTURE_BEFORE_STOP_MS = 900L
-        const val SILENCE_TIMEOUT_MS = 9_000L
+
+        /**
+         * Backstop only. The recogniser session itself waits [ListenOptions.startTimeoutMs] for
+         * the rider to begin and reports NO_SPEECH; this catches a recogniser that never
+         * reports anything at all.
+         */
+        const val SILENCE_TIMEOUT_MS = 18_000L
         const val AUDIO_WAIT_MS = 6_000L
+        const val CODE_FILL_STEP_MS = 140L
     }
 
     // =================================================================================
@@ -135,6 +171,7 @@ class RiderSignInViewModel(application: Application) : AndroidViewModel(applicat
     fun start() {
         if (ui.step != SignInStep.CHECKING && ui.step != SignInStep.DONE) return
         reset()
+        ui = ui.copy(prompt = "Starting Cab Eye…")
         // On a cold start the text-to-speech engine is still initialising, and a sentence
         // spoken before it is ready is dropped. For a blind rider the first sentence is the
         // only explanation of what is happening, so wait for the voice (up to 6 s) first.
@@ -145,8 +182,6 @@ class RiderSignInViewModel(application: Application) : AndroidViewModel(applicat
             begin()
         }
     }
-
-    private var startJob: Job? = null
 
     private fun begin() {
         if (store.riderIsGuest) {
@@ -169,17 +204,16 @@ class RiderSignInViewModel(application: Application) : AndroidViewModel(applicat
 
         ask(
             SignInStep.ASK_PHONE,
-            "Welcome to Cab Eye. I'll sign you in with your mobile number, so your trips and " +
-                "favourite places are remembered. Say your ten digit number now. " +
-                "Or say skip to continue without signing in.",
+            "Welcome to Cab Eye. To sign in, hold the screen, or a volume button, and say your ten " +
+                "digit mobile number. Keep holding until you finish. Or hold and say skip to continue " +
+                "without signing in.",
             typed = TypedField.PHONE
         )
     }
 
     private fun reset() {
-        phoneInParts = false
-        phoneFirstPart = null
         phone = ""
+        phoneSoFar = ""
         pendingName = ""
         account = null
         misses = 0
@@ -197,7 +231,7 @@ class RiderSignInViewModel(application: Application) : AndroidViewModel(applicat
             // A press while waiting on the fingerprint means "show me the prompt again".
             SignInStep.UNLOCK -> requestUnlock()
             SignInStep.SENDING, SignInStep.VERIFYING, SignInStep.DONE, SignInStep.CHECKING -> Unit
-            else -> openMic()
+            else -> openMic(byPress = true)
         }
     }
 
@@ -221,6 +255,8 @@ class RiderSignInViewModel(application: Application) : AndroidViewModel(applicat
         stt?.cancel()
         closeMic()
         engine.stopSpeaking()
+        // A typed number is the whole number, never "the rest" of a half-heard one.
+        if (ui.step == SignInStep.ASK_PHONE) setPhoneSoFar("")
         handle(text)
     }
 
@@ -229,6 +265,40 @@ class RiderSignInViewModel(application: Application) : AndroidViewModel(applicat
         stt?.cancel()
         closeMic()
         skip()
+    }
+
+    /** "Start the number again" button: clears the digits collected so far. */
+    fun onClearNumber() {
+        stt?.cancel()
+        closeMic()
+        engine.stopSpeaking()
+        setPhoneSoFar("")
+        misses = 0
+        ask(SignInStep.ASK_PHONE, "Okay, cleared. Say your ten digit mobile number.", typed = TypedField.PHONE)
+    }
+
+    /** "Send the code again" button. */
+    fun onResend() {
+        if (phone.isBlank()) return
+        stt?.cancel()
+        closeMic()
+        engine.stopSpeaking()
+        sendCode()
+    }
+
+    /** The code was read from the incoming text message. */
+    fun onSmsCode(code: String) {
+        if (ui.step != SignInStep.ASK_CODE && ui.step != SignInStep.SENDING) return
+        Log.i(TAG, "CODE read from text message")
+        reopenJob?.cancel()
+        stt?.cancel()
+        closeMic()
+        engine.stopSpeaking()
+        viewModelScope.launch {
+            fillCode(code)
+            speak("Code received from your messages. Checking it.")
+            verify(code)
+        }
     }
 
     /**
@@ -269,19 +339,24 @@ class RiderSignInViewModel(application: Application) : AndroidViewModel(applicat
         }
 
         when (ui.step) {
-            SignInStep.ASK_PHONE -> hearPhone(text)
+            SignInStep.ASK_PHONE -> when {
+                kind == SignInCommands.Kind.BACK && SpokenNumbers.digits(text).isEmpty() -> onClearNumber()
+                else -> hearPhone(text)
+            }
 
             SignInStep.CONFIRM_PHONE -> {
                 // A fresh ten-digit number here is a correction, not a yes or no.
                 val corrected = SpokenNumbers.mobileNumber(text)
                 when {
-                    corrected != null && corrected != phone -> hearPhone(text)
+                    corrected != null && corrected != phone -> confirmPhone(corrected)
                     kind == SignInCommands.Kind.YES -> sendCode()
                     kind == SignInCommands.Kind.NO || kind == SignInCommands.Kind.BACK -> {
-                        // Misheard once already: go straight to the easier two-part entry.
-                        phoneInParts = true
-                        phoneFirstPart = null
-                        ask(SignInStep.ASK_PHONE, "Okay. Let's do it in two parts. Say the first five digits.", typed = TypedField.PHONE)
+                        setPhoneSoFar("")
+                        ask(
+                            SignInStep.ASK_PHONE,
+                            "Okay. Say your ten digit number again. You can pause between the digits; I'll wait.",
+                            typed = TypedField.PHONE
+                        )
                     }
                     else -> miss("Say yes if ${SpokenNumbers.speakable(phone)} is right, or no to say it again.")
                 }
@@ -290,10 +365,13 @@ class RiderSignInViewModel(application: Application) : AndroidViewModel(applicat
             SignInStep.ASK_CODE -> {
                 val code = SpokenNumbers.otp(text)
                 when {
-                    code != null -> verify(code)
+                    code != null -> viewModelScope.launch { fillCode(code); verify(code) }
                     kind == SignInCommands.Kind.RESEND -> sendCode()
-                    kind == SignInCommands.Kind.BACK ->
+                    kind == SignInCommands.Kind.BACK -> {
+                        smsCodeCancel?.invoke()
+                        setPhoneSoFar("")
                         ask(SignInStep.ASK_PHONE, "Okay. Say your ten digit number.", typed = TypedField.PHONE)
+                    }
                     else -> {
                         val digits = SpokenNumbers.digits(text)
                         miss(
@@ -344,61 +422,50 @@ class RiderSignInViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
+    /**
+     * A number, or part of one. Digits already collected are kept and the new ones added to
+     * them, so a number that came through short only ever needs its missing part said.
+     */
     private fun hearPhone(text: String) {
-        // A whole number is always welcome, even halfway through two-part entry.
-        SpokenNumbers.mobileNumber(text)?.let { confirmPhone(it); return }
-
-        val digits = SpokenNumbers.digits(text)
-
-        if (phoneInParts) {
-            val first = phoneFirstPart
-            when {
-                digits.length != 5 -> miss(
-                    if (first == null) "Say just the first five digits of your number."
-                    else "Say the last five digits."
+        val step = PhoneEntry.next(phoneSoFar, text)
+        when (step) {
+            is PhoneEntry.Step.Complete -> confirmPhone(step.number)
+            is PhoneEntry.Step.Partial -> {
+                setPhoneSoFar(step.digits)
+                misses = 0
+                val left = 10 - step.digits.length
+                ask(
+                    SignInStep.ASK_PHONE,
+                    "I have ${SpokenNumbers.speakable(step.digits)} " +
+                        "Say the last $left ${if (left == 1) "digit" else "digits"}.",
+                    heard = step.digits,
+                    typed = TypedField.PHONE
                 )
-                first == null -> {
-                    phoneFirstPart = digits
-                    misses = 0
-                    ask(
-                        SignInStep.ASK_PHONE,
-                        "${SpokenNumbers.speakable(digits)} Now say the last five digits.",
-                        heard = digits
-                    )
-                }
-                else -> {
-                    val number = SpokenNumbers.mobileNumber(first + digits)
-                    if (number != null) {
-                        confirmPhone(number)
-                    } else {
-                        phoneFirstPart = null
-                        ask(
-                            SignInStep.ASK_PHONE,
-                            "That doesn't make a mobile number. Let's start again. Say the first five digits."
-                        )
-                    }
-                }
             }
-            return
+            PhoneEntry.Step.Nothing -> miss(
+                if (phoneSoFar.isEmpty()) "I didn't hear a number. Say your ten digit mobile number."
+                else "Say the last ${10 - phoneSoFar.length} digits of your number."
+            )
+            PhoneEntry.Step.TooLong -> {
+                setPhoneSoFar("")
+                miss("I heard more than ten digits. Let's start again. Say your ten digit mobile number.")
+            }
+            PhoneEntry.Step.NotMobile -> {
+                setPhoneSoFar("")
+                miss("That isn't a mobile number. Indian mobile numbers start with 6, 7, 8 or 9. Say it again.")
+            }
         }
+    }
 
-        // The full number did not come through: switch to two parts rather than asking the
-        // rider to repeat ten digits that were just misheard.
-        phoneInParts = true
-        phoneFirstPart = null
-        misses = 0
-        val heardPart = when {
-            digits.isEmpty() -> "I didn't catch a number. "
-            else -> "I heard ${digits.length} digits. "
-        }
-        ask(SignInStep.ASK_PHONE, heardPart + "Let's do it in two parts. Say the first five digits.")
+    private fun setPhoneSoFar(digits: String) {
+        phoneSoFar = digits
+        ui = ui.copy(phoneSoFar = digits)
     }
 
     private fun confirmPhone(number: String) {
         phone = number
         misses = 0
-        phoneInParts = false
-        phoneFirstPart = null
+        setPhoneSoFar("")
         ask(
             SignInStep.CONFIRM_PHONE,
             "I heard ${SpokenNumbers.speakable(number)} Is that right?",
@@ -408,7 +475,7 @@ class RiderSignInViewModel(application: Application) : AndroidViewModel(applicat
 
     /**
      * The recogniser's guesses, best first; returns the first that fits the current question —
-     * a whole mobile number, a five-digit half, the six-digit code, or a yes/no.
+     * a whole mobile number, the rest of one, the six-digit code, or a yes/no.
      */
     private fun chooseTranscript(alternatives: List<String>): String {
         val best = alternatives.first()
@@ -417,10 +484,9 @@ class RiderSignInViewModel(application: Application) : AndroidViewModel(applicat
             k == SignInCommands.Kind.YES || k == SignInCommands.Kind.NO
         }
         val chosen = when (ui.step) {
-            SignInStep.ASK_PHONE ->
-                alternatives.firstOrNull { SpokenNumbers.mobileNumber(it) != null }
-                    ?: if (phoneInParts) alternatives.firstOrNull { SpokenNumbers.digits(it).length == 5 } else null
+            SignInStep.ASK_PHONE -> PhoneEntry.bestGuess(phoneSoFar, alternatives)
             SignInStep.CONFIRM_PHONE -> alternatives.firstOrNull(yesNo)
+                ?: alternatives.firstOrNull { SpokenNumbers.mobileNumber(it) != null }
             SignInStep.ASK_CODE -> alternatives.firstOrNull { SpokenNumbers.otp(it) != null }
             SignInStep.CONFIRM_NAME -> alternatives.firstOrNull(yesNo)
             else -> null
@@ -429,12 +495,54 @@ class RiderSignInViewModel(application: Application) : AndroidViewModel(applicat
         return chosen ?: best
     }
 
+    /** How patient the microphone is for the current question. */
+    private fun listenOptions(): ListenOptions {
+        val command: (String) -> Boolean = {
+            when (SignInCommands.classify(it)) {
+                SignInCommands.Kind.SKIP, SignInCommands.Kind.HELP, SignInCommands.Kind.REPEAT,
+                SignInCommands.Kind.RESEND -> true
+                else -> false
+            }
+        }
+        return when (ui.step) {
+            SignInStep.ASK_PHONE -> {
+                val needed = 10 - phoneSoFar.length
+                ListenOptions(
+                    startTimeoutMs = 12_000L,
+                    endSilenceMs = 1_200L,
+                    // Digits still missing: the rider is reading the number out. Wait for them.
+                    incompleteSilenceMs = 4_500L,
+                    isComplete = { command(it) || SpokenNumbers.digits(it).length >= needed }
+                )
+            }
+            SignInStep.ASK_CODE -> ListenOptions(
+                startTimeoutMs = 15_000L,
+                endSilenceMs = 1_200L,
+                incompleteSilenceMs = 4_500L,
+                isComplete = {
+                    command(it) || SignInCommands.classify(it) == SignInCommands.Kind.BACK ||
+                        SpokenNumbers.digits(it).length >= 6
+                }
+            )
+            SignInStep.CONFIRM_PHONE, SignInStep.CONFIRM_NAME -> ListenOptions(
+                startTimeoutMs = 10_000L,
+                endSilenceMs = 1_000L,
+                isComplete = { SignInCommands.classify(it) != SignInCommands.Kind.NONE }
+            )
+            SignInStep.ASK_NAME -> ListenOptions(startTimeoutMs = 10_000L, endSilenceMs = 1_300L)
+            else -> ListenOptions()
+        }
+    }
+
     // =================================================================================
     //  Server
     // =================================================================================
 
     private fun sendCode() {
-        setStep(SignInStep.SENDING, "Sending a code to your phone.")
+        smsCodeCancel?.invoke()
+        CodeNotifier.clear(getApplication())
+        ui = ui.copy(phone = phone, code = "", smsPreview = "", smsTexted = false)
+        setStep(SignInStep.SENDING, "Sending a code to ${SpokenNumbers.speakable(phone)}")
         speak("Sending a code to your phone.")
         viewModelScope.launch {
             when (val result = api.sendOtp(phone, AppRole.RIDER)) {
@@ -442,16 +550,23 @@ class RiderSignInViewModel(application: Application) : AndroidViewModel(applicat
                     val sent = result.value
                     val auto = sent.devCode
                     if (auto != null) {
-                        // Mock delivery: the code came back in the reply. This is the same
-                        // zero-touch path the SMS Retriever gives once a real SMS provider is
-                        // connected — the rider never has to hear, hold or repeat the code.
-                        speak("Code received. Checking it.")
+                        // No SMS provider on the backend: the code arrives the way a text
+                        // would — as a message notification and on screen — and is filled in.
+                        val message = sent.devMessage.ifBlank { "Your Cab Eye code is $auto." }
+                        CodeNotifier.show(getApplication(), message)
+                        ui = ui.copy(smsPreview = message)
+                        setStep(SignInStep.VERIFYING, "Code received. Checking it.")
+                        fillCode(auto)
+                        speak("Code received: ${SpokenNumbers.speakable(auto)} Checking it.")
                         verify(auto)
                     } else {
+                        ui = ui.copy(smsTexted = sent.texted)
+                        smsCodeRequest?.invoke { code -> onMain { onSmsCode(code) } }
                         ask(
                             SignInStep.ASK_CODE,
-                            "I've sent a six digit code by text message. Say the code when you have it, " +
-                                "or say send again.",
+                            "I've sent a six digit code by text message. When it arrives, your phone " +
+                                "will ask to let Cab Eye read it. Tap Allow and I'll fill it in. " +
+                                "Or say the code yourself, or say send again.",
                             typed = TypedField.CODE
                         )
                     }
@@ -460,21 +575,37 @@ class RiderSignInViewModel(application: Application) : AndroidViewModel(applicat
                     engine.earcon(Earcon.ERROR)
                     if (result.detail.startsWith("HTTP 429")) {
                         // A code is already on its way — go and wait for it.
+                        smsCodeRequest?.invoke { code -> onMain { onSmsCode(code) } }
                         ask(SignInStep.ASK_CODE, "${result.spoken} Then say the code.", typed = TypedField.CODE)
                     } else {
-                        ask(SignInStep.ASK_PHONE, "${result.spoken} Say your number again, or say skip.",
-                            typed = TypedField.PHONE)
+                        ask(
+                            SignInStep.CONFIRM_PHONE,
+                            "${result.spoken} Say yes to try sending the code again, or no to change the number. " +
+                                "Or say skip.",
+                            heard = phone
+                        )
                     }
                 }
             }
         }
     }
 
+    /** Shows the code arriving digit by digit, so a helper can watch it fill in. */
+    private suspend fun fillCode(code: String) {
+        for (i in 1..code.length) {
+            ui = ui.copy(code = code.take(i))
+            delay(CODE_FILL_STEP_MS)
+        }
+    }
+
     private fun verify(code: String) {
+        smsCodeCancel?.invoke()
+        ui = ui.copy(code = code)
         setStep(SignInStep.VERIFYING, "Checking the code.")
         viewModelScope.launch {
             when (val result = api.verifyOtp(phone, AppRole.RIDER, code)) {
                 is ApiResult.Ok -> {
+                    CodeNotifier.clear(getApplication())
                     val signIn = result.value
                     if (!store.save(AppRole.RIDER, signIn.token, signIn.account)) {
                         // The keystore refused. Carry on for this session; next launch asks again.
@@ -494,6 +625,7 @@ class RiderSignInViewModel(application: Application) : AndroidViewModel(applicat
                 }
                 is ApiResult.Failed -> {
                     engine.earcon(Earcon.ERROR)
+                    ui = ui.copy(code = "")
                     val reason = reasonOf(result.detail)
                     when {
                         reason == "EXPIRED" || reason == "LOCKED" || reason == "NO_CODE" -> {
@@ -587,6 +719,7 @@ class RiderSignInViewModel(application: Application) : AndroidViewModel(applicat
 
     private fun finish(signedIn: AccountInfo, returning: Boolean) {
         reopenJob?.cancel()
+        smsCodeCancel?.invoke()
         closeMic()
         val name = signedIn.spokenName
         val line = when {
@@ -604,6 +737,7 @@ class RiderSignInViewModel(application: Application) : AndroidViewModel(applicat
 
     private fun finishAsGuest(announce: Boolean, remember: Boolean = true) {
         reopenJob?.cancel()
+        smsCodeCancel?.invoke()
         closeMic()
         if (remember) store.riderIsGuest = true
         app.preferences.hasHeardWelcome = true
@@ -617,6 +751,12 @@ class RiderSignInViewModel(application: Application) : AndroidViewModel(applicat
     // =================================================================================
     //  Speech plumbing
     // =================================================================================
+
+    private fun listensOn(step: SignInStep): Boolean = when (step) {
+        SignInStep.ASK_PHONE, SignInStep.CONFIRM_PHONE, SignInStep.ASK_CODE,
+        SignInStep.ASK_NAME, SignInStep.CONFIRM_NAME -> true
+        else -> false
+    }
 
     /** Moves to [step], speaks [question], and listens for the answer unless told not to. */
     private fun ask(
@@ -646,7 +786,7 @@ class RiderSignInViewModel(application: Application) : AndroidViewModel(applicat
         if (misses >= MAX_MISSES) {
             misses = 0
             ui = ui.copy(prompt = reprompt)
-            speak("I'm having trouble hearing that. Hold the screen and speak when you're ready, or say skip.")
+            speak("I'm having trouble hearing that. Hold the screen and speak when you're ready, or type it below, or say skip.")
             return
         }
         ui = ui.copy(prompt = reprompt)
@@ -665,18 +805,22 @@ class RiderSignInViewModel(application: Application) : AndroidViewModel(applicat
         engine.speak(text, tier, onDone = onDone?.let { cb -> { onMain { cb() } } })
     }
 
+    /**
+     * After a question: nothing opens by itself. Rider mode listens only while the rider holds
+     * the screen or a volume key — an app that listened on its own heard its own voice and the
+     * room around it.
+     */
     private fun reopenMicAfterGap() {
         reopenJob?.cancel()
-        reopenJob = viewModelScope.launch {
-            delay(MIC_REOPEN_GAP_MS)
-            openMic()
-        }
     }
 
-    private fun openMic() {
+    private fun openMic(byPress: Boolean) {
         reopenJob?.cancel()
+        if (!byPress) return
+        if (!listensOn(ui.step)) return
         if (!micPermissionGranted) {
-            speak("I need microphone permission to hear you. You can also type your answer.")
+            waitingForPermission = true
+            speak("Please allow the microphone so I can hear you. You can also type your answer below.")
             return
         }
         val recogniser = stt ?: return
@@ -687,7 +831,9 @@ class RiderSignInViewModel(application: Application) : AndroidViewModel(applicat
         if (recogniser.isListening) return
         ui = ui.copy(micOpen = true, partial = "")
         micOpenedAt = System.currentTimeMillis()
-        recogniser.start(listener)
+        recogniser.start(listener, listenOptions())
+        // Held: a pause does not end the answer; letting go does.
+        recogniser.setHeld(true)
         armSilenceWatch()
     }
 
@@ -711,7 +857,7 @@ class RiderSignInViewModel(application: Application) : AndroidViewModel(applicat
         misses++
         if (misses >= MAX_MISSES) {
             misses = 0
-            speak("I'll wait. Hold the screen when you're ready.")
+            speak("I'll wait. Hold the screen when you're ready, or type your answer below.")
         } else {
             speakThenListen(ui.prompt)
         }
@@ -737,7 +883,9 @@ class RiderSignInViewModel(application: Application) : AndroidViewModel(applicat
             if (alternatives.isEmpty()) return@onMain
             closeMic()
             engine.earcon(Earcon.LISTENING_END)
-            handle(chooseTranscript(alternatives))
+            val chosen = chooseTranscript(alternatives)
+            ui = ui.copy(partial = chosen)
+            handle(chosen)
         }
 
         override fun onError(error: SpeechError) = onMain {
@@ -752,7 +900,8 @@ class RiderSignInViewModel(application: Application) : AndroidViewModel(applicat
 
     private fun helpFor(step: SignInStep): String = when (step) {
         SignInStep.ASK_PHONE, SignInStep.CONFIRM_PHONE ->
-            "Say your ten digit mobile number, one digit at a time if you like. Say skip to use the app without signing in."
+            "Say your ten digit mobile number. You can say it in groups and pause between them; " +
+                "I'll wait. Say start again to clear it, or skip to use the app without signing in."
         SignInStep.ASK_CODE ->
             "Say the six digit code from the text message. Say send again for a new code, or go back to change the number."
         SignInStep.ASK_NAME, SignInStep.CONFIRM_NAME ->
@@ -772,6 +921,45 @@ class RiderSignInViewModel(application: Application) : AndroidViewModel(applicat
     override fun onCleared() {
         reopenJob?.cancel()
         silenceJob?.cancel()
+        smsCodeCancel?.invoke()
         super.onCleared()
     }
+}
+
+/**
+ * Collecting a mobile number across answers. Pure, so every path is a JVM test.
+ */
+object PhoneEntry {
+
+    sealed interface Step {
+        data class Complete(val number: String) : Step
+        /** Fewer than ten digits so far; [digits] is everything collected. */
+        data class Partial(val digits: String) : Step
+        object Nothing : Step
+        object TooLong : Step
+        object NotMobile : Step
+    }
+
+    /** What [heard] adds to the [soFar] digits. A whole number on its own always wins. */
+    fun next(soFar: String, heard: String): Step {
+        SpokenNumbers.mobileNumber(heard)?.let { return Step.Complete(it) }
+        val digits = SpokenNumbers.digits(heard)
+        if (digits.isEmpty()) return Step.Nothing
+        val combined = soFar + digits
+        SpokenNumbers.mobileNumber(combined)?.let { return Step.Complete(it) }
+        // ("+91" or a leading 0 ahead of the number was already accepted by mobileNumber.)
+        return when {
+            combined.length < 10 -> Step.Partial(combined)
+            combined.length == 10 -> Step.NotMobile
+            else -> Step.TooLong
+        }
+    }
+
+    /**
+     * Of the recogniser's guesses, the first that completes the number; else the first that
+     * keeps it within ten digits; else null (the best guess stands).
+     */
+    fun bestGuess(soFar: String, alternatives: List<String>): String? =
+        alternatives.firstOrNull { next(soFar, it) is Step.Complete }
+            ?: alternatives.firstOrNull { next(soFar, it) is Step.Partial }
 }

@@ -25,7 +25,8 @@ import java.util.Optional;
  *
  * <pre>
  *   POST /auth/otp     {"phone":"9876543210","role":"RIDER"}
- *        → {"sent":true,"expiresInSeconds":300,"devCode":"123456"}   devCode only in mock mode
+ *        → {"sent":true,"expiresInSeconds":300,"delivery":"sms"|"mock","devCode":"123456"}
+ *          devCode (and devMessage) only when the code was not texted — see OtpService
  *   POST /auth/verify  {"phone":"…","role":"RIDER","code":"123456","name":"Harshini"}
  *        → {"token":"…","account":{…},"isNew":true}
  *   POST /auth/logout  Authorization: Bearer …
@@ -69,7 +70,12 @@ public class AuthController {
             out.put("error", "A code was just sent. Please wait " + sent.retryAfterSeconds() + " seconds.");
             return ResponseEntity.status(429).body(out);
         }
-        if (sent.devCode() != null) out.put("devCode", sent.devCode());
+        out.put("delivery", sent.delivery());
+        if (sent.devCode() != null) {
+            out.put("devCode", sent.devCode());
+            // The exact text a real SMS would carry, so the app's on-screen message matches it.
+            out.put("devMessage", com.cabeye.backend.auth.SmsSender.messageFor(sent.devCode()));
+        }
         return ResponseEntity.ok(out);
     }
 

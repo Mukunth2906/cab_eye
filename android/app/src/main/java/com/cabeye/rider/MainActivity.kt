@@ -8,6 +8,9 @@ import android.view.KeyEvent
 import androidx.fragment.app.FragmentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -112,6 +115,18 @@ class MainActivity : FragmentActivity() {
         viewModel?.onCameraPermissionResult(granted)
     }
 
+    /** The system's "let Cab Eye read this message?" sheet for the sign-in code. */
+    private val smsConsentLauncher: androidx.activity.result.ActivityResultLauncher<android.content.Intent> =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            smsReader.onConsentResult(result.resultCode, result.data)
+        }
+
+    private val smsReader: com.cabeye.rider.auth.SmsCodeReader by lazy {
+        com.cabeye.rider.auth.SmsCodeReader(this) { consent: android.content.Intent ->
+            smsConsentLauncher.launch(consent)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -132,6 +147,14 @@ class MainActivity : FragmentActivity() {
             val themeChoice = viewModel?.themeChoice ?: app.preferences.theme
 
             CabEyeTheme(choice = themeChoice) {
+                // Android 15 draws apps edge to edge: keep every screen clear of the status bar
+                // (the clock was sitting on top of the title) and of the gesture bar.
+                androidx.compose.foundation.layout.Box(
+                    modifier = androidx.compose.ui.Modifier
+                        .fillMaxSize()
+                        .background(com.cabeye.rider.ui.theme.LocalPalette.current.background)
+                        .safeDrawingPadding()
+                ) {
                 when {
                     showSettings -> DebugSettingsScreen(
                         currentUrl = settingsUrl,
@@ -145,6 +168,8 @@ class MainActivity : FragmentActivity() {
                             // Tears the rider's audio session down before the root swaps —
                             // see CabEyeApp.switchRole for why that order matters.
                             app.switchRole(next)
+                            // Straight to the chosen mode's screen: no extra "Done" to find.
+                            showSettings = false
                         },
                         onClose = { showSettings = false },
                         signedInAs = (if (role == AppRole.DRIVER) driverAccount else riderAccount)?.let {
@@ -155,6 +180,16 @@ class MainActivity : FragmentActivity() {
                             }
                         }.orEmpty(),
                         cameraAlwaysShare = if (role == AppRole.RIDER) cameraAlways else null,
+                        onLoadDemo = if (role == AppRole.RIDER && BuildConfig.DEBUG) { report ->
+                            val loaded = com.cabeye.rider.demo.DemoData.load(this@MainActivity)
+                            // Ride memory (the cab destinations) comes from the server: fetch it now.
+                            app.memory.refresh()
+                            val who = riderAccount?.phone.orEmpty()
+                            report(
+                                loaded + if (who.endsWith("9000011111")) " Signed in as the demo rider: ride history is on the server too."
+                                else " Sign in as the demo rider (90000 11111) to also see the ride history."
+                            )
+                        } else null,
                         onCameraAlwaysShare = { on ->
                             app.preferences.alwaysShareCamera = on
                             cameraAlways = on
@@ -170,6 +205,7 @@ class MainActivity : FragmentActivity() {
                     // -------------------------------------------------------------------
                     role == AppRole.DRIVER && (driverAccount?.profileComplete != true) -> {
                         val accountVm: DriverAccountViewModel = viewModel()
+                        accountVm.smsCodeRequest = { onCode -> smsReader.start(onCode) }
                         LaunchedEffect(driverAccount) {
                             accountVm.start()
                             if (driverAccount != null && accountVm.ui.step != com.cabeye.rider.driver.DriverAccountStep.PROFILE) {
@@ -232,6 +268,7 @@ class MainActivity : FragmentActivity() {
                             driverName = driverAccount?.name.orEmpty(),
                             onProfile = accountVm::editProfile,
                             cameraFrame = driverVm.cameraFrame,
+                            cameraLabels = driverVm.cameraLabels,
                             onRequestCamera = driverVm::requestCamera,
                             onStopCamera = driverVm::stopCamera,
                             onStopArrived = driverVm::arrivedAtStop,
@@ -252,6 +289,8 @@ class MainActivity : FragmentActivity() {
                         signIn.unlockRequest = { name, onResult ->
                             BiometricGate.unlock(this@MainActivity, name, onResult)
                         }
+                        signIn.smsCodeRequest = { onCode -> smsReader.start(onCode) }
+                        signIn.smsCodeCancel = { smsReader.stop() }
                         LaunchedEffect(Unit) {
                             requestPermissionsIfNeeded()
                             signIn.start()
@@ -261,7 +300,10 @@ class MainActivity : FragmentActivity() {
                             onHoldStart = signIn::onHoldStart,
                             onHoldEnd = signIn::onHoldEnd,
                             onTyped = signIn::onTyped,
-                            onSkip = signIn::onSkip
+                            onSkip = signIn::onSkip,
+                            onClearNumber = signIn::onClearNumber,
+                            onResend = signIn::onResend,
+                            onOpenSettings = { showSettings = true }
                         )
                     }
 
@@ -304,9 +346,43 @@ class MainActivity : FragmentActivity() {
                             onCameraAnswer = vm::onCameraAnswer,
                             onStopCamera = vm::onStopCamera,
                             onCallDriver = vm::onCallDriver,
-                            onHelp = vm::onHelp
+                            onHelp = vm::onHelp,
+                            onQuickCommand = vm::onQuickCommand,
+                            explore = vm.explore.ui,
+                            mindMap = remember(vm) {
+                                object : com.cabeye.rider.ui.MindMapActions {
+                                    override fun catalog() = vm.catalog
+                                    override fun answer() = vm.mapAnswer
+                                    override fun load() = vm.loadMindMap()
+                                    override fun book(card: com.cabeye.rider.mindmap.MindMapCatalog.PlaceCard) = vm.bookFromMap(card)
+                                    override fun explain(nodeId: String) = vm.explainNode(nodeId)
+                                    override fun forget(nodeId: String) = vm.forgetNode(nodeId)
+                                    override fun guide(routeId: String) = vm.guideWalkFromMap(routeId)
+                                    override fun readWalk(routeId: String) = vm.readWalkFromMap(routeId)
+                                    override fun forgetWalk(routeId: String) = vm.forgetWalkFromMap(routeId)
+                                    override fun bookRoute(name: String) = vm.bookRouteFromMap(name)
+                                }
+                            },
+                            exploreActions = remember(vm) {
+                                object : com.cabeye.rider.ui.ExploreActions {
+                                    override fun open() = vm.openExplore()
+                                    override fun describe() = vm.exploreDescribe()
+                                    override fun read() = vm.exploreRead()
+                                    override fun keepTelling() = vm.exploreKeepTelling()
+                                    override fun find(target: String) = vm.exploreFind(target)
+                                    override fun stop() = vm.exploreStop()
+                                    override fun name(name: String) = vm.exploreName(name)
+                                    override fun askName() = vm.exploreAskName()
+                                    override fun finish(save: Boolean) = vm.closeExplore(save)
+                                }
+                            },
+                            onCameraPreview = vm::attachCameraPreview,
+                            mindMapOpen = vm.mindMapOpen,
+                            onMindMapOpen = { open -> if (open) vm.openMindMap() else vm.closeMindMap() },
+                            onDoubleTap = vm::onDoubleTap
                         )
                     }
+                }
                 }
             }
         }
@@ -402,6 +478,12 @@ class MainActivity : FragmentActivity() {
         viewModel?.onBackground()
     }
 
+    override fun onDestroy() {
+        // The message receiver is registered against this Activity; never leak it.
+        smsReader.stop()
+        super.onDestroy()
+    }
+
     /**
      * Volume keys as a booking trigger.
      *
@@ -412,17 +494,26 @@ class MainActivity : FragmentActivity() {
      * hijacking them in a moving car would be a genuinely bad idea.
      */
     // ---------------------------------------------------------------------------------
-    //  Volume keys: a short press changes the volume, holding either key talks.
+    //  Volume keys: a short press changes the volume, holding either key talks, and
+    //  volume down pressed three times quickly opens (or closes) the mind map.
     //
     //  Both keys used to be hold-to-talk only, which left a blind rider no way to turn the
     //  narrator up or down while Cab Eye was open — found in the demo. Now a press shorter
     //  than HOLD_TO_TALK_MS is an ordinary volume step (with the system click, so the level
     //  can be heard), and holding past it opens the microphone as before.
+    //
+    //  The three presses still step the volume as they land (no waiting to see whether a
+    //  third is coming); when the third arrives, the volume goes back to where it was before
+    //  the first. Only volume down counts, so turning the narrator UP in a hurry can never
+    //  open anything. The double tap on the screen (explore) is in RiderSurface.
     // ---------------------------------------------------------------------------------
 
     private val keyHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private var volumeKeyTalking = false
     private var pendingTalk: Runnable? = null
+    private var volumeDownPresses = 0
+    private var lastVolumeDownAt = 0L
+    private var volumeBeforePresses = 0
 
     private fun holdStart() {
         signInViewModel?.onHoldStart() ?: viewModel?.onHoldStart()
@@ -465,8 +556,25 @@ class MainActivity : FragmentActivity() {
             volumeKeyTalking = false
             holdEnd()
         } else {
-            // A short press: an ordinary volume step on whatever is playing.
             val audio = getSystemService(android.media.AudioManager::class.java)
+            val vm = viewModel
+            if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN && vm != null && signInViewModel == null && audio != null) {
+                val now = android.os.SystemClock.uptimeMillis()
+                if (now - lastVolumeDownAt > MULTI_PRESS_GAP_MS) {
+                    volumeDownPresses = 0
+                    volumeBeforePresses = audio.getStreamVolume(android.media.AudioManager.STREAM_MUSIC)
+                }
+                lastVolumeDownAt = now
+                if (++volumeDownPresses == MIND_MAP_PRESSES) {
+                    volumeDownPresses = 0
+                    audio.setStreamVolume(android.media.AudioManager.STREAM_MUSIC, volumeBeforePresses, 0)
+                    vm.toggleMindMap()
+                    return true
+                }
+            } else {
+                volumeDownPresses = 0
+            }
+            // A short press: an ordinary volume step on whatever is playing.
             audio?.adjustSuggestedStreamVolume(
                 if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) android.media.AudioManager.ADJUST_RAISE
                 else android.media.AudioManager.ADJUST_LOWER,
@@ -480,5 +588,9 @@ class MainActivity : FragmentActivity() {
     private companion object {
         /** Holding a volume key longer than this talks; anything shorter changes the volume. */
         const val HOLD_TO_TALK_MS = 350L
+
+        /** Volume down pressed this many times, each within [MULTI_PRESS_GAP_MS], toggles the mind map. */
+        const val MIND_MAP_PRESSES = 3
+        const val MULTI_PRESS_GAP_MS = 600L
     }
 }

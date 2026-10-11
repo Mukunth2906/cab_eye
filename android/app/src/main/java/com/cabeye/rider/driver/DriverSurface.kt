@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
@@ -92,6 +93,7 @@ fun DriverSurface(
     driverName: String = "",
     onProfile: () -> Unit = {},
     cameraFrame: Bitmap? = null,
+    cameraLabels: List<com.cabeye.rider.vision.SceneObject> = emptyList(),
     onRequestCamera: () -> Unit = {},
     onStopCamera: () -> Unit = {},
     onStopArrived: () -> Unit = {},
@@ -124,11 +126,11 @@ fun DriverSurface(
                 is DriverState.Request -> RequestScreen(state, onAccept, onDecline)
                 is DriverState.Navigating -> NavigatingScreen(
                     state, uiState.lastPresetSent, onPreset, onBeacon, onLocation, onArrived, onCancel, onMessage,
-                    camera = { RiderViewPanel(uiState.camera, cameraFrame, onRequestCamera, onStopCamera) }
+                    camera = { RiderViewPanel(uiState.camera, cameraFrame, cameraLabels, onRequestCamera, onStopCamera, onMessage) }
                 )
                 is DriverState.Arrived -> ArrivedScreen(
                     state, onConfirmSeated, onCancel,
-                    camera = { RiderViewPanel(uiState.camera, cameraFrame, onRequestCamera, onStopCamera) },
+                    camera = { RiderViewPanel(uiState.camera, cameraFrame, cameraLabels, onRequestCamera, onStopCamera, onMessage) },
                     onMessage = onMessage
                 )
                 is DriverState.Seated -> SeatedScreen(onStartTrip)
@@ -537,8 +539,10 @@ private fun ArrivedScreen(
 private fun RiderViewPanel(
     camera: DriverCamera,
     frame: Bitmap?,
+    labels: List<com.cabeye.rider.vision.SceneObject>,
     onRequest: () -> Unit,
-    onStop: () -> Unit
+    onStop: () -> Unit,
+    onInstruct: (String) -> Unit
 ) {
     val palette = LocalPalette.current
     Spacer(Modifier.height(20.dp))
@@ -595,6 +599,12 @@ private fun RiderViewPanel(
                         contentScale = ContentScale.Fit,
                         modifier = Modifier.fillMaxSize()
                     )
+                    // What the passenger's phone detected: the same things they are hearing.
+                    com.cabeye.rider.ui.components.DetectionOverlay(
+                        objects = labels,
+                        imageAspect = frame.width.toFloat() / frame.height.coerceAtLeast(1),
+                        modifier = Modifier.fillMaxSize()
+                    )
                 } else {
                     Text(
                         "Waiting for the first picture…",
@@ -611,6 +621,39 @@ private fun RiderViewPanel(
                 color = palette.muted,
                 textAlign = TextAlign.Center
             )
+            if (labels.isNotEmpty()) {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "Your passenger hears: " + labels.take(4).joinToString(", ") { "${it.label} (${it.clock})" },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = palette.listening,
+                    textAlign = TextAlign.Center
+                )
+            }
+            Spacer(Modifier.height(10.dp))
+            Text(
+                "Guide them — one tap, said aloud on their phone:",
+                style = MaterialTheme.typography.labelLarge,
+                color = palette.onBackground,
+                textAlign = TextAlign.Center
+            )
+            Spacer(Modifier.height(6.dp))
+            CAMERA_INSTRUCTIONS.chunked(2).forEach { row ->
+                androidx.compose.foundation.layout.Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(8.dp)
+                ) {
+                    row.forEach { (label, spoken) ->
+                        androidx.compose.material3.OutlinedButton(
+                            onClick = { onInstruct(spoken) },
+                            modifier = Modifier.weight(1f).heightIn(min = 52.dp)
+                        ) {
+                            Text(label, textAlign = TextAlign.Center, color = palette.onBackground)
+                        }
+                    }
+                }
+                Spacer(Modifier.height(6.dp))
+            }
             Spacer(Modifier.height(10.dp))
             DriverButton("STOP CAMERA", palette.danger, onClick = onStop)
         }
@@ -1360,3 +1403,18 @@ private fun DriverButton(label: String, accent: Color, onClick: () -> Unit) {
         )
     }
 }
+
+
+/** One-tap instructions for a driver watching the passenger's camera: (button, what the passenger hears). */
+private val CAMERA_INSTRUCTIONS = listOf(
+    "Walk forward" to "Walk forward slowly.",
+    "Stop" to "Stop there.",
+    "Turn left" to "Turn a little to your left.",
+    "Turn right" to "Turn a little to your right.",
+    "Turn around" to "Turn around.",
+    "I can see you" to "I can see you. Stay where you are, I'm coming.",
+    "Car on your left" to "The car is on your left.",
+    "Car on your right" to "The car is on your right.",
+    "Wave your hand" to "Please wave your hand so I can spot you.",
+    "Careful, step" to "Careful, there's a step in front of you."
+)

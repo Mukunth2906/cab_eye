@@ -1,5 +1,7 @@
 # Personal mind map: memory for walks and rides
 
+[← Back to the README](../README.md)
+
 A sighted person holds a mental map of the places they know, built from everything they see.
 A blind traveller builds one from what they feel, hear and smell, and from what places mean to
 them: "left after Ravi's tea shop", "the temple bell means Amma's house is close". The walking
@@ -15,8 +17,41 @@ ways:
   way.
 
 Like the other agents it is rule-based, explainable and tested on the JVM. Everything stays on
-the phone. The one optional exception is a Grok reader for sentences the rules can't follow:
-the rider has to agree to it, and only that one sentence is sent.
+the phone. The one optional exception is a sentence reader (Grok, or Gemini) for sentences the
+rules can't follow: the rider has to agree to it, and only that one sentence is sent.
+
+## Opening it, and the screen
+
+**Press volume down three times quickly** (each press within 0.6 s) from the main screen, or
+tap **🧭 My mind map** in the top bar, or use TalkBack's actions menu (*Open my mind map*). The
+same three presses close it again, as does **Close**. The presses still step the volume as they
+land, and the third puts it back where it was. Only volume down counts, so turning the narrator
+up in a hurry never opens it. It opens only when no ride is being booked; otherwise the app
+says so. Opening it while exploring finishes explore first and keeps the walk.
+
+`ui/MindMapScreen.kt`, laid out by the pure `MindMapCatalog`:
+
+| Tab | Shows | Actions |
+|---|---|---|
+| **From my rides** | Cab destinations (visits, the rider's own names, distance and direction from here, area, cues on the way, walks from the drop-off, notes), saved multi-stop routes, ride cues, areas | Book a ride, Book this route, What's around, Hear, Forget, Famous places nearby |
+| **From my walks** | Spots named while exploring, recorded and explored walks, personal notes, what the camera saw nearby | Guide me, Read route, Book a ride, Hear, Forget |
+| **Map** | A radar with the rider at the centre; tap a dot for its details | What's around, Book a ride |
+
+Every answer is spoken as well as shown.
+
+## Two modules, two stores
+
+The rider's rides and the rider's walking are separate parts of the app, so their memories are
+kept separately (`MindMapStore`, `MindModule`):
+
+| Module | SharedPreferences | Node ids | Holds |
+|---|---|---|---|
+| **RIDES** | `cabeye.mindmap.rides` | `place:`, `cue:`, `area:`, `near:` | Cab destinations kept, ride cues, areas, ride traces, places offered after a ride |
+| **EXPLORE** | `cabeye.mindmap.explore` | `a:`, `obs:`, `lm:`, `walk:` | Named spots and personal notes, what the camera saw while exploring (`OBSERVED`), anything tied to a walk |
+
+An edge belongs to EXPLORE when either end does: a note about a cab destination is the rider's
+own words, so it is kept with their notes. The explore module and its camera are described in
+[EXPLORE-AND-CAMERA.md](EXPLORE-AND-CAMERA.md).
 
 ## The graph
 
@@ -27,6 +62,7 @@ the rider has to agree to it, and only that one sentence is sent.
 | ANCHOR | the rider's own notes | Ravi's tea shop: you stop on Fridays |
 | AREA | the phone's geocoder, on rides | Gandhipuram |
 | RIDE_CUE | marked by the rider in the cab | the flyover, speed bump |
+| OBSERVED | the camera, while exploring | a bench on your left, steps (seen 3 times) |
 
 | Edge | Meaning |
 |---|---|
@@ -38,8 +74,8 @@ the rider has to agree to it, and only that one sentence is sent.
 | IN_AREA | place → area |
 
 Places, walks and landmarks are **derived** again each time from the walk store and ride
-memory, so they never go out of date. Anchors, cues, areas and kept places are **authored** and
-stored in `MindMapStore` (SharedPreferences `cabeye.mindmap`, on the phone only).
+memory, so they never go out of date. Anchors, cues, areas, kept places and camera observations
+are **authored** and stored in `MindMapStore`, split by module as above, on the phone only.
 
 **Same landmark.** Two walk landmarks are joined only if all of these hold:
 - they are the same kind;
@@ -255,7 +291,7 @@ provider. The public ones are for light use.
 **Credit:** "Place information from OpenStreetMap" is said at the end of "tell me more", and
 both endpoints return the ODbL attribution.
 
-## The optional Grok reader
+## The optional sentence reader (Grok or Gemini)
 
 - **When it is used:** when the rules don't understand a sentence in one of these places:
   - during a walk;
@@ -267,14 +303,15 @@ both endpoints return the ODbL attribution.
 - **What is sent:** the sentence and up to 20 names of places the rider already knows. No
   position, route or history.
 - **The backend side** (`backend/.../mindmap/InterpretService.java`, `POST /me/mindmap/interpret`):
-  - It asks **Grok** (xAI, `grok-4.7` by default, set with `cabeye.grok.model`) through the
-    chat completions API for a structured answer (a strict JSON schema derived from
+  - It asks **Grok** (xAI, `grok-4.7` by default, set with `cabeye.grok.model`) when
+    `cabeye.grok.api-key` is set, otherwise **Gemini** when `cabeye.gemini.api-keys` is (the same
+    keys as the camera), through the chat completions API, for a structured answer (a strict JSON schema derived from
     `Interpretation`): intent, subject, person, habit, meaning, sense, side and confidence.
   - A 4-second timeout and no retries, because the rider is waiting to hear a reply; if it fails,
     the rules take over instead. A sound plays while the app waits.
   - At most 30 sentences per rider per hour.
-  - Without `cabeye.grok.api-key` in `cabeye-secrets.properties` the endpoint answers 404 and
-    the app stays rules-only for the session.
+  - With neither key in `cabeye-secrets.properties` the endpoint answers 404 and the app stays
+    rules-only for the session.
 - **Checks on the answer:** the phone checks it again with the same rules as the rider's own
   words.
   - Visual-only subjects are refused.
@@ -310,7 +347,7 @@ calls the app makes.
 **On a phone without keys:**
 - well-known places come from OpenStreetMap, or the built-in list when offline;
 - area names come from the phone's geocoder, then OpenStreetMap;
-- only the Grok reader is off.
+- only the sentence reader is off.
 
 ## Code
 
@@ -324,6 +361,10 @@ calls the app makes.
   - `NearbySuggestionAgent.kt`.
   - `MindMapInterpreter.kt`.
   - `MindMapStore.kt`: Android storage, plus the pure `MindMapJson`.
+  - `MindMapCatalog.kt`: what the mind map screen shows, by module (pure).
+  - `SyntheticRide.kt`: "simulate a ride".
+- **`ui/MindMapScreen.kt`**: the screen. Opened from `RiderSurface` (button) and `MainActivity`
+  (volume down ×3), with its open state in `RiderViewModel.mindMapOpen`.
 - **`places/`:**
   - `AreaNamer.kt`: the on-device geocoder.
   - `GooglePlaceResolver.searchNearby`.
@@ -334,7 +375,8 @@ calls the app makes.
   - `LandmarkParser` exposes its kind and colour patterns for reuse.
 - **Tests:**
   - Android: `MindMapTest`, `RideGuideTest`, `NearbySuggestionTest`, `MindMapInterpreterTest`.
-  - Backend: `MindMapInterpretTest`, with a stubbed model, so tests never call Grok.
+  - Backend: `MindMapInterpretTest`, with a stubbed model, so tests never call Grok or Gemini.
+  - Android `VisionExploreTest` covers observations and the module split.
 
 ## Known limits
 

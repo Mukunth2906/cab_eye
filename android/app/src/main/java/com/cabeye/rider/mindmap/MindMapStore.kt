@@ -1,42 +1,132 @@
 package com.cabeye.rider.mindmap
 
 import android.content.Context
+import com.cabeye.rider.memory.TextSimilarity
 import com.cabeye.rider.walk.LandmarkKind
 import com.cabeye.rider.walk.Side
 import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * The rider's own mind-map content — personal notes, ride cues, areas, remembered places — and
- * the traces of past rides, on this phone only (SharedPreferences, private to the app). Like the
- * walking routes, none of it is sent to the server: what a place means to a blind rider, and
- * the way they ride home, is theirs.
+ * Which part of the app a piece of the mind map came from. Each has its own storage.
+ *
+ *  - [RIDES]: cab destinations, ride cues, the areas a cab passes through, ride paths, places
+ *    offered after a ride. Ids `place:`, `cue:`, `area:`, `near:`.
+ *  - [EXPLORE]: what the rider learns on foot — named spots and personal notes (`a:`), things the
+ *    camera saw while exploring (`obs:`), and anything tied to a walk (`lm:`, `walk:`).
+ *
+ * An edge belongs to EXPLORE when either end does (a note about a cab destination is the rider's
+ * own words, kept with their notes); otherwise to RIDES.
+ */
+enum class MindModule {
+    RIDES, EXPLORE;
+
+    companion object {
+        private val RIDE_PREFIXES = listOf("place:", "cue:", "area:", "near:")
+
+        fun of(nodeId: String): MindModule = if (RIDE_PREFIXES.any { nodeId.startsWith(it) }) RIDES else EXPLORE
+
+        fun of(edge: Edge): MindModule = if (of(edge.from) == EXPLORE || of(edge.to) == EXPLORE) EXPLORE else RIDES
+
+        /** [map] split into (rides, explore). */
+        fun split(map: MindMap): Pair<MindMap, MindMap> {
+            val (ridesNodes, exploreNodes) = map.nodes.partition { of(it.id) == RIDES }
+            val (ridesEdges, exploreEdges) = map.edges.partition { of(it) == RIDES }
+            return MindMap(ridesNodes, ridesEdges) to MindMap(exploreNodes, exploreEdges)
+        }
+    }
+}
+
+/**
+ * The rider's own mind-map content, in two stores on this phone only (SharedPreferences, private
+ * to the app): one for the ride module ([MindModule.RIDES]: ride cues, areas, ride paths) and one
+ * for the explore module ([MindModule.EXPLORE]: named spots, notes, camera sightings). Like the
+ * walking routes, none of it is sent to the server: what a place means to a blind rider, and the
+ * way they ride home, is theirs.
+ *
+ * [authored] joins both, so everything that reads the whole mind map keeps working; [saveAuthored]
+ * puts each piece back into its own store. Data saved before the split is moved over once.
  */
 class MindMapStore(context: Context) {
 
     private val prefs = context.applicationContext.getSharedPreferences("cabeye.mindmap", Context.MODE_PRIVATE)
+    private val ridePrefs = context.applicationContext.getSharedPreferences("cabeye.mindmap.rides", Context.MODE_PRIVATE)
+    private val explorePrefs = context.applicationContext.getSharedPreferences("cabeye.mindmap.explore", Context.MODE_PRIVATE)
 
-    fun authored(): MindMap = MindMapJson.map(prefs.getString("map", null))
-
-    fun saveAuthored(map: MindMap) {
-        prefs.edit().putString("map", MindMapJson.json(MindMapJson.capped(map)).toString()).apply()
+    init {
+        migrate()
     }
 
-    fun traces(): List<RideTrace> = MindMapJson.traces(prefs.getString("traces", null))
+    /** One-time move from the single store used before rides and explore were separated. */
+    private fun migrate() {
+        val legacyMap = prefs.getString("map", null)
+        val legacyTraces = prefs.getString("traces", null)
+        if (legacyMap == null && legacyTraces == null) return
+        if (legacyMap != null) {
+            val (r, e) = MindModule.split(MindMapJson.map(legacyMap))
+            saveRides(rides().plus(r))
+            saveExplore(explore().plus(e))
+        }
+        if (legacyTraces != null) {
+            ridePrefs.edit().putString(
+                "traces",
+                MindMapJson.tracesJson(MindMapJson.keepTraces(traces() + MindMapJson.traces(legacyTraces))).toString()
+            ).apply()
+        }
+        prefs.edit().remove("map").remove("traces").apply()
+    }
+
+    /** The ride module's part: ride cues, areas, places offered after rides. */
+    fun rides(): MindMap = MindMapJson.map(ridePrefs.getString("map", null))
+
+    /** The explore module's part: named spots, notes, camera sightings. */
+    fun explore(): MindMap = MindMapJson.map(explorePrefs.getString("map", null))
+
+    private fun saveRides(map: MindMap) {
+        ridePrefs.edit().putString("map", MindMapJson.json(MindMapJson.capped(map)).toString()).apply()
+    }
+
+    private fun saveExplore(map: MindMap) {
+        explorePrefs.edit().putString("map", MindMapJson.json(MindMapJson.capped(map)).toString()).apply()
+    }
+
+    /** Both modules, joined. */
+    fun authored(): MindMap = rides().plus(explore())
+
+    /** Saves [map], each node and edge into its own module's store. */
+    fun saveAuthored(map: MindMap) {
+        val (r, e) = MindModule.split(map)
+        saveRides(r)
+        saveExplore(e)
+    }
+
+    /** Adds what the camera saw while exploring, merged with earlier sightings of the same thing. */
+    fun observe(seen: List<Node>, now: Long) {
+        if (seen.isEmpty()) return
+        saveExplore(Observations.merge(explore(), seen, now))
+    }
+
+    fun traces(): List<RideTrace> = MindMapJson.traces(ridePrefs.getString("traces", null))
 
     /** Keeps the last [MindMapJson.TRACES_PER_PLACE] rides to each place. */
     fun addTrace(trace: RideTrace) {
         val kept = MindMapJson.keepTraces(traces() + trace)
-        prefs.edit().putString("traces", MindMapJson.tracesJson(kept).toString()).apply()
+        ridePrefs.edit().putString("traces", MindMapJson.tracesJson(kept).toString()).apply()
+    }
+
+    /** Replaces every stored ride path with [list] (kept to the usual limits). */
+    fun replaceTraces(list: List<RideTrace>) {
+        ridePrefs.edit().putString("traces", MindMapJson.tracesJson(MindMapJson.keepTraces(list)).toString()).apply()
     }
 
     fun clear() {
-        prefs.edit().remove("map").remove("traces").apply()
+        ridePrefs.edit().remove("map").remove("traces").apply()
+        explorePrefs.edit().remove("map").apply()
     }
 
     /** "Forget my history": the ways the rider rode, not their own notes and cues. */
     fun clearTraces() {
-        prefs.edit().remove("traces").apply()
+        ridePrefs.edit().remove("traces").apply()
     }
 
     fun nearbyGuard(): NearbySuggestionAgent.Guard =
@@ -64,6 +154,44 @@ class MindMapStore(context: Context) {
     var interpretAsked: Boolean
         get() = prefs.getBoolean("interpretAsked", false)
         set(v) { prefs.edit().putBoolean("interpretAsked", v).apply() }
+}
+
+/**
+ * Camera sightings while exploring. The same thing seen again close by (same name, within
+ * [SAME_PLACE_M]) is one memory seen more times, not a new one — a rider walking past a bench
+ * every morning has one bench, confirmed every morning.
+ */
+object Observations {
+    const val SAME_PLACE_M = 12.0
+    const val MAX_OBSERVATIONS = 600
+
+    fun merge(map: MindMap, seen: List<Node>, now: Long): MindMap {
+        val nodes = map.nodes.toMutableList()
+        for (s in seen) {
+            if (s.kind != NodeKind.OBSERVED || !s.located) continue
+            val key = TextSimilarity.normalise(s.label)
+            val i = nodes.indexOfFirst { n ->
+                n.kind == NodeKind.OBSERVED && n.located &&
+                    TextSimilarity.normalise(n.label) == key &&
+                    Geo.metres(n.lat!!, n.lng!!, s.lat!!, s.lng!!) <= SAME_PLACE_M
+            }
+            if (i >= 0) {
+                val old = nodes[i]
+                nodes[i] = old.copy(
+                    confirmations = old.confirmations + 1, lastConfirmedAt = now,
+                    side = if (s.side != Side.NONE) s.side else old.side
+                )
+            } else {
+                nodes += s.copy(createdAt = if (s.createdAt == 0L) now else s.createdAt, lastConfirmedAt = now)
+            }
+        }
+        // Oldest one-off sightings go first when there are too many.
+        val obs = nodes.filter { it.kind == NodeKind.OBSERVED }
+        if (obs.size <= MAX_OBSERVATIONS) return MindMap(nodes, map.edges)
+        val drop = obs.sortedWith(compareBy<Node> { it.confirmations }.thenBy { it.lastConfirmedAt })
+            .take(obs.size - MAX_OBSERVATIONS).map { it.id }.toSet()
+        return MindMap(nodes.filter { it.id !in drop }, map.edges.filter { it.from !in drop && it.to !in drop })
+    }
 }
 
 /** JSON for the mind map and ride traces. Pure (org.json only), so it is a JVM test. */

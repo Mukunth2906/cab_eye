@@ -63,6 +63,14 @@ object BackendUrl {
             value = value.dropLast(1)
         }
 
+        // The admin website's address (".../admin", or a page under it) pasted in place of the
+        // server's. Found in use: it made every request fail with "I can't reach the server".
+        // The app's server is the same host without that path.
+        value = value.replace(Regex("/admin(/.*)?$", RegexOption.IGNORE_CASE), "")
+        while (value.endsWith("/")) {
+            value = value.dropLast(1)
+        }
+
         return value.ifEmpty { null }
     }
 

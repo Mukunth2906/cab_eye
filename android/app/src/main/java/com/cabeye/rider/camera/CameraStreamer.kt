@@ -10,6 +10,7 @@ import androidx.camera.core.CameraSelector
 import androidx.camera.core.CameraState
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
+import androidx.camera.core.Preview
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -32,12 +33,18 @@ import kotlin.math.max
  * answer "where is my passenger standing?", and it needs no video codec, relay server or
  * third-party service.
  *
+ * ## One camera, three uses
+ * The ride module and the explore module share this one camera session:
+ *  - [jpegSink]: small JPEG pictures for the driver (ride module, only while shared);
+ *  - [pictureSink]: each upright picture for the object detector, so the rider hears what is
+ *    around them (both modules);
+ *  - [attachPreview]: a live preview on the rider's own screen, for a low-vision rider or a helper.
+ * The camera runs while any of them wants it; turning one off never cuts the others.
+ *
  * ## What it deliberately does not do
  *  - **No audio.** It never touches the microphone, so the rider's app can keep listening for
  *    the driver to say the boarding code while the camera is on.
- *  - **No preview on the rider's screen.** The rider's screen stays exactly what it was; the
- *    camera runs headless through [ImageAnalysis] alone.
- *  - **No recording.** Each picture is encoded, handed over, and forgotten.
+ *  - **No recording.** Each picture is encoded or looked at, handed over, and forgotten.
  *
  * The camera is bound to a private lifecycle owned by this class, not to the Activity, so
  * starting and stopping it is entirely the view model's decision. Call [start] and [stop] on
@@ -51,8 +58,11 @@ class CameraStreamer(private val context: Context) {
         /** Four pictures a second. Enough to follow someone turning; small enough for 3G. */
         const val FRAME_INTERVAL_MS = 250L
 
-        /** Longest side of each picture, in pixels. */
+        /** Longest side of each picture sent to the driver, in pixels. */
         const val MAX_SIDE_PX = 480
+
+        /** Longest side of each picture given to the detector: more detail than the driver needs. */
+        const val PICTURE_SIDE_PX = 640
 
         const val JPEG_QUALITY = 50
         const val JPEG_QUALITY_SMALL = 35
@@ -79,6 +89,19 @@ class CameraStreamer(private val context: Context) {
     private var owner: StreamLifecycle? = null
     private var provider: ProcessCameraProvider? = null
     private var analysis: ImageAnalysis? = null
+    private var preview: Preview? = null
+    private var previewSurface: Preview.SurfaceProvider? = null
+
+    /** Ride module: base64 JPEG pictures for the driver, with their number. Background thread. */
+    @Volatile
+    var jpegSink: ((jpegBase64: String, n: Int) -> Unit)? = null
+
+    /**
+     * Each upright picture (longest side at most [PICTURE_SIDE_PX]), on a background thread. The
+     * bitmap is recycled after the call returns: copy it to keep it.
+     */
+    @Volatile
+    var pictureSink: ((Bitmap) -> Unit)? = null
     private var worker: ExecutorService? = null
 
     @Volatile private var lastFrameAt = 0L
@@ -95,6 +118,21 @@ class CameraStreamer(private val context: Context) {
      *   The streamer has already stopped itself by then.
      */
     fun start(onFrame: (jpegBase64: String, n: Int) -> Unit, onError: (reason: String) -> Unit) {
+        jpegSink = onFrame
+        start(onError)
+    }
+
+    /**
+     * Shows the live camera in a PreviewView ([provider]), or stops showing it (null).
+     * Main thread. Works before or after [start].
+     */
+    fun attachPreview(provider: Preview.SurfaceProvider?) {
+        previewSurface = provider
+        preview?.setSurfaceProvider(provider)
+    }
+
+    /** Opens the back camera (if it isn't already open) for whichever sinks are set. Main thread. */
+    fun start(onError: (reason: String) -> Unit) {
         if (running) return
         running = true
         frameCount = 0
@@ -127,10 +165,17 @@ class CameraStreamer(private val context: Context) {
                     .build()
                     .also { analysis = it }
 
-                useCase.setAnalyzer(executor) { image -> handle(image, onFrame) }
+                useCase.setAnalyzer(executor) { image -> handle(image) }
+
+                val previewUseCase = Preview.Builder().build().also {
+                    preview = it
+                    it.setSurfaceProvider(previewSurface)
+                }
 
                 cameraProvider.unbindAll()
-                val camera = cameraProvider.bindToLifecycle(lifecycle, CameraSelector.DEFAULT_BACK_CAMERA, useCase)
+                val camera = cameraProvider.bindToLifecycle(
+                    lifecycle, CameraSelector.DEFAULT_BACK_CAMERA, useCase, previewUseCase
+                )
                 lifecycle.resume()
 
                 // A camera taken away later (another app, the screen locking) reports it here.
@@ -164,27 +209,42 @@ class CameraStreamer(private val context: Context) {
         owner?.destroy()
         owner = null
         analysis = null
+        preview = null
+        jpegSink = null
+        pictureSink = null
         provider = null
         worker?.shutdown()
         worker = null
         Log.i(TAG, "Camera streaming stopped after $frameCount frame(s)")
     }
 
-    /** One camera image → one small, upright JPEG, at most every [FRAME_INTERVAL_MS]. */
-    private fun handle(image: ImageProxy, onFrame: (String, Int) -> Unit) {
+    /**
+     * One camera image → one upright picture for the detector, and one small JPEG for the driver
+     * (when shared), at most every [FRAME_INTERVAL_MS].
+     */
+    private fun handle(image: ImageProxy) {
         try {
             if (!running) return
+            val jpegTo = jpegSink
+            val pictureTo = pictureSink
+            if (jpegTo == null && pictureTo == null) return
             val now = System.currentTimeMillis()
             if (now - lastFrameAt < FRAME_INTERVAL_MS) return
             lastFrameAt = now
-
-            val upright = scaleAndRotate(image.toBitmap(), image.imageInfo.rotationDegrees)
-            var bytes = encode(upright, JPEG_QUALITY)
-            if (bytes.size > TARGET_MAX_BYTES) bytes = encode(upright, JPEG_QUALITY_SMALL)
-            upright.recycle()
-
             frameCount++
-            onFrame(Base64.encodeToString(bytes, Base64.NO_WRAP), frameCount)
+
+            val upright = scaleAndRotate(image.toBitmap(), image.imageInfo.rotationDegrees, PICTURE_SIDE_PX)
+            if (pictureTo != null) runCatching { pictureTo(upright) }.onFailure { Log.w(TAG, "picture sink: $it") }
+            if (jpegTo != null) {
+                val small = if (max(upright.width, upright.height) > MAX_SIDE_PX) {
+                    scaleAndRotate(upright, 0, MAX_SIDE_PX, recycleSource = false)
+                } else upright
+                var bytes = encode(small, JPEG_QUALITY)
+                if (bytes.size > TARGET_MAX_BYTES) bytes = encode(small, JPEG_QUALITY_SMALL)
+                if (small !== upright) small.recycle()
+                jpegTo(Base64.encodeToString(bytes, Base64.NO_WRAP), frameCount)
+            }
+            upright.recycle()
         } catch (e: Exception) {
             Log.w(TAG, "Frame skipped: $e")
         } finally {
@@ -192,15 +252,15 @@ class CameraStreamer(private val context: Context) {
         }
     }
 
-    private fun scaleAndRotate(source: Bitmap, rotationDegrees: Int): Bitmap {
+    private fun scaleAndRotate(source: Bitmap, rotationDegrees: Int, maxSide: Int, recycleSource: Boolean = true): Bitmap {
         val longest = max(source.width, source.height)
-        val scale = if (longest > MAX_SIDE_PX) MAX_SIDE_PX.toFloat() / longest else 1f
+        val scale = if (longest > maxSide) maxSide.toFloat() / longest else 1f
         val matrix = Matrix().apply {
             postScale(scale, scale)
             if (rotationDegrees != 0) postRotate(rotationDegrees.toFloat())
         }
         val out = Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true)
-        if (out !== source) source.recycle()
+        if (recycleSource && out !== source) source.recycle()
         return out
     }
 

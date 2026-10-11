@@ -75,6 +75,7 @@ object MindMapAgent {
     /** Places first, then the rider's own notes, then landmarks: a place name is the likelier meaning. */
     private fun rank(n: Node) = when (n.kind) {
         NodeKind.PLACE -> 0; NodeKind.ANCHOR -> 1; NodeKind.AREA -> 2; NodeKind.LANDMARK -> 3; NodeKind.RIDE_CUE -> 4
+        NodeKind.OBSERVED -> 5
     }
 
     // ---- "what's around X" ----------------------------------------------------------------
@@ -113,6 +114,9 @@ object MindMapAgent {
             }
         }
 
+        // What the rider's camera has seen right here while exploring.
+        if (target.located) seenNear(map, target.lat!!, target.lng!!, now)?.let { lines += it }
+
         // Ride cues on the way there.
         val cues = map.edges.filter { it.kind == EdgeKind.ON_RIDE && it.to == target.id }
             .mapNotNull { map.node(it.from) }.filter { it.kind == NodeKind.RIDE_CUE }
@@ -140,9 +144,11 @@ object MindMapAgent {
             .filter { (n, _) -> !n.id.startsWith("walk:") && standalone(map, n) }
             .distinctBy { TextSimilarity.normalise(it.first.label) }
             .take(3)
-        if (area == null && near.isEmpty()) return null
+        val seen = seenNear(map, lat, lng, now)
+        if (area == null && near.isEmpty() && seen == null) return null
         val parts = mutableListOf<String>()
         area?.let { parts += "You're in $it." }
+        seen?.let { parts += it }
         if (near.isNotEmpty()) {
             parts += "Places you know nearby: " + near.joinToString("; ") { (n, d) ->
                 val dir = Geo.bearing(lat, lng, n.lat!!, n.lng!!)
@@ -184,6 +190,10 @@ object MindMapAgent {
                 else "${n.label}: ${places.take(MAX_ITEMS).joinToString(", ") { display(it) }}."
             }
             NodeKind.PLACE -> return around(map, n, now)
+            NodeKind.OBSERVED -> {
+                out += "Your camera saw ${aOrAn(n.label)}${sideOf(n)} here ${ago(n, now)}" +
+                    (if (n.confirmations > 1) ", ${n.confirmations} times" else "") + "."
+            }
         }
         map.anchorsFor(n.id).filter { n.kind != NodeKind.ANCHOR }.forEach { out += "Your note: ${anchor(it, now)}." }
         return out.joinToString(" ")
@@ -200,7 +210,8 @@ object MindMapAgent {
             count(NodeKind.LANDMARK).takeIf { it > 0 }?.let { plural(it, "landmark") },
             count(NodeKind.ANCHOR).takeIf { it > 0 }?.let { plural(it, "personal note") },
             count(NodeKind.RIDE_CUE).takeIf { it > 0 }?.let { plural(it, "ride cue") },
-            count(NodeKind.AREA).takeIf { it > 0 }?.let { plural(it, "area") }
+            count(NodeKind.AREA).takeIf { it > 0 }?.let { plural(it, "area") },
+            count(NodeKind.OBSERVED).takeIf { it > 0 }?.let { plural(it, "thing") + " seen with your camera" }
         )
         val shared = map.edges.count { it.kind == EdgeKind.SAME_AS }
         return "Your mind map has ${parts.joinToString(", ")}." +
@@ -411,4 +422,43 @@ object MindMapAgent {
     }
 
     private fun plural(n: Int, word: String) = "$n $word${if (n == 1) "" else "s"}"
+
+    /** How close a camera sighting must be to count as "here". */
+    const val SEEN_NEAR_M = 60.0
+
+    /**
+     * "With your camera here you've seen a bench on your left and steps, 2 days ago." Null when
+     * the camera has seen nothing within [SEEN_NEAR_M].
+     */
+    fun seenNear(map: MindMap, lat: Double, lng: Double, now: Long): String? {
+        val seen = map.near(lat, lng, SEEN_NEAR_M, setOf(NodeKind.OBSERVED))
+            .distinctBy { TextSimilarity.normalise(it.first.label) }
+            .sortedByDescending { it.first.confirmations }
+            .take(MAX_ITEMS)
+        if (seen.isEmpty()) return null
+        val latest = seen.maxOf { maxOf(it.first.lastConfirmedAt, it.first.createdAt) }
+        return "With your camera here you've seen " +
+            seen.joinToString(", ") { (n, _) -> aOrAn(n.label) + sideOf(n) } +
+            ", ${ago(latest, now)}."
+    }
+
+    private fun aOrAn(label: String): String {
+        val l = label.trim()
+        if (l.isEmpty()) return l
+        val first = l.split(' ').first().lowercase()
+        if (first in setOf("the", "a", "an", "some") || l.endsWith("s") && !l.endsWith("ss")) return l
+        return (if (first.first() in "aeiou") "an " else "a ") + l
+    }
+
+    private fun ago(n: Node, now: Long) = ago(maxOf(n.lastConfirmedAt, n.createdAt), now)
+
+    private fun ago(at: Long, now: Long): String {
+        val days = ((now - at) / 86_400_000L).toInt()
+        return when {
+            days <= 0 -> "today"
+            days == 1 -> "yesterday"
+            days < 14 -> "$days days ago"
+            else -> "${days / 7} weeks ago"
+        }
+    }
 }

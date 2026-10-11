@@ -24,7 +24,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.foundation.border
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -38,20 +41,22 @@ import com.cabeye.rider.ui.theme.CabEyeType
  * Displays:
  * - App title "Cab Eye"
  * - Optional city indicator badge
- * - Hidden 5-tap connection/settings chip in corner
+ * - Connection status, and a Settings button (one tap)
  */
 @Composable
 fun CabEyeHeader(
     modifier: Modifier = Modifier,
     cityName: String? = null,
     connected: Boolean = true,
-    onOpenSettings: () -> Unit = {}
+    onOpenSettings: () -> Unit = {},
+    /** Opens the mind map screen; null hides the button. */
+    onOpenFeatures: (() -> Unit)? = null,
+    /** Opens the explore module (camera, no ride); null hides the button. */
+    onOpenExplore: (() -> Unit)? = null
 ) {
-    var taps by remember { mutableIntStateOf(0) }
-    var firstTapAt by remember { mutableLongStateOf(0L) }
-
+    Column(modifier = modifier.fillMaxWidth()) {
     Row(
-        modifier = modifier
+        modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = CabEyeSpacing.screenPadding, vertical = CabEyeSpacing.md),
         horizontalArrangement = Arrangement.SpaceBetween,
@@ -76,28 +81,8 @@ fun CabEyeHeader(
             }
         }
 
-        // Connection status & settings entrance
-        // Hidden 5-tap mechanism preserved for accessibility safety
-        Box(
-            modifier = Modifier
-                .defaultMinSize(minWidth = CabEyeSpacing.minTouchTarget, minHeight = CabEyeSpacing.minTouchTarget)
-                .clearAndSetSemantics { }
-                .clip(RoundedCornerShape(12.dp))
-                .clickable {
-                    val now = System.currentTimeMillis()
-                    if (now - firstTapAt > 3_000L) {
-                        firstTapAt = now
-                        taps = 1
-                    } else {
-                        taps++
-                    }
-                    if (taps >= 5) {
-                        taps = 0
-                        onOpenSettings()
-                    }
-                },
-            contentAlignment = Alignment.CenterEnd
-        ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            // Connection status: green dot when the server is reachable, "offline" when not.
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
@@ -124,6 +109,71 @@ fun CabEyeHeader(
                     )
                 }
             }
+            Spacer(Modifier.width(10.dp))
+            // Settings: a plain button, one tap. Rider or driver mode, server address, account.
+            Box(
+                modifier = Modifier
+                    .defaultMinSize(minWidth = CabEyeSpacing.minTouchTarget, minHeight = CabEyeSpacing.minTouchTarget)
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(CabEyeColors.SurfaceElevated)
+                    .border(1.5.dp, CabEyeColors.CardBorderHighlight, RoundedCornerShape(14.dp))
+                    .clickable(onClickLabel = "Open settings", role = Role.Button) { onOpenSettings() }
+                    .semantics { contentDescription = "Settings. Switch to driver mode, server address, account." }
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = "⚙  Settings",
+                    style = CabEyeType.buttonText.copy(fontSize = 16.sp, fontWeight = FontWeight.Bold),
+                    color = CabEyeColors.TextPrimary
+                )
+            }
         }
+    }
+    if (onOpenFeatures != null || onOpenExplore != null) Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = CabEyeSpacing.screenPadding),
+        horizontalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+    if (onOpenExplore != null) {
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .defaultMinSize(minHeight = CabEyeSpacing.minTouchTarget)
+                .clip(RoundedCornerShape(14.dp))
+                .background(CabEyeColors.SurfaceElevated)
+                .border(1.5.dp, CabEyeColors.SuccessGreen, RoundedCornerShape(14.dp))
+                .clickable(onClickLabel = "Open explore", role = Role.Button) { onOpenExplore() }
+                .semantics { contentDescription = "Explore around me with the camera. No ride needed." }
+                .padding(horizontal = 10.dp, vertical = 12.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = "📷  Explore",
+                style = CabEyeType.buttonText.copy(fontSize = 17.sp, fontWeight = FontWeight.Bold),
+                color = CabEyeColors.SuccessGreen
+            )
+        }
+    }
+    if (onOpenFeatures != null) {
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .defaultMinSize(minHeight = CabEyeSpacing.minTouchTarget)
+                .clip(RoundedCornerShape(14.dp))
+                .background(CabEyeColors.SurfaceElevated)
+                .border(1.5.dp, CabEyeColors.VoiceBlue, RoundedCornerShape(14.dp))
+                .clickable(onClickLabel = "Open my mind map", role = Role.Button) { onOpenFeatures() }
+                .semantics { contentDescription = "My mind map. Places from your rides, spots and walks from exploring, and a map." }
+                .padding(horizontal = 14.dp, vertical = 12.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = "🧭  My mind map",
+                style = CabEyeType.buttonText.copy(fontSize = 17.sp, fontWeight = FontWeight.Bold),
+                color = CabEyeColors.VoiceBlue
+            )
+        }
+    }
+    }
     }
 }

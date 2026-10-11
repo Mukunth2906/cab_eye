@@ -18,12 +18,16 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * One-time codes for phone sign-in.
  *
- * <h2>Mock delivery</h2>
- * There is no SMS provider in this MVP. The code is written to the backend log, and — only while
- * {@code cabeye.auth.otp.expose} is true (the default for local demos) — returned in the
- * {@code /auth/otp} response as {@code devCode}, so the app can "auto-read" it exactly the way
- * the SMS Retriever API will once a real provider (MSG91, Twilio, Firebase) is plugged into
- * {@link #deliver}. Set {@code CABEYE_OTP_EXPOSE=false} before any public deployment.
+ * <h2>Delivery</h2>
+ * When an SMS provider is set up ({@link SmsSender}: Twilio or Fast2SMS keys in
+ * {@code cabeye-secrets.properties}), the code is texted to the phone for real and is never put
+ * in the reply — the app reads it from the incoming message.
+ *
+ * <p>With no provider, or when the provider refuses, delivery falls back to <b>mock</b>: the
+ * code is written to the backend log and — only while {@code cabeye.auth.otp.expose} is true
+ * (the default for local demos) — returned in the {@code /auth/otp} reply as {@code devCode},
+ * so the app can show it as an incoming message and fill it in. Set
+ * {@code CABEYE_OTP_EXPOSE=false} before any public deployment.
  *
  * <h2>Why these limits</h2>
  * <ul>
@@ -48,12 +52,16 @@ public class OtpService {
     private final Map<String, Pending> pending = new ConcurrentHashMap<>();
     private final boolean expose;
     private final com.cabeye.backend.redis.RedisBridge redisBridge;
+    private final SmsSender sms;
 
     public OtpService(@Value("${cabeye.auth.otp.expose:true}") boolean expose,
                       @org.springframework.beans.factory.annotation.Autowired(required = false)
-                      com.cabeye.backend.redis.RedisBridge redisBridge) {
+                      com.cabeye.backend.redis.RedisBridge redisBridge,
+                      @org.springframework.beans.factory.annotation.Autowired(required = false)
+                      SmsSender sms) {
         this.expose = expose;
         this.redisBridge = redisBridge;
+        this.sms = sms;
     }
 
     /**
@@ -67,7 +75,7 @@ public class OtpService {
         Pending previous = pending.get(key);
         if (previous != null && now - previous.sentAt < RESEND_COOLDOWN_MS) {
             long wait = (RESEND_COOLDOWN_MS - (now - previous.sentAt) + 999) / 1000;
-            return new Sent(false, wait, null, TTL_MS / 1000);
+            return new Sent(false, wait, null, TTL_MS / 1000, "none");
         }
 
         String code = String.format("%06d", random.nextInt(1_000_000));
@@ -76,8 +84,10 @@ public class OtpService {
         if (redisBridge != null && redisBridge.isEnabled()) {
             redisBridge.saveOtp(key, hashed + ":" + (now + TTL_MS), TTL_MS / 1000);
         }
-        deliver(role, phone, code);
-        return new Sent(true, 0, expose ? code : null, TTL_MS / 1000);
+        boolean texted = deliver(role, phone, code);
+        // A code that really went out by SMS is never also handed back: the phone has to read
+        // the message, exactly as it will for every real rider.
+        return new Sent(true, 0, !texted && expose ? code : null, TTL_MS / 1000, texted ? "sms" : "mock");
     }
 
     /** @return the verdict; a success consumes the code so it cannot be replayed */
@@ -113,9 +123,18 @@ public class OtpService {
         return Verdict.WRONG;
     }
 
-    /** The seam for a real SMS provider. */
-    private void deliver(Role role, String phone, String code) {
+    /** @return true when the code was texted; false means mock delivery (log, and devCode). */
+    private boolean deliver(Role role, String phone, String code) {
+        if (sms != null && sms.configured()) {
+            String failure = sms.send(phone, code);
+            if (failure == null) {
+                log.info("OTP role={} phone={} delivered by SMS ({})", role, Phone.masked(phone), sms.provider());
+                return true;
+            }
+            log.warn("OTP role={} phone={} SMS failed ({}); falling back to mock delivery", role, Phone.masked(phone), failure);
+        }
         log.info("OTP role={} phone={} code={} (mock delivery — no SMS sent)", role, Phone.masked(phone), code);
+        return false;
     }
 
     private static String key(Role role, String phone) {
@@ -137,8 +156,9 @@ public class OtpService {
      * @param sent        false when refused by the resend cooldown
      * @param retryAfterSeconds how long to wait when refused
      * @param devCode     the code itself, only in mock-exposure mode
+     * @param delivery    "sms" when texted, "mock" when not, "none" when nothing was sent
      */
-    public record Sent(boolean sent, long retryAfterSeconds, String devCode, long expiresInSeconds) {}
+    public record Sent(boolean sent, long retryAfterSeconds, String devCode, long expiresInSeconds, String delivery) {}
 
     public enum Verdict {
         OK, WRONG, EXPIRED, LOCKED, NO_CODE;

@@ -72,6 +72,8 @@ fun DebugSettingsScreen(
     /** Rider only: null hides the camera setting. */
     cameraAlwaysShare: Boolean? = null,
     onCameraAlwaysShare: (Boolean) -> Unit = {},
+    /** Debug builds, rider mode: loads demo walks and mind map onto this phone. Null hides it. */
+    onLoadDemo: ((report: (String) -> Unit) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     val palette = LocalPalette.current
@@ -107,6 +109,63 @@ fun DebugSettingsScreen(
             }
 
             Spacer(Modifier.height(24.dp))
+
+            // ---------------------------------------------------------------------------
+            //  Role
+            // ---------------------------------------------------------------------------
+
+            Text("Mode", style = MaterialTheme.typography.bodyLarge, color = palette.clarify)
+            Spacer(Modifier.height(4.dp))
+            Text(
+                // Said plainly, because it is the surprising part: this toggle does not merely
+                // change the screen. It releases the microphone and the speech engine.
+                "Tap Driver to use this phone as the driver's app; tap Rider to come back. " +
+                        "Driver mode releases the microphone and the narrator.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = palette.muted
+            )
+            Spacer(Modifier.height(14.dp))
+
+            Row(Modifier.fillMaxWidth()) {
+                RoleButton(
+                    label = "RIDER",
+                    role = AppRole.RIDER,
+                    current = currentRole,
+                    modifier = Modifier.weight(1f),
+                    onClick = onRoleChange
+                )
+                Spacer(Modifier.padding(horizontal = 6.dp))
+                RoleButton(
+                    label = "DRIVER",
+                    role = AppRole.DRIVER,
+                    current = currentRole,
+                    modifier = Modifier.weight(1f),
+                    onClick = onRoleChange
+                )
+            }
+
+            Spacer(Modifier.height(12.dp))
+            Text(
+                "Every request carries X-Role: ${currentRole.wireName}",
+                style = MaterialTheme.typography.bodyMedium,
+                color = palette.muted
+            )
+
+            if (!debugBuild) {
+                Spacer(Modifier.height(20.dp))
+                Text(
+                    "This is a release build. The role toggle is a debug affordance and " +
+                            "would not ship in this form.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = palette.danger
+                )
+            }
+
+
+            Spacer(Modifier.height(28.dp))
+            Divider()
+            Spacer(Modifier.height(24.dp))
+
 
             // ---------------------------------------------------------------------------
             //  Backend address
@@ -202,55 +261,34 @@ fun DebugSettingsScreen(
             Divider()
             Spacer(Modifier.height(24.dp))
 
-            // ---------------------------------------------------------------------------
-            //  Role
-            // ---------------------------------------------------------------------------
-
-            Text("Mode", style = MaterialTheme.typography.bodyLarge, color = palette.clarify)
-            Spacer(Modifier.height(4.dp))
-            Text(
-                // Said plainly, because it is the surprising part: this toggle does not merely
-                // change the screen. It releases the microphone and the speech engine.
-                "Switching to Driver releases the microphone and shuts the narrator down — " +
-                        "not just hides them.",
-                style = MaterialTheme.typography.bodyMedium,
-                color = palette.muted
-            )
-            Spacer(Modifier.height(14.dp))
-
-            Row(Modifier.fillMaxWidth()) {
-                RoleButton(
-                    label = "RIDER",
-                    role = AppRole.RIDER,
-                    current = currentRole,
-                    modifier = Modifier.weight(1f),
-                    onClick = onRoleChange
-                )
-                Spacer(Modifier.padding(horizontal = 6.dp))
-                RoleButton(
-                    label = "DRIVER",
-                    role = AppRole.DRIVER,
-                    current = currentRole,
-                    modifier = Modifier.weight(1f),
-                    onClick = onRoleChange
-                )
-            }
-
-            Spacer(Modifier.height(12.dp))
-            Text(
-                "Every request carries X-Role: ${currentRole.wireName}",
-                style = MaterialTheme.typography.bodyMedium,
-                color = palette.muted
-            )
-
-            if (!debugBuild) {
-                Spacer(Modifier.height(20.dp))
+            if (onLoadDemo != null) {
+                var demoStatus by remember { mutableStateOf("") }
+                Text("Demo data", style = MaterialTheme.typography.bodyLarge, color = palette.clarify)
+                Spacer(Modifier.height(4.dp))
                 Text(
-                    "This is a release build. The role toggle is a debug affordance and " +
-                            "would not ship in this form.",
+                    "Adds three saved walks with landmarks, personal notes (Ravi's tea shop, the temple bell, " +
+                        "where you meet Priya), ride cues, areas and past rides to this phone, so the walking " +
+                        "guide and the mind map have something to show. Your own notes are kept. For the ride " +
+                        "history too, sign in as the demo rider 90000 11111 (see scripts/seed_demo.py).",
                     style = MaterialTheme.typography.bodyMedium,
-                    color = palette.danger
+                    color = palette.muted
                 )
+                Spacer(Modifier.height(12.dp))
+                WideButton(
+                    label = "Load demo walks & mind map",
+                    accent = palette.listening,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    demoStatus = "Loading…"
+                    onLoadDemo { demoStatus = it }
+                }
+                if (demoStatus.isNotBlank()) {
+                    Spacer(Modifier.height(10.dp))
+                    Text(demoStatus, style = MaterialTheme.typography.bodyMedium, color = palette.onBackground)
+                }
+                Spacer(Modifier.height(28.dp))
+                Divider()
+                Spacer(Modifier.height(24.dp))
             }
 
             if (onSignOut != null) {

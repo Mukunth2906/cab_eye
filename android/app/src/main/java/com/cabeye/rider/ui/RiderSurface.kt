@@ -7,7 +7,9 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -31,6 +33,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -111,6 +114,14 @@ fun RiderSurface(
     onStopCamera: () -> Unit = {},
     onCallDriver: () -> Unit = {},
     onHelp: () -> Unit = {},
+    onQuickCommand: (String) -> Unit = {},
+    explore: com.cabeye.rider.explore.ExploreUi = com.cabeye.rider.explore.ExploreUi(),
+    mindMap: MindMapActions? = null,
+    exploreActions: ExploreActions? = null,
+    onCameraPreview: (androidx.camera.core.Preview.SurfaceProvider?) -> Unit = {},
+    mindMapOpen: Boolean = false,
+    onMindMapOpen: (Boolean) -> Unit = {},
+    onDoubleTap: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val palette = LocalPalette.current
@@ -119,6 +130,8 @@ fun RiderSurface(
 
     val currentHoldStart by rememberUpdatedState(onHoldStart)
     val currentHoldEnd by rememberUpdatedState(onHoldEnd)
+    val currentDoubleTap by rememberUpdatedState(onDoubleTap)
+    val idle by rememberUpdatedState(uiState.ride is RiderState.Idle)
 
     // Trigger distinctive haptic on state change
     LaunchedEffect(uiState.ride::class, uiState.sosActive) {
@@ -129,16 +142,51 @@ fun RiderSurface(
         modifier = modifier
             .fillMaxSize()
             .background(palette.background)
+    ) {
+        Column(
+            modifier = Modifier.fillMaxSize()
+        ) {
+            // Top bar: title, connection, and the Settings button. Deliberately OUTSIDE the
+            // hold-to-talk area below, so touching Settings never opens the microphone.
+            CabEyeHeader(
+                cityName = uiState.activeCityName,
+                connected = uiState.connected,
+                onOpenSettings = onOpenSettings,
+                onOpenFeatures = if (uiState.ride is RiderState.Idle) ({ onMindMapOpen(true) }) else null,
+                onOpenExplore = if (uiState.ride is RiderState.Idle && exploreActions != null) ({ exploreActions.open() }) else null
+            )
 
-            // Massive whole-screen tap-and-hold target for voice input
+            // Ride module: the driver asking to see the camera, or the camera shared. Above the
+            // hold-to-talk area, so its buttons are plain buttons.
+            if (uiState.camera != CameraShare.OFF) {
+                RideCameraCard(uiState, onCameraAnswer, onStopCamera, onCameraPreview)
+            }
+
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+
+            // Everything below the top bar is one tap-and-hold target for voice input, and,
+            // from the ready screen, a double tap opens explore. The first tap of a double tap
+            // is still an ordinary press (holding must open the mic at once, never after a
+            // wait); the view model drops that press when the second tap lands.
             .pointerInput(Unit) {
-                detectTapGestures(
-                    onPress = {
-                        currentHoldStart()
-                        tryAwaitRelease()
-                        currentHoldEnd()
+                var quickTapUpAt = 0L
+                awaitEachGesture {
+                    val down = awaitFirstDown()
+                    if (quickTapUpAt != 0L && down.uptimeMillis - quickTapUpAt < viewConfiguration.doubleTapTimeoutMillis) {
+                        quickTapUpAt = 0L
+                        waitForUpOrCancellation()
+                        currentDoubleTap()
+                        return@awaitEachGesture
                     }
-                )
+                    val fromIdle = idle
+                    currentHoldStart()
+                    val up = waitForUpOrCancellation()
+                    currentHoldEnd()
+                    quickTapUpAt = if (fromIdle && up != null && up.uptimeMillis - down.uptimeMillis < QUICK_TAP_MS) up.uptimeMillis else 0L
+                }
             }
 
             // Merged accessibility semantics for screen readers
@@ -154,19 +202,12 @@ fun RiderSurface(
                     onStopCamera = onStopCamera,
                     onCodeConfirmed = onCodeConfirmed,
                     onCallDriver = onCallDriver,
-                    onHelp = onHelp
+                    onHelp = onHelp,
+                    onOpenExplore = exploreActions?.let { a -> { a.open() } },
+                    onOpenMindMap = mindMap?.let { { onMindMapOpen(true) } }
                 )
             }
-    ) {
-        Column(
-            modifier = Modifier.fillMaxSize()
         ) {
-            // Top App Bar Header with title, active city, and 5-tap connection chip
-            CabEyeHeader(
-                cityName = uiState.activeCityName,
-                connected = uiState.connected,
-                onOpenSettings = onOpenSettings
-            )
 
             // Main scrollable content column
             Column(
@@ -205,13 +246,17 @@ fun RiderSurface(
                     // -----------------------------------------------------------------
                     is RiderState.Listening -> {
                         VoiceOrb(
-                            state = VoiceOrbState.LISTENING,
+                            state = if (uiState.micOpen) VoiceOrbState.LISTENING else VoiceOrbState.READY,
                             inputLevel = ride.inputLevel,
                             customAccent = palette.listening
                         )
                         Spacer(Modifier.height(CabEyeSpacing.lg))
                         StateHeadline(
-                            text = if (ride.isFollowUp) "Listening for\nyour answer" else "Listening...",
+                            text = when {
+                                !uiState.micOpen -> "Hold to\nanswer"
+                                ride.isFollowUp -> "Listening for\nyour answer"
+                                else -> "Listening..."
+                            },
                             color = palette.listening
                         )
                         Spacer(Modifier.height(CabEyeSpacing.sm))
@@ -219,7 +264,7 @@ fun RiderSurface(
                             text = if (ride.partialTranscript.isNotBlank())
                                 "“${ride.partialTranscript}”"
                             else
-                                "Speak your destination",
+                                "Say where you want to go. Take your time; pauses are fine.",
                             color = palette.onBackground
                         )
                         Spacer(Modifier.height(CabEyeSpacing.xl))
@@ -384,8 +429,16 @@ fun RiderSurface(
                             color = palette.clarify
                         )
                         Spacer(Modifier.height(CabEyeSpacing.sm))
+                        val seconds = (ride.elapsedMillis / 1000).toInt()
                         SupportingText(
-                            text = "We're finding the nearest driver for you.",
+                            text = "Searching for %d:%02d".format(seconds / 60, seconds % 60),
+                            color = palette.clarify
+                        )
+                        Spacer(Modifier.height(CabEyeSpacing.sm))
+                        SupportingText(
+                            text = if (seconds < 30) "Your request has gone to drivers who are online nearby."
+                            else "No driver has accepted yet. Drivers see your request in the Cab Eye driver app; " +
+                                "you'll hear the moment one accepts.",
                             color = palette.muted
                         )
                         Spacer(Modifier.height(CabEyeSpacing.xl))
@@ -950,6 +1003,29 @@ fun RiderSurface(
                 }
             }
 
+            if (uiState.holdToAnswer && !uiState.micOpen) {
+                Text(
+                    text = "Hold the screen or a volume button to answer",
+                    style = CabEyeType.secondaryInfo.copy(fontWeight = FontWeight.Bold),
+                    color = palette.listening,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = CabEyeSpacing.screenPadding)
+                        .background(palette.surface, CabEyeShapes.small)
+                        .border(1.5.dp, palette.listening, CabEyeShapes.small)
+                        .padding(12.dp)
+                )
+            } else if (uiState.micOpen) {
+                Text(
+                    text = "Listening while you hold. Let go when you've finished.",
+                    style = CabEyeType.secondaryInfo,
+                    color = palette.listening,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = CabEyeSpacing.screenPadding)
+                )
+            }
+
             // Bottom bar with Help & SOS button
             Box(
                 modifier = Modifier
@@ -972,14 +1048,52 @@ fun RiderSurface(
                 )
             }
         }
+        }
 
-        // Live camera assist in top corner
-        CameraPanel(
-            camera = uiState.camera,
-            onAnswer = onCameraAnswer,
-            onStop = onStopCamera,
-            modifier = Modifier.align(Alignment.TopStart)
-        )
+
+        // Walking routes and the mind map, as buttons. On top of everything, so a tap here can
+        // never reach the hold-to-talk area underneath.
+        if (mindMapOpen && mindMap != null) {
+            MindMapScreen(
+                catalog = mindMap.catalog(),
+                answer = mindMap.answer(),
+                onLoad = mindMap::load,
+                onClose = { onMindMapOpen(false) },
+                onBook = { if (mindMap.book(it)) onMindMapOpen(false) },
+                onExplain = mindMap::explain,
+                onForget = mindMap::forget,
+                onGuide = { if (mindMap.guide(it)) onMindMapOpen(false) },
+                onReadWalk = mindMap::readWalk,
+                onForgetWalk = mindMap::forgetWalk,
+                onBookRoute = { if (mindMap.bookRoute(it)) onMindMapOpen(false) },
+                onExplore = {
+                    onMindMapOpen(false)
+                    exploreActions?.open()
+                },
+                onQuick = { command ->
+                    onMindMapOpen(false)
+                    onQuickCommand(command)
+                }
+            )
+        }
+
+        if (explore.open && exploreActions != null) {
+            ExploreScreen(
+                ui = explore,
+                onPreview = onCameraPreview,
+                onHoldStart = onHoldStart,
+                onHoldEnd = onHoldEnd,
+                onDescribe = exploreActions::describe,
+                onRead = exploreActions::read,
+                onKeepTelling = exploreActions::keepTelling,
+                onFind = exploreActions::find,
+                onStop = exploreActions::stop,
+                onName = exploreActions::name,
+                onAskName = exploreActions::askName,
+                onFinish = exploreActions::finish,
+                micOpen = uiState.micOpen
+            )
+        }
 
         // Emergency Overlay
         if (uiState.sosActive) {
@@ -1053,52 +1167,6 @@ private fun ProximityBeaconVisualization(
                 text = "🚕",
                 fontSize = 38.sp
             )
-        }
-    }
-}
-
-/**
- * Live camera corner panel for driver assist.
- */
-@Composable
-private fun CameraPanel(
-    camera: CameraShare,
-    onAnswer: (Boolean) -> Unit,
-    onStop: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    if (camera == CameraShare.OFF) return
-    val palette = LocalPalette.current
-    val live = camera == CameraShare.LIVE
-
-    Column(
-        modifier = modifier
-            .padding(12.dp)
-            .width(230.dp)
-            .background(palette.surface, CabEyeShapes.card)
-            .border(2.dp, if (live) palette.danger else palette.clarify, CabEyeShapes.card)
-            .padding(12.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        Text(
-            text = if (live) "● CAMERA ON" else "Driver asks to see camera",
-            style = CabEyeType.badgeText,
-            color = if (live) palette.danger else palette.clarify,
-            textAlign = TextAlign.Center
-        )
-        Text(
-            text = if (live) "Shown to driver only." else "Say yes or no",
-            style = CabEyeType.secondaryInfo.copy(fontSize = 13.sp),
-            color = palette.muted,
-            textAlign = TextAlign.Center
-        )
-        Spacer(Modifier.height(8.dp))
-        if (live) {
-            SecondaryAction(label = "STOP CAMERA", onClick = onStop, accentColor = palette.danger)
-        } else {
-            PrimaryAction(label = "SHARE", onClick = { onAnswer(true) }, accentColor = palette.confirm)
-            Spacer(Modifier.height(8.dp))
-            SecondaryAction(label = "NO", onClick = { onAnswer(false) }, accentColor = palette.onBackground)
         }
     }
 }
@@ -1248,3 +1316,109 @@ private fun hapticFor(uiState: RiderUiState): HapticPattern {
         is RiderState.Walking -> HapticPattern.LISTENING_END
     }
 }
+
+
+/** What the mind map screen can ask of the ride screen's view model. */
+interface MindMapActions {
+    fun catalog(): com.cabeye.rider.mindmap.MindMapCatalog.Catalog?
+    fun answer(): String
+    fun load()
+    fun book(card: com.cabeye.rider.mindmap.MindMapCatalog.PlaceCard): Boolean
+    fun explain(nodeId: String)
+    fun forget(nodeId: String)
+    fun guide(routeId: String): Boolean
+    fun readWalk(routeId: String)
+    fun forgetWalk(routeId: String)
+    fun bookRoute(name: String): Boolean
+}
+
+/** What the explore screen can ask of the ride screen's view model. */
+interface ExploreActions {
+    fun open()
+    fun describe()
+    fun read()
+    fun keepTelling()
+    fun find(target: String)
+    fun stop()
+    fun name(name: String)
+    fun askName()
+    fun finish(save: Boolean)
+}
+
+/**
+ * Ride module: the driver asks to see the rider's camera (Share / No), or the camera is shared
+ * (live preview with what it sees drawn on it, and Stop). Full width, large, impossible to miss.
+ */
+@Composable
+private fun RideCameraCard(
+    uiState: RiderUiState,
+    onAnswer: (Boolean) -> Unit,
+    onStop: () -> Unit,
+    onPreview: (androidx.camera.core.Preview.SurfaceProvider?) -> Unit
+) {
+    val palette = LocalPalette.current
+    val who = uiState.cameraFrom.ifBlank { "Your driver" }
+    val live = uiState.camera == CameraShare.LIVE
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = CabEyeSpacing.screenPadding, vertical = 8.dp)
+            .background(palette.surface, CabEyeShapes.card)
+            .border(3.dp, if (live) palette.danger else palette.clarify, CabEyeShapes.card)
+            .padding(14.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        if (!live) {
+            Text("📷 $who asks to see your camera", style = CabEyeType.stateTitle.copy(fontSize = 22.sp), color = palette.clarify, textAlign = TextAlign.Center)
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "So they can find you and guide you to the car. Only they see it, nothing is recorded, " +
+                    "and it turns off once you're in. I'll tell you what's around you too.",
+                style = CabEyeType.secondaryInfo, color = palette.onBackground, textAlign = TextAlign.Center
+            )
+            Spacer(Modifier.height(12.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+                PrimaryAction(label = "SHARE CAMERA", onClick = { onAnswer(true) }, accentColor = palette.confirm, modifier = Modifier.weight(1f))
+                SecondaryAction(label = "NO", onClick = { onAnswer(false) }, accentColor = palette.onBackground, modifier = Modifier.weight(1f))
+            }
+        } else {
+            Text("● CAMERA SHARED WITH ${who.uppercase()}", style = CabEyeType.badgeText, color = palette.danger)
+            Spacer(Modifier.height(8.dp))
+            val context = androidx.compose.ui.platform.LocalContext.current
+            val previewView = androidx.compose.runtime.remember {
+                androidx.camera.view.PreviewView(context).apply {
+                    scaleType = androidx.camera.view.PreviewView.ScaleType.FIT_CENTER
+                    implementationMode = androidx.camera.view.PreviewView.ImplementationMode.COMPATIBLE
+                }
+            }
+            androidx.compose.runtime.DisposableEffect(previewView) {
+                onPreview(previewView.surfaceProvider)
+                onDispose { onPreview(null) }
+            }
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(260.dp)
+                    .clip(CabEyeShapes.medium)
+                    .background(Color.Black)
+            ) {
+                androidx.compose.ui.viewinterop.AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
+                com.cabeye.rider.ui.components.DetectionOverlay(
+                    objects = uiState.cameraSeen, imageAspect = 3f / 4f, modifier = Modifier.fillMaxSize()
+                )
+            }
+            if (uiState.cameraSeen.isNotEmpty()) {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "Around you: " + uiState.cameraSeen.take(4).joinToString(", ") { "${it.label} (${it.clock})" },
+                    style = CabEyeType.secondaryInfo, color = palette.listening, textAlign = TextAlign.Center
+                )
+            }
+            Spacer(Modifier.height(10.dp))
+            SecondaryAction(label = "STOP CAMERA", onClick = onStop, accentColor = palette.danger)
+        }
+    }
+}
+
+/** A press shorter than this can be the first half of a double tap; a longer one was a hold. */
+private const val QUICK_TAP_MS = 300L

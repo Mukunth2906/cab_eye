@@ -458,15 +458,19 @@ class VoiceLogicTest {
     }
 
     @Test
-    fun `the silence timeout is eight seconds and rests rather than looping`() {
-        assertEquals(8_000L, RecoveryLadder.SILENCE_TIMEOUT_MS)
+    fun `the silence timeout outlasts the recogniser's own wait and rests rather than looping`() {
+        assertEquals(14_000L, RecoveryLadder.SILENCE_TIMEOUT_MS)
+        assertTrue(
+            "the backstop must not cut off a rider before the recogniser's own start timeout",
+            RecoveryLadder.SILENCE_TIMEOUT_MS > com.cabeye.rider.speech.ListenOptions().startTimeoutMs
+        )
         assertTrue(
             "the re-prompt has to be a question, because it is followed by an open mic",
             RecoveryLadder.SILENCE_REPROMPT.contains("?")
         )
         assertTrue(
-            "the resting line must tell the rider the word that wakes it",
-            RecoveryLadder.SILENCE_REST.contains("hello")
+            "the resting line must tell the rider how to start talking again (rider mode never listens on its own)",
+            RecoveryLadder.SILENCE_REST.contains("Hold the screen")
         )
     }
 

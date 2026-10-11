@@ -161,6 +161,15 @@ dependencies {
     implementation 'androidx.camera:camera-core:1.4.2'
     implementation 'androidx.camera:camera-camera2:1.4.2'
     implementation 'androidx.camera:camera-lifecycle:1.4.2'
+    // The rider's own live preview (ride module while sharing, explore module).
+    implementation 'androidx.camera:camera-view:1.4.2'
+
+    // ---- On-device object detection (works offline, no key) ----------------------------
+    // The fallback for "what's in front of me" when Gemini is not set up or not reachable,
+    // and the fast detector that runs on every frame. Models are bundled in the APK.
+    implementation 'com.google.mlkit:object-detection:17.0.2'
+    implementation 'com.google.mlkit:image-labeling:17.0.9'
+    implementation 'com.google.mlkit:text-recognition:16.0.1'
 
     // ---- Google Maps Platform --------------------------------------------------------
     // Current native Android SDKs (September 2026): Places 5.3.0, Maps 20.0.0,
@@ -168,6 +177,9 @@ dependencies {
     implementation 'com.google.android.libraries.places:places:5.3.0'
     implementation 'com.google.android.gms:play-services-maps:20.0.0'
     implementation 'com.google.android.gms:play-services-location:21.4.0'
+    // SMS User Consent: reads the sign-in code from the incoming text once the rider taps Allow.
+    // No SMS permission is needed, and only that one message is ever shown to the app.
+    implementation 'com.google.android.gms:play-services-auth-api-phone:18.1.0'
 
     // ---- Settings storage ------------------------------------------------------------
     // DataStore, for the backend URL and the role toggle. SharedPreferences is still used

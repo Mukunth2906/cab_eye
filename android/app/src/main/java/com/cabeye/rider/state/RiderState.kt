@@ -325,7 +325,16 @@ data class RiderUiState(
      * [sosActive]: the camera never changes where the ride is, and the ride screen underneath
      * stays exactly what it was.
      */
-    val camera: CameraShare = CameraShare.OFF
+    val camera: CameraShare = CameraShare.OFF,
+    /**
+     * A question was asked and the app is waiting for the rider to press (hold the screen or
+     * a volume key) to answer it. Rider mode never opens the microphone by itself.
+     */
+    val holdToAnswer: Boolean = false,
+    /** Ride module: the driver asking to see the camera, by name ("Karthik"). */
+    val cameraFrom: String = "",
+    /** Ride module: what the shared camera sees right now (labels and boxes), for the preview. */
+    val cameraSeen: List<com.cabeye.rider.vision.SceneObject> = emptyList()
 )
 
 /** Where the "help my driver find me" camera stands. */

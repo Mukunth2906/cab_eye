@@ -29,6 +29,15 @@ class NetworkLogicTest {
     // =================================================================================
 
     @Test
+    fun `the admin website's address becomes the server's`() {
+        assertEquals("http://localhost:8080", BackendUrl.normaliseBase("http://localhost:8080/admin"))
+        assertEquals("http://localhost:8080", BackendUrl.normaliseBase("http://localhost:8080/admin/"))
+        assertEquals("https://abc.ngrok-free.app", BackendUrl.normaliseBase("abc.ngrok-free.app/admin/index.html"))
+        // A prefix that merely contains the word is left alone.
+        assertEquals("https://host/administrator", BackendUrl.normaliseBase("https://host/administrator"))
+    }
+
+    @Test
     fun `trailing slash is stripped`() {
         assertEquals(
             "https://abc123.ngrok-free.app",

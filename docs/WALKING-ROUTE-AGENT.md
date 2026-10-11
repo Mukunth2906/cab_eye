@@ -1,5 +1,7 @@
 # Walking-route memory agent — "the last hundred metres"
 
+[← Back to the README](../README.md)
+
 The cab gets a blind rider to the kerb. This agent gets them from the kerb to the door, and
 from the door back to the pickup point, by remembering walks they have made. It follows
 Clew3D (capture → landmarks → O&M narration) and Guerreiro et al. (previewing a route
@@ -13,7 +15,7 @@ costs nothing to run, and keeps everything on the phone.
 | Capture | Yes | GPS (outdoors), accelerometer step detection and compass heading (indoors too, by pedestrian dead reckoning). Runs as a location foreground service, so it keeps recording with the screen off. |
 | Capture: LiDAR / BLE beacons | No | Most Android phones have no LiDAR (Clew3D needs an iPhone Pro), and beacons need hardware on site. Indoor distances come from steps instead, which is less precise. |
 | Landmark extraction | Partly | Landmarks come from the rider's own words ("bakery smell on my left", "kerb here"), parsed by rules. Visual-only cues (signs, colours) are refused, and colours are stripped from tactile cues. |
-| Landmark extraction: vision model | No (hook left open) | A camera-based vision model would cost money or be too heavy to run on the phone. The rider is the sensor, which also means the stored landmarks are ones a blind traveller actually uses. |
+| Landmark extraction: vision model | Yes, in explore | Recorded walks still take landmarks only from the rider's words. The **explore** module (double tap the main screen) records a walk with the camera on: ML Kit on the phone, and Gemini through the backend when configured, name what is seen, and those become the walk's landmarks and mind-map observations. See [EXPLORE-AND-CAMERA.md](EXPLORE-AND-CAMERA.md). |
 | Route builder | Yes | `RouteBuilder` splits the walk into stretches: distance (calibrated steps), landmarks with their side, and a turn at the end. Turns come from the rider ("turning left") first, then from the compass (≥50° held for 3 s while walking; spinning the phone in place doesn't count). |
 | Narration | Yes (templates, no LLM) | `WalkNarrator` uses O&M phrasing: "Part 1. Walk straight about 20 metres, about 30 of your steps. Then turn right at the kerb." |
 | Memory store | Yes, on the phone | Per-route trip data, the cleaned route graph (segments and landmarks), and a profile (preferred detail, consent). All in `WalkStore` (app-private SharedPreferences). Nothing goes to the server. |
@@ -61,4 +63,4 @@ costs nothing to run, and keeps everything on the phone.
 - Step-based distances drift by about 5–10% over long indoor walks. Routes are meant to be short (the last hundred metres).
 - Compass readings are disturbed near metal and inside vehicles. Spoken turns override the compass.
 - Routes live only on the phone, so a lost phone means lost routes. An opt-in encrypted backup to the server is a possible next step.
-- The vision-model landmark hook is not built.
+- Camera landmarks come only from explore walks; an ordinary recorded walk doesn't use the camera.

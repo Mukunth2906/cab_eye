@@ -23,7 +23,13 @@ interface SpeechInput {
      * **The caller must guarantee TTS is not speaking.** If it is, the recogniser hears the
      * phone's own voice and transcribes the app talking to itself.
      */
-    fun start(listener: SpeechInputListener)
+    fun start(listener: SpeechInputListener) = start(listener, ListenOptions())
+
+    /**
+     * As [start], with control over how patient the session is: how long to wait for the
+     * rider to begin, how long a pause ends the answer, and when the answer is already complete.
+     */
+    fun start(listener: SpeechInputListener, options: ListenOptions)
 
     /**
      * Stops capturing and processes what was heard so far.
@@ -36,11 +42,42 @@ interface SpeechInput {
     /** Aborts and discards. No final result will be delivered. */
     fun cancel()
 
+    /**
+     * While held (the rider is pressing the screen or a volume key), a pause never ends the
+     * answer: only the release ([stop]) does, or a complete answer. Reset by every [start].
+     */
+    fun setHeld(held: Boolean) = Unit
+
     /** True between [start] and a final result or error. */
     val isListening: Boolean
 
     fun release()
 }
+
+/**
+ * How long one answer may take.
+ *
+ * Android's recogniser ends a session at the first short pause — often well under a second.
+ * A rider reading out a phone number pauses between groups ("98765 … 43210"), and an answer
+ * cut at the pause is the most common reason the app used to ask again. So a session here is
+ * made of as many recogniser segments as it takes: when one ends, the next starts at once and
+ * the words are joined, until the rider has genuinely stopped.
+ *
+ * @param startTimeoutMs how long to wait for the rider to begin speaking at all
+ * @param endSilenceMs once the rider has spoken, how long a pause means "finished"
+ * @param incompleteSilenceMs the same, while [isComplete] says the answer is not complete yet
+ *   (six digits of a ten-digit number) — longer, because the rider is still reading it out
+ * @param maxDurationMs a hard ceiling on one answer
+ * @param isComplete true once the words heard so far are a whole answer, so the session can
+ *   end the moment it is complete instead of waiting out the pause
+ */
+data class ListenOptions(
+    val startTimeoutMs: Long = 10_000L,
+    val endSilenceMs: Long = 1_500L,
+    val incompleteSilenceMs: Long = 4_000L,
+    val maxDurationMs: Long = 30_000L,
+    val isComplete: ((String) -> Boolean)? = null
+)
 
 /**
  * Callbacks from a recognition session. All are delivered on the main thread.

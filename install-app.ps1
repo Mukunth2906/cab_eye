@@ -318,9 +318,8 @@ Write-Host "  All $($results.Count) device(s) installed." -ForegroundColor Green
 Write-Host ''
 Write-Host '  On each phone: accept the microphone permission prompt.' -ForegroundColor Yellow
 Write-Host ''
-Write-Host '  RIDER phone : press and HOLD anywhere, say "take me to Adyar"' -ForegroundColor Yellow
-Write-Host '  DRIVER phone: tap the small dot at the top right 5 times ->' -ForegroundColor Yellow
-Write-Host '                Settings -> DRIVER -> Done -> GO ONLINE' -ForegroundColor Yellow
+Write-Host '  RIDER phone : HOLD the screen (or a volume button) and say "take me to Adyar"' -ForegroundColor Yellow
+Write-Host '  DRIVER phone: tap Settings (top right) -> DRIVER -> GO ONLINE' -ForegroundColor Yellow
 Write-Host ''
 
 if ($NoLogs) { exit 0 }

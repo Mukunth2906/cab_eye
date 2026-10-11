@@ -219,8 +219,37 @@ public class RideCameraService {
         out.put("jpeg", data);
         Object seq = payload.get("n");
         if (seq instanceof Number) out.put("n", seq);
+        // What the rider's phone detected in this picture, so the driver sees what the rider hears.
+        java.util.List<Map<String, Object>> labels = labels(payload.get("labels"));
+        if (!labels.isEmpty()) out.put("labels", labels);
         return sessions.sendToRole(rideId, "DRIVER",
                 RideEvent.now("CAMERA_FRAME", rideId, senderId, "RIDER", out)) > 0;
+    }
+
+    /** At most 8 well-formed labels: {label (30 chars), clock, box [l, t, r, b] each 0..1}. Anything else is dropped. */
+    static java.util.List<Map<String, Object>> labels(Object raw) {
+        java.util.List<Map<String, Object>> out = new java.util.ArrayList<>();
+        if (!(raw instanceof java.util.List<?> list)) return out;
+        for (Object item : list) {
+            if (out.size() >= 8) break;
+            if (!(item instanceof Map<?, ?> m)) continue;
+            Object label = m.get("label");
+            Object box = m.get("box");
+            if (!(label instanceof String l) || l.isBlank() || !(box instanceof java.util.List<?> b) || b.size() != 4) continue;
+            java.util.List<Double> clean = new java.util.ArrayList<>();
+            for (Object v : b) {
+                if (!(v instanceof Number n)) { clean = null; break; }
+                clean.add(Math.max(0.0, Math.min(1.0, n.doubleValue())));
+            }
+            if (clean == null) continue;
+            Map<String, Object> one = new HashMap<>();
+            one.put("label", l.length() > 30 ? l.substring(0, 30) : l);
+            Object clock = m.get("clock");
+            if (clock instanceof String c && c.length() <= 12) one.put("clock", c);
+            one.put("box", clean);
+            out.add(one);
+        }
+        return out;
     }
 
     // ===================================================================================

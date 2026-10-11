@@ -33,8 +33,9 @@ import java.util.regex.Pattern;
  * rules produce. Only the sentence and the names of a few nearby places the rider already
  * knows are sent — never a position, a route or a history.
  *
- * Off unless {@code cabeye.grok.api-key} is set: the endpoint then answers 404 and the
- * app stays rules-only. The phone checks the answer again with its own rules (no visual-only
+ * Uses Grok when {@code cabeye.grok.api-key} is set, otherwise Gemini when
+ * {@code cabeye.gemini.api-keys} is (the same keys as the camera's "what's in front of me").
+ * With neither, the endpoint answers 404 and the app stays rules-only. The phone checks the answer again with its own rules (no visual-only
  * cues, never "the path is clear"), so this is a reader, not a decision-maker.
  */
 @Service
@@ -73,10 +74,26 @@ public class InterpretService {
     public InterpretService(@Value("${cabeye.grok.api-key:}") String apiKey,
                             @Value("${cabeye.grok.model:grok-4.7}") String modelId,
                             @Value("${cabeye.grok.url:https://api.x.ai/v1/chat/completions}") String url,
-                            @Value("${cabeye.grok.timeout-ms:4000}") long timeoutMs) {
-        this.enabled = apiKey != null && !apiKey.isBlank();
-        this.model = enabled ? grok(apiKey.trim(), modelId, url, timeoutMs) : null;
-        log.info(enabled ? "MINDMAP_INTERPRET enabled model={}" : "MINDMAP_INTERPRET disabled (no cabeye.grok.api-key)", modelId);
+                            @Value("${cabeye.grok.timeout-ms:4000}") long timeoutMs,
+                            @Autowired(required = false) com.cabeye.backend.vision.GeminiClient gemini) {
+        if (apiKey != null && !apiKey.isBlank()) {
+            this.enabled = true;
+            this.model = grok(apiKey.trim(), modelId, url, timeoutMs);
+            log.info("MINDMAP_INTERPRET enabled model={}", modelId);
+        } else if (gemini != null && gemini.enabled()) {
+            this.enabled = true;
+            this.model = gemini(gemini);
+            log.info("MINDMAP_INTERPRET enabled model=gemini");
+        } else {
+            this.enabled = false;
+            this.model = null;
+            log.info("MINDMAP_INTERPRET disabled (no cabeye.grok.api-key or cabeye.gemini.api-keys)");
+        }
+    }
+
+    /** Grok only (tests, and callers with no Gemini). */
+    public InterpretService(String apiKey, String modelId, String url, long timeoutMs) {
+        this(apiKey, modelId, url, timeoutMs, null);
     }
 
     /** For tests: any model, always enabled. */
@@ -169,6 +186,26 @@ public class InterpretService {
             String content = message.path("content").asText("");
             if (message.hasNonNull("refusal") || content.isBlank()) return Interpretation.NONE;
             return json.readValue(content, Interpretation.class);
+        };
+    }
+
+    /** Gemini through {@link com.cabeye.backend.vision.GeminiClient}: same prompt, JSON asked for in words. */
+    static Model gemini(com.cabeye.backend.vision.GeminiClient gemini) {
+        ObjectMapper json = new ObjectMapper()
+                .configure(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+        String shape;
+        try {
+            shape = json.writeValueAsString(schema(json).path("properties"));
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+        return (utterance, known) -> {
+            String user = "Known places: " + (known.isEmpty() ? "(none)" : String.join("; ", known)) +
+                    "\nSentence: " + utterance +
+                    "\nAnswer with ONE JSON object with exactly these fields, and nothing else: " + shape;
+            // The rider is waiting to hear an answer: a short budget, then the rules take over.
+            String answer = gemini.chat(SYSTEM, gemini.parts(gemini.text(user)), 400, 6_000);
+            return json.readValue(com.cabeye.backend.vision.GeminiClient.jsonIn(answer), Interpretation.class);
         };
     }
 

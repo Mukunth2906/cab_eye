@@ -45,6 +45,7 @@ import com.cabeye.rider.places.ContactMatch
 import com.cabeye.rider.places.Gazetteer
 import com.cabeye.rider.places.MatchGate
 import com.cabeye.rider.service.NarrationService
+import com.cabeye.rider.speech.ListenOptions
 import com.cabeye.rider.speech.SpeechError
 import com.cabeye.rider.speech.SpeechInputListener
 import com.cabeye.rider.state.DriverInfo
@@ -220,7 +221,10 @@ private enum class MicPurpose {
     NEARBY,
 
     /** Yes or no: may this sentence go to the server to be understood? Or: did I read it right? */
-    INTERPRET
+    INTERPRET,
+
+    /** The explore module is open: describe, keep telling me, find, read, this is …, finish. */
+    EXPLORE
 }
 
 /**
@@ -423,6 +427,9 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     /** Last thing said, so "repeat" has something to repeat. */
     private var lastSpoken: String = ""
 
+    /** The last few sentences spoken, with when, so the app can recognise its own voice. */
+    private val recentSpoken = ArrayDeque<Pair<Long, String>>()
+
     /**
      * What the rider actually said for the destination being booked ("piece g"), sent with the
      * booking so their memory learns their words for the place. Cleared once sent.
@@ -525,8 +532,18 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         /** How long to listen for the driver to say the boarding code before offering help. */
         const val CODE_LISTEN_MS = 15_000L
 
+        /** With no press, an optional question (feedback, "anything else?") takes its default. */
+        const val NO_PRESS_DEFAULT_MS = 60_000L
+
+        /** How long after saying something the app treats hearing those words as its own echo. */
+        const val ECHO_WINDOW_MS = 30_000L
+
+        /** First spoken "still looking" while no driver has accepted, then every so often. */
+        const val FINDING_FIRST_UPDATE_MS = 30_000L
+        const val FINDING_UPDATE_EVERY_MS = 90_000L
+
         /** How long the rider has to answer the camera question. The server allows 45 s. */
-        const val CAMERA_ANSWER_MS = 40_000L
+        const val CAMERA_ANSWER_MS = 60_000L
 
         /** The camera never stays on longer than this. The server enforces the same limit. */
         const val CAMERA_MAX_MS = 3 * 60_000L
@@ -865,7 +882,17 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             // other's modality — the driver never speaks, the rider never reads.
             RideEventType.POSITION_PRESET -> {
                 val text = event.string("text")
-                if (text.isNotBlank()) narrate(event, text)
+                if (text.isNotBlank()) {
+                    if (uiState.camera == CameraShare.LIVE) {
+                        // The driver is watching the camera and guiding: their words come first,
+                        // over anything the object narration was saying.
+                        engine.stopSpeaking()
+                        haptics.perform(HapticPattern.CLARIFY)
+                        speak("$cameraDriverName says: $text", NarrationTier.INTERRUPT)
+                    } else {
+                        narrate(event, text)
+                    }
+                }
             }
 
             // Tier 2 — the beacon IS the message. Speaking over it would mask the one thing the
@@ -1048,7 +1075,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             val spokenCode = expectedCode.replace("-", " ")
             speak(
                 "Your car has arrived. In your ear only: the code is $spokenCode. " +
-                        "Wait for the driver to say it.",
+                        "Hold the screen while the driver says it, and I'll check it.",
                 NarrationTier.INTERRUPT
             ) {
                 openMic(MicPurpose.CODE_VERIFY)
@@ -1058,7 +1085,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             // and the app says why, because unexplained silence is the one thing it must never
             // produce.
             speak(
-                "Your car has arrived. Ask the driver to say the code, and I'll check it.",
+                "Your car has arrived. Ask the driver to say the code, and hold the screen while they say it. I'll check it.",
                 NarrationTier.INTERRUPT
             ) {
                 openMic(MicPurpose.CODE_VERIFY)
@@ -1084,11 +1111,12 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         codeListenJob?.cancel()
         codeListenJob = viewModelScope.launch {
             delay(CODE_LISTEN_MS)
-            if (!codeVerified && micPurpose == MicPurpose.CODE_VERIFY && uiState.ride is RiderState.Arrived) {
+            val codeAsked = micPurpose == MicPurpose.CODE_VERIFY || awaitingAnswer?.first == MicPurpose.CODE_VERIFY
+            if (!codeVerified && codeAsked && uiState.ride is RiderState.Arrived) {
                 stt?.cancel()
                 closeMic()
                 speak(
-                    "I didn't hear the code. Ask the driver to say it again, close to your phone. " +
+                    "I haven't checked the code yet. Hold the screen while the driver says it, close to your phone. " +
                         "If someone with you can see the driver's screen, they can press Code is right.",
                     NarrationTier.QUEUED
                 ) { openMic(MicPurpose.CODE_VERIFY) }
@@ -1212,6 +1240,37 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     //  pass, the pictures stop coming, or the app leaves the screen — and always says so.
 
     private val cameraStreamer by lazy { CameraStreamer(getApplication()) }
+
+    /** The newest camera picture, for whichever module is looking (ride camera, explore). */
+    private val frameTap = com.cabeye.rider.vision.FrameTap()
+
+    /** "What's in front of me": Gemini through the backend, or the phone's own detector. */
+    private val sceneDetector by lazy { com.cabeye.rider.vision.SceneDetector(api) }
+
+    /** The explore module: no ride, the camera, the rider's street, into the mind map. */
+    val explore by lazy {
+        com.cabeye.rider.explore.ExploreController(
+            app = getApplication(),
+            scope = viewModelScope,
+            camera = cameraStreamer,
+            tap = frameTap,
+            detector = sceneDetector,
+            mindMap = mindMapStore,
+            walks = walkStore,
+            position = { riderPosition() },
+            speak = { text, tier -> speak(text, tier) },
+            isSpeaking = { engine.isSpeaking },
+            cameraSharedWithDriver = { uiState.camera == CameraShare.LIVE }
+        )
+    }
+
+    /** Ride module: what the shared camera sees, said to the rider and drawn for the driver. */
+    private var rideVisionJob: Job? = null
+
+    @Volatile
+    private var rideLabels: List<com.cabeye.rider.vision.SceneObject> = emptyList()
+
+    private var awaitingExplorePermission = false
     private val haptics by lazy { Haptics(getApplication()) }
 
     private val cameraJobs = mutableListOf<Job>()
@@ -1246,7 +1305,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         cameraDriverName = event.string("driverName").ifBlank { currentDriver()?.name.orEmpty() }
             .ifBlank { "Your driver" }
         cameraReasked = false
-        uiState = uiState.copy(camera = CameraShare.ASKING)
+        uiState = uiState.copy(camera = CameraShare.ASKING, cameraFrom = cameraDriverName)
         Log.i(TAG, "CAMERA requested by $cameraDriverName always=${prefs.alwaysShareCamera}")
 
         cameraAskJob?.cancel()
@@ -1276,7 +1335,8 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     private fun askCameraQuestion() {
         haptics.perform(HapticPattern.CLARIFY)
         speakAroundMic(
-            "$cameraDriverName can't see you. Can they see your back camera to find you? Say yes or no."
+            "$cameraDriverName can't see you and asks to see your back camera to find you. " +
+                "Tap Share camera on the screen, or hold the screen and say yes. Say no to keep it off."
         )
     }
 
@@ -1287,7 +1347,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         cameraReasked = true
-        speakAroundMic("Say yes to share your camera with your driver, or no.")
+        speakAroundMic("To share your camera with your driver, tap Share camera, or hold the screen and say yes. Or say no.")
     }
 
     /**
@@ -1344,6 +1404,12 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun onCameraPermissionResult(granted: Boolean) {
+        if (awaitingExplorePermission) {
+            awaitingExplorePermission = false
+            if (granted) openExplore()
+            else speak("Without camera permission I can't look around for you.", NarrationTier.QUEUED)
+            return
+        }
         if (!awaitingCameraPermission) return
         awaitingCameraPermission = false
         Log.i(TAG, "CAMERA_PERMISSION granted=$granted")
@@ -1401,10 +1467,11 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         uiState = uiState.copy(camera = CameraShare.LIVE)
         lastCameraFrameAt = System.currentTimeMillis()
 
+        cameraStreamer.pictureSink = frameTap.sink
         cameraStreamer.start(
             onFrame = { jpeg, n ->
                 lastCameraFrameAt = System.currentTimeMillis()
-                socket.sendFrame(jpeg, n)
+                socket.sendFrame(jpeg, n, rideLabels)
             },
             onError = {
                 stopCamera(
@@ -1420,8 +1487,10 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         val remembered = if (always) " I'll share it automatically from now on." else ""
         speakAroundMic(
             "${lead}Camera on.$remembered Hold your phone up at chest height, pointing at the road. " +
-                "Say stop camera to turn it off."
+                "Your driver can see it and guide you, and I'll tell you what's around you. " +
+                "Tap Stop camera, or say stop camera, to turn it off."
         )
+        startRideVision()
 
         cameraJobs += viewModelScope.launch {
             while (uiState.camera == CameraShare.LIVE) {
@@ -1486,8 +1555,13 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         cameraJobs.clear()
         awaitingCameraPermission = false
         cameraAskedInBackground = false
-        cameraStreamer.stop()
-        uiState = uiState.copy(camera = CameraShare.OFF)
+        rideVisionJob?.cancel()
+        rideVisionJob = null
+        rideLabels = emptyList()
+        cameraStreamer.jpegSink = null
+        // Explore may still be using the camera; otherwise it is turned off.
+        if (!explore.ui.open) cameraStreamer.stop()
+        uiState = uiState.copy(camera = CameraShare.OFF, cameraSeen = emptyList())
         Log.i(TAG, "CAMERA stopped reason=$reason was=$was")
 
         val rideId = activeRideId
@@ -2025,6 +2099,295 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /**
+     * A button on the "Walks & my places" screen: runs exactly what saying [text] would.
+     *
+     * The walking routes and the mind map are voice features, and as voice-only features they
+     * could not be found. These buttons make them visible and touchable; the dialogue that
+     * follows is the same one, answered by holding the screen.
+     *
+     * A [text] starting with "say:" is a spoken hint instead (for commands that need the rider's
+     * own words, such as the name of a place to remember).
+     */
+    fun onQuickCommand(text: String) {
+        stt?.cancel()
+        closeMic()
+        engine.stopSpeaking()
+        clearAwaiting()
+        if (text.startsWith("say:")) {
+            speak(text.removePrefix("say:").trim(), NarrationTier.QUEUED)
+            return
+        }
+        if (uiState.ride !is RiderState.Idle || walkMode != WalkMode.NONE) {
+            speak("That's available when no ride or walk is in progress.", NarrationTier.QUEUED)
+            return
+        }
+        Log.i(TAG, "QUICK command \"$text\"")
+        micPurpose = MicPurpose.BOOKING
+        handleTranscript(text)
+    }
+
+    // =================================================================================
+    //  The mind map screen: everything remembered, by module, and what it can do
+    // =================================================================================
+
+    var catalog by mutableStateOf<com.cabeye.rider.mindmap.MindMapCatalog.Catalog?>(null)
+        private set
+
+    /** The last thing the mind map screen said (shown as well as spoken). */
+    var mapAnswer by mutableStateOf("")
+        private set
+
+    /**
+     * Whether the mind map screen is showing. Opened by its button in the top bar, or by pressing
+     * volume down three times quickly (the same again closes it); see MainActivity.
+     */
+    var mindMapOpen by mutableStateOf(false)
+        private set
+
+    /** Opens the mind map from the main screen; anywhere else it says why not. */
+    fun openMindMap() {
+        if (mindMapOpen) return
+        if (uiState.ride !is RiderState.Idle || activeRideId != null) {
+            speak("Your mind map opens from the main screen, when no ride is being booked.", NarrationTier.QUEUED)
+            return
+        }
+        // Explore covers the whole screen: finish it (keeping the walk) so the map is what shows.
+        if (explore.ui.open) closeExplore(save = true)
+        stt?.cancel()
+        closeMic()
+        clearAwaiting()
+        mindMapOpen = true
+        speak("Your mind map. Press volume down three times to close it.", NarrationTier.INTERRUPT)
+    }
+
+    fun closeMindMap() {
+        mindMapOpen = false
+    }
+
+    /** Volume down pressed three times quickly. */
+    fun toggleMindMap() {
+        if (mindMapOpen) {
+            closeMindMap()
+            speak("Mind map closed.", NarrationTier.INTERRUPT)
+        } else {
+            openMindMap()
+        }
+    }
+
+    /**
+     * The main screen double-tapped (from idle): explore. The first tap of the two was an
+     * ordinary press and opened the microphone for a booking; it is dropped here, silently,
+     * before it can hear anything — its own stop is not due for [MIN_CAPTURE_BEFORE_STOP_MS].
+     */
+    fun onDoubleTap() {
+        stt?.cancel()
+        closeMic()
+        if (uiState.ride is RiderState.Listening && activeRideId == null) transition(RiderState.Idle, announce = false)
+        openExplore()
+    }
+
+    /** Builds what the mind map screen shows; ride places are fetched fresh from the server too. */
+    fun loadMindMap() {
+        mapAnswer = ""
+        rebuildCatalog()
+        app.memory.refresh { onMain { rebuildCatalog() } }
+    }
+
+    private fun rebuildCatalog() {
+        viewModelScope.launch {
+            val here = runCatching { riderPosition() }.getOrNull()
+            catalog = com.cabeye.rider.mindmap.MindMapCatalog.build(
+                map = mindMap(),
+                places = app.memory.current.places,
+                routes = app.memory.current.routes,
+                walks = walkStore.routes(),
+                profile = walkStore.profile(),
+                here = here,
+                now = System.currentTimeMillis()
+            )
+        }
+    }
+
+    private fun sayOnMap(text: String) {
+        mapAnswer = text
+        engine.stopSpeaking()
+        speak(text, NarrationTier.INTERRUPT)
+    }
+
+    /** "What's around" / "Hear" on a card. */
+    fun explainNode(nodeId: String) {
+        val map = mindMap()
+        val node = map.node(nodeId) ?: return
+        sayOnMap(com.cabeye.rider.mindmap.MindMapAgent.about(map, node, System.currentTimeMillis()))
+    }
+
+    /** "Book a ride" on a place card: straight into the usual booking (announcement, cancel window). */
+    fun bookFromMap(card: com.cabeye.rider.mindmap.MindMapCatalog.PlaceCard): Boolean {
+        if (activeRideId != null || uiState.ride !is RiderState.Idle) {
+            sayOnMap("You already have a ride going. Finish or cancel it first.")
+            return false
+        }
+        val lat = card.lat
+        val lng = card.lng
+        if (lat == null || lng == null) {
+            sayOnMap("I don't know exactly where ${card.name} is yet, so I can't book it from here. Hold the screen and say take me to ${card.name}.")
+            return false
+        }
+        stt?.cancel()
+        closeMic()
+        clearAwaiting()
+        engine.stopSpeaking()
+        trace = Telemetry.RideTrace(rideId = "local").also { it.tapCount++ }
+        val placeId = card.placeId.takeUnless { it.startsWith("a:") || it.isBlank() }.orEmpty()
+        beginOptimisticBooking(PlaceOption(card.name, lat, lng, 1f, placeId = placeId), preferredRideType())
+        return true
+    }
+
+    /** "Book this route" on a saved multi-stop route. */
+    fun bookRouteFromMap(name: String): Boolean {
+        if (activeRideId != null || uiState.ride !is RiderState.Idle) {
+            sayOnMap("You already have a ride going. Finish or cancel it first.")
+            return false
+        }
+        onQuickCommand("take me on $name")
+        return true
+    }
+
+    /** "Forget" on any card: from its own module's store (ride places from the server too). */
+    fun forgetNode(nodeId: String) {
+        val label = mindMap().node(nodeId)?.label ?: "that"
+        if (nodeId.startsWith("place:")) {
+            val key = nodeId.removePrefix("place:")
+            viewModelScope.launch {
+                api.forgetPlace(key)
+                app.memory.refresh { onMain { rebuildCatalog() } }
+            }
+        }
+        mindMapStore.saveAuthored(mindMapStore.authored().without(nodeId))
+        sayOnMap("Forgotten: $label.")
+        rebuildCatalog()
+    }
+
+    fun guideWalkFromMap(routeId: String): Boolean {
+        val route = walkStore.routes().firstOrNull { it.id == routeId } ?: return false
+        onQuickCommand("guide me to ${route.name}")
+        return true
+    }
+
+    fun readWalkFromMap(routeId: String) {
+        val route = walkStore.routes().firstOrNull { it.id == routeId } ?: return
+        val now = System.currentTimeMillis()
+        val level = WalkNarrator.levelFor(route, walkStore.profile())
+        sayOnMap(WalkNarrator.narrate(route, level, now, com.cabeye.rider.mindmap.MindMapAgent.notesFor(mindMap(), route.id)))
+    }
+
+    fun forgetWalkFromMap(routeId: String) {
+        val route = walkStore.routes().firstOrNull { it.id == routeId } ?: return
+        walkStore.delete(routeId)
+        sayOnMap("Forgotten the walk ${route.name}.")
+        rebuildCatalog()
+    }
+
+    // =================================================================================
+    //  Explore module (no ride): the camera, the rider's street, into the mind map
+    // =================================================================================
+
+    /** Opens explore; [then] is what to do first (for "find the door" said at the main question). */
+    fun openExplore(then: com.cabeye.rider.explore.ExploreCommands.Command? = null) {
+        if (activeRideId != null || isRideUnderway(uiState.ride)) {
+            speak("Explore is for when you're not on a ride. Your ride's camera can be shared with your driver instead.", NarrationTier.QUEUED)
+            return
+        }
+        if (!hasCameraPermission()) {
+            val request = cameraPermissionRequest ?: return
+            awaitingExplorePermission = true
+            speak("Your phone will ask to use the camera, so I can look around for you. Choose Allow.", NarrationTier.INTERRUPT) { request() }
+            return
+        }
+        stt?.cancel()
+        closeMic()
+        clearAwaiting()
+        explore.open()
+        if (then != null) runExplore(then)
+    }
+
+    fun exploreDescribe() = explore.describe()
+    fun exploreRead() = explore.describe(read = true)
+    fun exploreKeepTelling() = explore.continuous()
+    fun exploreFind(target: String) = explore.find(target)
+    fun exploreStop() = explore.stopLooking()
+    fun exploreName(name: String) = explore.nameThisPlace(name)
+
+    /** "Name this place" with no name yet: the rider holds the screen and says it. */
+    fun exploreAskName() {
+        speak("Hold the screen and say: this is, and then the name. For example, this is Ravi's tea shop.", NarrationTier.INTERRUPT)
+    }
+
+    fun closeExplore(save: Boolean) {
+        stt?.cancel()
+        closeMic()
+        explore.close(save)
+    }
+
+    /** The live preview on the rider's own screen (explore, and the shared ride camera). */
+    fun attachCameraPreview(provider: androidx.camera.core.Preview.SurfaceProvider?) {
+        cameraStreamer.attachPreview(provider)
+    }
+
+    private fun handleExploreSpeech(text: String) {
+        val cmd = com.cabeye.rider.explore.ExploreCommands.parse(text)
+        if (cmd == null) {
+            speak("Say describe, keep telling me, find the door, read this, this is and a name, or finish.", NarrationTier.QUEUED)
+            return
+        }
+        runExplore(cmd)
+    }
+
+    private fun runExplore(cmd: com.cabeye.rider.explore.ExploreCommands.Command) {
+        when (cmd) {
+            com.cabeye.rider.explore.ExploreCommands.Command.Describe -> explore.describe()
+            com.cabeye.rider.explore.ExploreCommands.Command.Read -> explore.describe(read = true)
+            com.cabeye.rider.explore.ExploreCommands.Command.KeepTelling -> explore.continuous(on = true)
+            com.cabeye.rider.explore.ExploreCommands.Command.Stop -> {
+                explore.stopLooking()
+                speak("Stopped.", NarrationTier.INTERRUPT)
+            }
+            is com.cabeye.rider.explore.ExploreCommands.Command.Find -> explore.find(cmd.target)
+            is com.cabeye.rider.explore.ExploreCommands.Command.Name -> explore.nameThisPlace(cmd.name)
+            com.cabeye.rider.explore.ExploreCommands.Command.Finish -> closeExplore(save = true)
+            com.cabeye.rider.explore.ExploreCommands.Command.Discard -> {
+                closeExplore(save = false)
+                speak("Closed, without saving the walk. What the camera saw is still in your mind map.", NarrationTier.QUEUED)
+            }
+        }
+    }
+
+    // ---- Ride module: the shared camera also tells the rider what's around ------------
+
+    private fun startRideVision() {
+        rideVisionJob?.cancel()
+        val recent = LinkedHashMap<String, Long>()
+        rideVisionJob = viewModelScope.launch {
+            // "Camera on…" is said first.
+            delay(4_000)
+            while (uiState.camera == CameraShare.LIVE) {
+                val picture = frameTap.next() ?: continue
+                val scene = runCatching { sceneDetector.quick(picture) }.getOrElse { com.cabeye.rider.vision.Scene() }
+                picture.recycle()
+                rideLabels = scene.objects
+                if (uiState.camera != CameraShare.LIVE) break
+                uiState = uiState.copy(cameraSeen = scene.objects)
+                val now = System.currentTimeMillis()
+                recent.entries.removeAll { now - it.value > 15_000L }
+                val change = com.cabeye.rider.vision.SceneSpeech.changes(scene, recent.keys)
+                scene.objects.forEach { recent[it.label.lowercase()] = now }
+                if (change != null && !engine.isSpeaking && !uiState.micOpen) speak(change, NarrationTier.QUEUED)
+                delay(1_500)
+            }
+        }
+    }
+
     /** Tapped "Help" from idle or status. */
     fun onHelp() {
         speakHelp()
@@ -2036,7 +2399,28 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Rider pressed the surface, or a volume key. Opens the microphone. */
     fun onHoldStart() {
-        if (uiState.ride is RiderState.Listening) return
+        // Already listening to this press (never stack two sessions).
+        if (uiState.micOpen && stt?.isListening == true) return
+
+        // Exploring: a press talks to the explore module ("find the door", "this is …").
+        if (explore.ui.open) {
+            clearAwaiting()
+            engine.stopSpeaking()
+            if (stt?.isListening == true) stt?.cancel()
+            openMic(MicPurpose.EXPLORE, byPress = true)
+            return
+        }
+
+        // A question is waiting for its answer: this press answers it.
+        val waiting = awaitingAnswer
+        clearAwaiting()
+        if (waiting != null && uiState.ride::class == waiting.second && stillAsking(waiting.first)) {
+            trace?.tapCount = (trace?.tapCount ?: 0) + 1
+            engine.stopSpeaking()
+            if (stt?.isListening == true) stt?.cancel()
+            openMic(waiting.first, byPress = true)
+            return
+        }
 
         // ------------------------------------------------------------------------------
         //  A ride already under way is not a booking opportunity.
@@ -2064,7 +2448,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             trace?.tapCount = (trace?.tapCount ?: 0) + 1
             engine.stopSpeaking()
             if (stt?.isListening == true) stt?.cancel()
-            openMic(MicPurpose.CAMERA)
+            openMic(MicPurpose.CAMERA, byPress = true)
             return
         }
 
@@ -2080,7 +2464,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             if (stop != null && stop.status == "WAITING" && !stop.riderBack) {
                 listenForStopCode("Welcome back. Ask the driver to say the code.")
             } else {
-                openMic(MicPurpose.TRIP_COMMAND)
+                openMic(MicPurpose.TRIP_COMMAND, byPress = true)
             }
             return
         }
@@ -2097,7 +2481,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         if (uiState.ride is RiderState.Walking || walkMode != WalkMode.NONE) {
             engine.stopSpeaking()
             if (stt?.isListening == true) stt?.cancel()
-            openMic(MicPurpose.WALK)
+            openMic(MicPurpose.WALK, byPress = true)
             return
         }
 
@@ -2106,11 +2490,11 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             engine.stopSpeaking()
             if (stt?.isListening == true) stt?.cancel()
             when {
-                pendingRoutine != null -> openMic(MicPurpose.MEMORY_ANSWER)
-                planStage == PlanStage.REVIEW -> openMic(MicPurpose.PLAN_REVIEW)
-                planStage == PlanStage.KINDS -> openMic(MicPurpose.STOP_KIND)
-                planStage == PlanStage.COLLECTING -> openMic(MicPurpose.PLAN_LEG)
-                else -> openMic(MicPurpose.SLOT_ANSWER)
+                pendingRoutine != null -> openMic(MicPurpose.MEMORY_ANSWER, byPress = true)
+                planStage == PlanStage.REVIEW -> openMic(MicPurpose.PLAN_REVIEW, byPress = true)
+                planStage == PlanStage.KINDS -> openMic(MicPurpose.STOP_KIND, byPress = true)
+                planStage == PlanStage.COLLECTING -> openMic(MicPurpose.PLAN_LEG, byPress = true)
+                else -> openMic(MicPurpose.SLOT_ANSWER, byPress = true)
             }
             return
         }
@@ -2147,7 +2531,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             is RiderState.NextJourney -> MicPurpose.NEXT_JOURNEY
             else -> MicPurpose.BOOKING
         }
-        openMic(purpose)
+        openMic(purpose, byPress = true)
     }
 
     /**
@@ -2190,7 +2574,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             }
             return
         }
-        if (uiState.ride !is RiderState.Listening) return
+        if (!uiState.micOpen) return
         // T0 — the clock the rider actually experiences starts here.
         trace?.mark(Telemetry.Stage.MIC_RELEASED)
 
@@ -2213,6 +2597,8 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     /** Sighted-helper fallback for the clarification question. The rider answers by voice. */
     fun onClarifyChoice(option: PlaceOption) {
         trace?.tapCount = (trace?.tapCount ?: 0) + 1
+        pendingOptions = null
+        engine.stopSpeaking()
         stt?.cancel()
         closeMic()
         beginOptimisticBooking(option, heldRideType ?: RideType.AUTO)
@@ -2221,6 +2607,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     /** Sighted-helper fallback for the near-miss question. */
     fun onNearMissAnswer(accepted: Boolean) {
         trace?.tapCount = (trace?.tapCount ?: 0) + 1
+        engine.stopSpeaking()
         stt?.cancel()
         closeMic()
         if (pendingMemory != null) {
@@ -2278,9 +2665,23 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     //  Microphone
     // =================================================================================
 
-    private fun openMic(purpose: MicPurpose) {
+    /**
+     * Opens the microphone — but only for a press.
+     *
+     * Rider mode never listens on its own: found in use, an app that opened the microphone
+     * after each question heard its own voice, background talk and the street, and acted on
+     * them (a ride cancelled itself on hearing "say cancel to stop"). So a question asked out
+     * loud is remembered ([awaitPress]) and the rider answers it by holding the screen or a
+     * volume key, for as long as they are speaking.
+     */
+    private fun openMic(purpose: MicPurpose, byPress: Boolean = false) {
         // Any real open supersedes a pending delayed one, including the rider's own press.
         micReopenJob?.cancel()
+
+        if (!byPress) {
+            awaitPress(purpose)
+            return
+        }
 
         if (!micPermissionGranted) {
             engine.earcon(Earcon.ERROR)
@@ -2311,6 +2712,15 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
+        // A question that has been overtaken does not get to listen. Found on device: "did you
+        // mean A or B?" was answered by a tap, the booking announcement began, and the old
+        // question's "listen when I finish" opened the mic over it, which heard the app say
+        // "say cancel to stop" and cancelled the ride.
+        if (!stillAsking(purpose)) {
+            Log.i(TAG, "MIC not opened for $purpose: that question is no longer open")
+            return
+        }
+
         micPurpose = purpose
 
         // Two states must stay on screen through their own open microphone: `confirming`, where
@@ -2322,7 +2732,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             purpose != MicPurpose.FEEDBACK && purpose != MicPurpose.NEXT_JOURNEY &&
             purpose != MicPurpose.CAMERA && purpose != MicPurpose.TRIP_COMMAND &&
             purpose != MicPurpose.STOP_CONFIRM && purpose != MicPurpose.WALK && purpose != MicPurpose.NEARBY &&
-            purpose != MicPurpose.INTERPRET &&
+            purpose != MicPurpose.INTERPRET && purpose != MicPurpose.EXPLORE &&
             !planPurpose(purpose)
         ) {
             transition(
@@ -2334,9 +2744,145 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         uiState = uiState.copy(micOpen = true)
         lastPartial = ""
         micOpenedAtMillis = System.currentTimeMillis()
-        recogniser.start(speechListener)
+        recogniser.start(speechListener, listenOptionsFor(purpose))
+        // Held: a pause does not end the answer; letting go does.
+        recogniser.setHeld(true)
         startSilenceWatch(purpose)
     }
+
+    /** The question waiting for a press to answer it, and the screen it was asked on. */
+    private var awaitingAnswer: Pair<MicPurpose, kotlin.reflect.KClass<out RiderState>>? = null
+    private var pressWaitJob: Job? = null
+
+    /**
+     * A question has been asked: wait for the rider to press to answer it. The screen says so,
+     * and a question with a natural default (feedback, the camera, "anything else?") takes it
+     * if no press comes, so nothing is left hanging.
+     */
+    private fun awaitPress(purpose: MicPurpose) {
+        if (!stillAsking(purpose)) {
+            Log.i(TAG, "MIC no press awaited for $purpose: that question is no longer open")
+            return
+        }
+        // "Understanding your request" must not stay up while the app waits for an answer.
+        if (uiState.ride is RiderState.Resolving) {
+            transition(RiderState.Listening(isFollowUp = purpose != MicPurpose.BOOKING), announce = false)
+        }
+        awaitingAnswer = purpose to uiState.ride::class
+        uiState = uiState.copy(holdToAnswer = true)
+        Log.i(TAG, "MIC waiting for a press to answer $purpose")
+
+        pressWaitJob?.cancel()
+        val timeout = when (purpose) {
+            MicPurpose.CAMERA -> CAMERA_ANSWER_MS
+            MicPurpose.FEEDBACK, MicPurpose.NEXT_JOURNEY, MicPurpose.NEARBY, MicPurpose.INTERPRET -> NO_PRESS_DEFAULT_MS
+            else -> return
+        }
+        pressWaitJob = viewModelScope.launch {
+            delay(timeout)
+            if (awaitingAnswer?.first != purpose || uiState.micOpen) return@launch
+            clearAwaiting()
+            Log.i(TAG, "NO_PRESS for $purpose after ${timeout}ms; taking the default")
+            when (purpose) {
+                MicPurpose.FEEDBACK -> finishFeedback(send = true, spokenThanks = false)
+                MicPurpose.NEXT_JOURNEY -> finishPostRide("I'll wait. Hold anywhere when you need a ride.")
+                MicPurpose.NEARBY -> endNearby()
+                MicPurpose.INTERPRET -> interpretNoAnswer()
+                MicPurpose.CAMERA -> if (uiState.camera == CameraShare.ASKING) declineCamera("NO_ANSWER")
+                else -> Unit
+            }
+        }
+    }
+
+    private fun clearAwaiting() {
+        awaitingAnswer = null
+        pressWaitJob?.cancel()
+        pressWaitJob = null
+        if (uiState.holdToAnswer) uiState = uiState.copy(holdToAnswer = false)
+    }
+
+    /**
+     * How patient the microphone is, per question.
+     *
+     * The recogniser keeps listening through pauses (see [ListenOptions]); what changes is how
+     * long a pause ends the answer, and what counts as a complete answer that needs no pause
+     * at all. A yes, a rating or a whole code ends the moment it is heard; a destination or a
+     * spoken report waits for the rider to stop, so a "take me to… uh… RS Puram" is not cut
+     * at the "uh".
+     */
+    private fun listenOptionsFor(purpose: MicPurpose): ListenOptions {
+        val yesNo: (String) -> Boolean = { text ->
+            val intent = Classifier.classify(text, rideActive = uiState.ride !is RiderState.Idle).intent
+            intent is RiderIntent.Yes || intent is RiderIntent.No
+        }
+        return when (purpose) {
+            MicPurpose.CODE_VERIFY -> {
+                val expected = expectedCode.filter { it.isDigit() }
+                ListenOptions(
+                    // The driver may take a moment to reach the window and speak.
+                    startTimeoutMs = CODE_LISTEN_MS,
+                    endSilenceMs = 1_000L,
+                    incompleteSilenceMs = 3_000L,
+                    isComplete = { text ->
+                        val heard = digitsFrom(text)
+                        CameraConsent.answer(text) != null ||
+                            (expected.isNotEmpty() && (heard.contains(expected) || heard.length >= expected.length))
+                    }
+                )
+            }
+            MicPurpose.CANCEL_WINDOW -> ListenOptions(
+                startTimeoutMs = RiderState.CANCEL_WINDOW_MS + 1_000L,
+                endSilenceMs = 800L
+            )
+            MicPurpose.NEAR_MISS_ANSWER, MicPurpose.MEMORY_ANSWER, MicPurpose.MEETING_ANSWER,
+            MicPurpose.CONTACT_CONFIRM_ANSWER, MicPurpose.STOP_CONFIRM, MicPurpose.INTERPRET -> ListenOptions(
+                endSilenceMs = 1_100L,
+                isComplete = yesNo
+            )
+            MicPurpose.CAMERA -> ListenOptions(
+                endSilenceMs = 1_000L,
+                isComplete = { CameraConsent.answer(it) != null || CameraConsent.isStopCamera(it) }
+            )
+            MicPurpose.FEEDBACK -> when ((uiState.ride as? RiderState.Feedback)?.step) {
+                FeedbackStep.RATING -> ListenOptions(
+                    endSilenceMs = 1_200L,
+                    isComplete = { FeedbackParser.intentOf(it) != FeedbackParser.Intent.NONE }
+                )
+                FeedbackStep.RATING_CHECK, FeedbackStep.CONFIRM -> ListenOptions(
+                    endSilenceMs = 1_100L,
+                    isComplete = { yesNo(it) || FeedbackParser.rating(it) != null || FeedbackParser.isSendCommand(it) }
+                )
+                // Saying what went wrong is a few sentences, with thinking between them.
+                else -> ListenOptions(endSilenceMs = 2_200L, maxDurationMs = 60_000L)
+            }
+            else -> ListenOptions(endSilenceMs = 1_300L)
+        }
+    }
+
+    /** False for a question the rider has already answered some other way, or that moved on. */
+    private fun stillAsking(purpose: MicPurpose): Boolean = when (purpose) {
+        MicPurpose.CLARIFY_ANSWER -> pendingOptions != null && uiState.ride is RiderState.Clarify
+        MicPurpose.NEAR_MISS_ANSWER -> pendingNearMiss != null || pendingMemory != null
+        MicPurpose.CANCEL_WINDOW -> uiState.ride is RiderState.Confirming
+        else -> true
+    }
+
+    /**
+     * True when [text] is the app's own voice coming back through the microphone: three or
+     * more words that appear, in order, in something the app said in the last few seconds.
+     * A rider's bare "cancel" is never mistaken for it; "say cancel to stop" always is.
+     */
+    private fun isEcho(text: String): Boolean {
+        val words = echoWords(text)
+        if (words.size < 3) return false
+        val now = System.currentTimeMillis()
+        return recentSpoken.any { (at, said) ->
+            now - at < ECHO_WINDOW_MS && echoWords(said).windowed(words.size).any { it == words }
+        }
+    }
+
+    private fun echoWords(text: String): List<String> =
+        text.lowercase().split(Regex("[^a-z0-9]+")).filter { it.isNotBlank() }
 
     /** Reflects a closed microphone in the UI so the pulsing indicator stops. */
     private fun closeMic() {
@@ -2470,6 +3016,12 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         trace?.mark(Telemetry.Stage.SPEECH_FINAL)
         silenceJob?.cancel()
         closeMic()
+        if (isEcho(text)) {
+            // The phone heard itself. Not the rider's answer: listen again for the real one.
+            Log.w(TAG, "ECHO ignored heard=\"$text\" purpose=$micPurpose")
+            reopenMicAfterGap(micPurpose)
+            return
+        }
         engine.earcon(Earcon.LISTENING_END)
         handleTranscript(text)
     }
@@ -2556,9 +3108,25 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         consecutiveSpeechErrors = 0
         silenceRepromptUsed = false
 
+        // Exploring: everything said is for the explore module.
+        if (micPurpose == MicPurpose.EXPLORE) {
+            handleExploreSpeech(text)
+            return
+        }
+
         // Camera words first: "stop camera" must never reach the classifier, where a leading
         // "stop" is the command that cancels the whole ride.
         if (handleCameraSpeech(text)) return
+
+        // "What's in front of me", "explore", "find the door": the explore module, from the main
+        // question, when no ride is under way.
+        if (micPurpose == MicPurpose.BOOKING && uiState.ride is RiderState.Listening && activeRideId == null &&
+            (com.cabeye.rider.explore.ExploreCommands.opens(text) || text.trim().lowercase().startsWith("find "))
+        ) {
+            transition(RiderState.Idle, announce = false)
+            openExplore(then = com.cabeye.rider.explore.ExploreCommands.parse(text))
+            return
+        }
 
         // "Speak slower", "louder": only as a short command from the main question, so a
         // report like "the driver was going too fast" is never taken as a setting.
@@ -2689,6 +3257,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             MicPurpose.PLAN_LEG, MicPurpose.STOP_KIND, MicPurpose.PLAN_REVIEW,
             MicPurpose.TRIP_COMMAND, MicPurpose.STOP_CONFIRM, MicPurpose.WALK, MicPurpose.NEARBY,
             MicPurpose.INTERPRET -> return // handled above
+            MicPurpose.EXPLORE -> return // handled above
             MicPurpose.BOOKING -> Unit
         }
 
@@ -2889,7 +3458,10 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         if (runnerUp != null) {
             val gap = top.score - runnerUp.score
             val divergenceKm = Gazetteer.distanceKm(top, runnerUp)
-            val shouldAsk = gap < RiderState.CONFIDENCE_DELTA && divergenceKm > RiderState.DIVERGENCE_KM
+            // "Did you mean Peelamedu, or Peelamedu?" cannot be answered. Found on device, where
+            // the offline map holds two places of that name. Same name: take the better match.
+            val sameName = top.name.trim().equals(runnerUp.name.trim(), ignoreCase = true)
+            val shouldAsk = !sameName && gap < RiderState.CONFIDENCE_DELTA && divergenceKm > RiderState.DIVERGENCE_KM
 
             Telemetry.logClarificationDecision(top.name, runnerUp.name, gap, divergenceKm, shouldAsk)
 
@@ -6162,9 +6734,9 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         val address = place.formattedAddress.takeIf { it.isNotBlank() }
         val why = if (note.isNotBlank()) ", $note" else ""
         return if (address != null) {
-            "Booking ${rideType.spokenName} to ${place.name}$why, $address. Say cancel to stop."
+            "Booking ${rideType.spokenName} to ${place.name}$why, $address. To stop it, hold the screen and say cancel."
         } else {
-            "Booking ${rideType.spokenName} to ${place.name}$why. Say cancel to stop."
+            "Booking ${rideType.spokenName} to ${place.name}$why. To stop it, hold the screen and say cancel."
         }
     }
 
@@ -6172,7 +6744,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     private fun planAnnouncement(p: TripPlan, place: PlaceOption, rideType: RideType): String {
         val n = p.stops.size
         val stops = p.stops.joinToString(", then ") { it.name }
-        return "Booking ${rideType.spokenName} to ${place.name}, with $n ${if (n == 1) "stop" else "stops"}: $stops. Say cancel to stop."
+        return "Booking ${rideType.spokenName} to ${place.name}, with $n ${if (n == 1) "stop" else "stops"}: $stops. To stop it, hold the screen and say cancel."
     }
 
     private var bookingStartedAt: Long = System.currentTimeMillis()
@@ -6414,6 +6986,8 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         onDone: (() -> Unit)? = null
     ) {
         lastSpoken = text
+        recentSpoken.addLast(System.currentTimeMillis() to text)
+        while (recentSpoken.size > 6) recentSpoken.removeFirst()
         engine.speak(
             text,
             tier,
@@ -6480,6 +7054,8 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                     "Or say my places, list places, status, repeat, go back, cancel, call driver, book again, " +
                     "switch city, or yellow theme. To change how I sound, say speak slower, speak faster, " +
                     "louder, or quieter. A short press on the volume keys also changes the volume. " +
+                    "Double tap the screen to explore around you with the camera. " +
+                    "Press volume down three times quickly to open your mind map. " +
                     "To teach me places, say remember this as Ravi's tea shop, or ask what's around here. " +
                     "In the cab, hold the screen and say speed bump, or where am I.",
             NarrationTier.QUEUED
@@ -6524,6 +7100,12 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun handleSpeechError(error: SpeechError) {
+        if (micPurpose == MicPurpose.EXPLORE) {
+            if (error == SpeechError.NO_MATCH || error == SpeechError.NO_SPEECH) {
+                speak("I didn't catch that. Hold and say describe, find the door, read this, or this is and a name.", NarrationTier.QUEUED)
+            }
+            return
+        }
         if (micPurpose == MicPurpose.WALK) {
             onWalkNoAnswer()
             return
@@ -6670,7 +7252,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             MicPurpose.TRIP_COMMAND, MicPurpose.STOP_CONFIRM, MicPurpose.WALK, MicPurpose.NEARBY,
-            MicPurpose.INTERPRET -> return
+            MicPurpose.INTERPRET, MicPurpose.EXPLORE -> return
 
             MicPurpose.MEMORY_ANSWER -> {
                 val routine = pendingRoutine
@@ -6802,10 +7384,49 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             next::class.simpleName ?: "?"
         )
         if (next is RiderState.Idle) engine.heartbeat(false)
+        val wasFinding = uiState.ride is RiderState.Finding
+        if (awaitingAnswer != null && awaitingAnswer?.second != next::class) clearAwaiting()
         uiState = uiState.copy(ride = next)
+        if (next is RiderState.Finding && !wasFinding) startFindingWatch()
         // A scheduled ride that came due while the app was busy starts at the next quiet moment.
         if (next is RiderState.Idle && app.dueScheduledRide.value != null) {
             viewModelScope.launch { startDueRide() }
+        }
+    }
+
+    private var findingJob: Job? = null
+
+    /**
+     * While searching for a driver: the elapsed time on screen, and a spoken update now and
+     * then, so a long search never sounds like a stalled app. Ends by itself the moment the
+     * state moves on (a driver accepted, a cancel, a failure).
+     */
+    private fun startFindingWatch() {
+        findingJob?.cancel()
+        val started = System.currentTimeMillis()
+        findingJob = viewModelScope.launch {
+            var spokenAt = 0L
+            while (true) {
+                delay(1_000)
+                val current = uiState.ride as? RiderState.Finding ?: return@launch
+                val elapsed = System.currentTimeMillis() - started
+                uiState = uiState.copy(ride = current.copy(elapsedMillis = elapsed))
+                val due = when {
+                    spokenAt == 0L && elapsed >= FINDING_FIRST_UPDATE_MS -> true
+                    spokenAt > 0L && elapsed - spokenAt >= FINDING_UPDATE_EVERY_MS -> true
+                    else -> false
+                }
+                if (due && !uiState.micOpen) {
+                    spokenAt = elapsed
+                    val minutes = (elapsed / 60_000).toInt()
+                    val waited = if (minutes < 1) "half a minute" else if (minutes == 1) "a minute" else "$minutes minutes"
+                    speak(
+                        "Still looking for a driver. It's been $waited. No driver has accepted yet; " +
+                            "I'll tell you the moment one does.",
+                        NarrationTier.QUEUED
+                    )
+                }
+            }
         }
     }
 
@@ -6823,6 +7444,10 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         paymentPollJob?.cancel()
         listPlacesJob?.cancel()
         demoRideJob?.cancel()
+        findingJob?.cancel()
+        rideVisionJob?.cancel()
+        if (explore.ui.open) explore.close(save = true)
+        runCatching { sceneDetector.close() }
         stt?.cancel()
         engine.heartbeat(false)
         // The socket is application-scoped and deliberately NOT closed here. A rotation or a

@@ -1,9 +1,12 @@
-# Cab Eye — next phase: what's new and how to test it
+# Cab Eye — on-device test scripts
+
+[← Back to the README](README.md)
 
 Covers: sign-in (rider voice + fingerprint, driver form + profile), the destination dialogue
 "go back" fixes, the Preference-Memory Agent (visited places, time-of-travel suggestions,
 misheard-place repair, learned aliases, confidence recalibration), optional voice feedback,
-and the next journey (book now / schedule / done).
+and the next journey (book now / schedule / done), multi-stop rides, walking routes, and the
+explore and mind-map modules with their gestures (section 9).
 
 ## 0. Build first
 
@@ -15,10 +18,8 @@ cd ..\android
 .\gradlew.bat assembleDebug
 ```
 
-The pure logic tests (99 of them) were run while writing this. The Compose screens
-(`RiderSignInSurface`, `DriverAccountScreen`, the new `RiderSurface` branches) and
-`MainActivity` could not be compiled there — if the build reports an error, it will be in one
-of those four files.
+Building by hand needs Java 17+: set `JAVA_HOME` to `C:\Program Files\Android\Android Studio\jbr`
+first (this PC's default Java is 11). See [docs/SETUP.md](docs/SETUP.md).
 
 Backend data now lives in `backend/data/` (accounts, sessions, visited places, trips,
 feedback). Delete that folder for a clean slate. It is git-ignored.
@@ -184,3 +185,52 @@ Outdoors first (GPS + steps), then try a corridor indoors (steps + compass only)
 | Book a cab to the place the walk was recorded from, finish the ride | "I have your walk from here to the clinic door. Say guide me when you're ready." |
 | In the cab, press and say "tell me the walk" | Preview of the walk, no guidance until you're out |
 | "my walking routes" / "forget the route to the clinic" / "export my walking log" | List / delete / share sheet with a CSV |
+
+## 9. Inputs, explore and the mind map
+
+Sign in as a rider, no ride under way. For Gemini descriptions, put keys in
+`backend/cabeye-secrets.properties` and restart the backend; `http://localhost:8080/me/vision`
+(with the rider's token) or the backend log (`GEMINI keys=N`) shows whether it is on. Without
+keys everything below still works with the on-device detector.
+
+**Inputs**
+
+| Do | Expected |
+|---|---|
+| Hold the screen, speak, let go | Chirp, listening, the answer, exactly as before. Holding never waits. |
+| Short press volume up / down | Volume step with the system click; nothing else. |
+| Hold a volume key | Talks, like holding the screen. |
+| **Double tap** the main screen | Explore opens ("Exploring. Hold the phone at chest height…"). First time: the camera permission is explained, then asked. No "I didn't catch that" from the first tap. |
+| Double tap during a ride / while a question is waiting | Nothing special: each tap is an ordinary press. |
+| **Volume down ×3 quickly** | Mind map opens: "Your mind map. Press volume down three times to close it." Volume back where it was. |
+| Volume down ×3 again | "Mind map closed." |
+| Volume down twice, pause a second, once more | Three volume steps down; the mind map does not open. |
+| Volume up ×3 quickly | Three volume steps up; nothing opens. |
+| Volume down ×3 while a ride is being booked or under way | "Your mind map opens from the main screen, when no ride is being booked." |
+| Volume down ×3 while exploring | Explore finishes (walk saved), the mind map opens. |
+| TalkBack on: swipe up-then-right on the main screen | Actions include *Open explore* and *Open my mind map*. |
+| "help" | Mentions the double tap and volume down three times. |
+
+**Explore**
+
+| Do / say (hold the camera picture) | Expected |
+|---|---|
+| **Describe** / "what's in front of me" | Hazards first, then objects with clock positions (and distances with Gemini). Boxes on screen. |
+| **Keep telling me**, walk slowly | Only new things are said; **Stop telling** / "stop" ends it. |
+| "find the door", turn slowly | Says when and where it appears; gives up after 90 s. |
+| **Read text** at a sign | Reads it, or asks to hold steady about an arm's length away. |
+| "this is Ravi's tea shop" (outdoors) | "Remembered Ravi's tea shop here, near …". |
+| **Save & finish** | "You walked about N metres; I've saved it as the walk to Ravi's tea shop. I noted N things the camera saw." |
+| Then "take me to Ravi's tea shop" | Books a ride to that spot with the usual cancel window. |
+| Backend stopped mid-explore | Descriptions continue from the phone's own detector, no error spoken. |
+
+**Mind map**
+
+| Do | Expected |
+|---|---|
+| Open it, **From my rides** | Cab destinations with visits, distance, direction; Book a ride works and closes the map. |
+| **From my walks** | Ravi's tea shop, the explored walk, camera finds; Guide me starts walk guidance. |
+| **Map** | Radar with you at the centre; tap a dot for details. |
+
+Logs: `adb logcat -s CabEye.Explore CabEye.Vision CabEye.Camera CABEYE_METRICS`.
+

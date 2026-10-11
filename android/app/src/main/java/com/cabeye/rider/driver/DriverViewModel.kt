@@ -63,6 +63,9 @@ class DriverViewModel(application: Application) : AndroidViewModel(application) 
      * changes several times a second and nothing else on the screen should recompose for it.
      */
     var cameraFrame by mutableStateOf<Bitmap?>(null)
+
+    /** What the passenger's phone detected in the current picture: the same things they hear. */
+    var cameraLabels by mutableStateOf<List<com.cabeye.rider.vision.SceneObject>>(emptyList())
         private set
 
     private var pollJob: Job? = null
@@ -129,16 +132,19 @@ class DriverViewModel(application: Application) : AndroidViewModel(application) 
             }
         }
         viewModelScope.launch {
-            socket.frames.collect { jpeg ->
+            socket.frames.collect { frame ->
                 if (uiState.camera != DriverCamera.LIVE) return@collect
                 // Decoded off the main thread; only the newest picture is ever shown.
                 val bitmap = withContext(Dispatchers.Default) {
                     runCatching {
-                        val bytes = Base64.decode(jpeg, Base64.DEFAULT)
+                        val bytes = Base64.decode(frame.jpeg, Base64.DEFAULT)
                         BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
                     }.getOrNull()
                 }
-                if (bitmap != null && uiState.camera == DriverCamera.LIVE) cameraFrame = bitmap
+                if (bitmap != null && uiState.camera == DriverCamera.LIVE) {
+                    cameraFrame = bitmap
+                    cameraLabels = frame.labels
+                }
             }
         }
     }
@@ -178,6 +184,7 @@ class DriverViewModel(application: Application) : AndroidViewModel(application) 
 
     private fun endCamera(state: DriverCamera = DriverCamera.OFF) {
         cameraFrame = null
+        cameraLabels = emptyList()
         if (uiState.camera != state) uiState = uiState.copy(camera = state)
     }
 
