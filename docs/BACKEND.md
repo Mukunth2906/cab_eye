@@ -24,7 +24,7 @@ runs the admin website.
 | `vision` | `GeminiClient` (keys × models fallback) and `VisionService` ("what's in front of me", with the server-side safety filter). |
 | `mindmap` | `InterpretService`: reads a sentence the phone's rules couldn't (Grok, else Gemini), with consent. |
 | `places` | `OsmService`: area names (Nominatim) and well-known places (Overpass), cached and rate-limited. |
-| `admin` | The admin website's API, cases, SOS and urgent alerts to Telegram and email. |
+| `admin` | The admin website's API; `CaseService` (feedback, driver reports, stops overdue, SOS) and `AlertService` (Telegram and email). |
 | `store`, `persistence` | H2 file database by default (`backend/data/`), PostgreSQL with `CABEYE_DB_URL`; JSON tables. |
 | `redis` | Optional: shares ride events between several backend instances (Docker cluster). |
 
@@ -66,6 +66,7 @@ runs the admin website.
 | `GET /health`, `/ready`, `/whoami` | Health checks. |
 | `/pay/{orderId}`, `/payments/{orderId}…` | Checkout pages (mock and Razorpay). |
 | `/admin`, `/admin/api/…` | Admin website: overview, cases (status, notes), rides, drivers (suspend), riders, Telegram link, test alert. |
+| `POST /sos` | The rider's SOS: `{rideId?, lat?, lng?, note?}` → `{caseId, alerted}`. A token is used when present, never required, so a guest still gets through. Opens one urgent `SOS` case per emergency (presses within 10 minutes update its position), with rider, ride, driver, plate and emergency contact, and alerts Telegram and email. |
 | `POST /debug/broadcast` | Debug only: needs the dev profile and `cabeye.debug.token`; returns 404 otherwise (indistinguishable from absent), and does not exist under `prod`. |
 | `/` | A browser test console for the WebSocket. |
 
@@ -99,5 +100,5 @@ cd backend
 ```
 
 There are endpoint tests for auth, rides, multi-stop, memory, fare and the trip meter, feedback,
-payments, the camera, vision, the mind-map reader, OSM places, SMS and admin. External
+payments, the camera, vision, the mind-map reader, OSM places, SMS, admin and SOS. External
 services (Gemini, Grok, OSM, SMS, Razorpay) are stubbed, so the tests need no network or keys.

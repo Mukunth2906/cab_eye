@@ -218,7 +218,22 @@ TTS audio ≤ 300 ms, total ≤ 2000 ms.
 
 ---
 
-## 6. Troubleshooting
+## 6. See every screen without a phone
+
+```powershell
+cd android
+.\gradlew.bat :app:testDebugUnitTest --tests "*ScreenGalleryTest" -Pscreenshots
+```
+
+Robolectric draws every rider screen (each ride state, Explore, the mind map, SOS, sign-in) in
+all three themes with Android's real graphics code. The PNGs land in
+`android/app/build/screenshots/<theme>/`, with `sheet-N.png` contact sheets of six screens each.
+Without `-Pscreenshots` the test skips itself. The first run downloads Robolectric's Android
+image (about 100 MB).
+
+---
+
+## 7. Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -241,7 +256,7 @@ TTS audio ≤ 300 ms, total ≤ 2000 ms.
 
 ---
 
-## 7. Versions
+## 8. Versions
 
 Pinned as a tested-together set.
 

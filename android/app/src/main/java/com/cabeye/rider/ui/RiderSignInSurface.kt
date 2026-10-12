@@ -230,7 +230,11 @@ private fun StepProgress(step: SignInStep) {
         Text("SIGN IN", style = MaterialTheme.typography.labelLarge, color = palette.muted)
         return
     }
-    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.fillMaxWidth()
+    ) {
         listOf("Number", "Code", "Name").forEachIndexed { i, label ->
             val done = i < current
             val active = i == current
@@ -239,15 +243,19 @@ private fun StepProgress(step: SignInStep) {
                 done -> palette.confirm
                 else -> palette.muted
             }
+            // Equal widths and one line each: three steps always fit across the phone.
             Box(
                 modifier = Modifier
+                    .weight(1f)
                     .border(if (active) 2.dp else 1.dp, color, CabEyeShapes.pill)
-                    .padding(horizontal = 12.dp, vertical = 6.dp)
+                    .padding(horizontal = 8.dp, vertical = 8.dp),
+                contentAlignment = Alignment.Center
             ) {
                 Text(
                     text = (if (done) "✓ " else "${i + 1}  ") + label,
-                    style = MaterialTheme.typography.labelLarge,
-                    color = color
+                    style = MaterialTheme.typography.labelLarge.copy(fontSize = 17.sp, lineHeight = 22.sp),
+                    color = color,
+                    maxLines = 1
                 )
             }
         }

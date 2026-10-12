@@ -491,6 +491,10 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         /** In the cab, a press released this quickly is a tap ("where are we"), not talking. */
         const val TAP_MS = 500L
 
+        /** SOS delivery: tries, and the back-off between them (1 s, 2 s, 3 s …). */
+        const val SOS_ATTEMPTS = 4
+        const val SOS_RETRY_MS = 1_000L
+
         /** The simulated ride: one synthetic fix this often (each stands for 15 s of driving). */
         const val DEMO_FIX_MS = 700L
         /** Where a simulated ride starts when the phone is not in Coimbatore: Saibaba Colony. */
@@ -605,6 +609,16 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         val NETBANKING_WORDS = Regex("\\b(net ?banking|bank)\\b")
         val UPI_WORDS = Regex("\\b(upi|u p i)\\b")
     }
+
+    /**
+     * Whether the mind map screen is showing. Opened by its button in the top bar, or by pressing
+     * volume down three times quickly (the same again closes it); see MainActivity.
+     *
+     * Declared above `init` on purpose: `init` starts collectors that can run synchronously and
+     * reach [transition], which reads this.
+     */
+    var mindMapOpen by mutableStateOf(false)
+        private set
 
     init {
         themeChoice = prefs.theme
@@ -854,7 +868,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                     ?: (current as? RiderState.Approaching)?.driver
                     ?: driverFrom(event)
                 engine.heartbeat(false)
-                transition(RiderState.Approaching(driver, distanceMeters = -1, bearingDegrees = 0f), announce = false)
+                transition(RiderState.Approaching(driver, distanceMeters = null, bearingDegrees = null), announce = false)
                 narrate(event, "${driver.name} is on the way.")
                 lastSpokenPhase = RidePhase.ENROUTE
             }
@@ -869,7 +883,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
                     ?: (uiState.ride as? RiderState.Assigned)?.driver
                     ?: driverFrom(event)
 
-                transition(RiderState.Approaching(driver, metres, bearing), announce = false)
+                transition(RiderState.Approaching.of(driver, metres, bearing), announce = false)
                 engine.heartbeat(false)
                 engine.earcon(
                     Earcon.DRIVER_APPROACH,
@@ -2138,13 +2152,6 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
     var mapAnswer by mutableStateOf("")
         private set
 
-    /**
-     * Whether the mind map screen is showing. Opened by its button in the top bar, or by pressing
-     * volume down three times quickly (the same again closes it); see MainActivity.
-     */
-    var mindMapOpen by mutableStateOf(false)
-        private set
-
     /** Opens the mind map from the main screen; anywhere else it says why not. */
     fun openMindMap() {
         if (mindMapOpen) return
@@ -2153,7 +2160,12 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         // Explore covers the whole screen: finish it (keeping the walk) so the map is what shows.
-        if (explore.ui.open) closeExplore(save = true)
+        if (explore.ui.open) {
+            closeExplore(save = true)
+            // Closing explore may have started a scheduled ride that came due meanwhile; that
+            // booking's cancel window must stay visible, so no map over it.
+            if (uiState.ride !is RiderState.Idle) return
+        }
         stt?.cancel()
         closeMic()
         clearAwaiting()
@@ -2328,6 +2340,8 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         stt?.cancel()
         closeMic()
         explore.close(save)
+        // A scheduled ride that came due while exploring was held back; this is its moment.
+        if (app.dueScheduledRide.value != null) startDueRide()
     }
 
     /** The live preview on the rider's own screen (explore, and the shared ride camera). */
@@ -2650,15 +2664,50 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         transition(RiderState.Idle)
     }
 
+    private var sosJob: Job? = null
+
+    /**
+     * SOS held. Sends an urgent case to support with the ride and the phone's position, and
+     * says only what actually happened: "sending", then "sent", or "not delivered" with what to
+     * do instead. (It used to say "sharing your location" and send nothing at all.)
+     */
     fun onSos() {
-        uiState = uiState.copy(sosActive = true)
+        // Already raised and on its way: a second trigger must not restart or repeat it.
+        if (uiState.sosActive && sosJob?.isActive == true) return
+        uiState = uiState.copy(sosActive = true, sosStatus = "Sending your S O S to Cab Eye support…")
         engine.earcon(Earcon.SOS)
-        speak("S O S activated. Sharing your location.", NarrationTier.INTERRUPT)
+        speak("S O S. Sending your location to Cab Eye support.", NarrationTier.INTERRUPT)
         Telemetry.logStateChange(uiState.ride::class.simpleName ?: "?", "SOS")
+
+        sosJob?.cancel()
+        sosJob = viewModelScope.launch {
+            val here = runCatching { app.locationProvider.current() }.getOrNull()
+            var result: ApiResult<Boolean> = ApiResult.Failed("", "not tried")
+            for (attempt in 1..SOS_ATTEMPTS) {
+                result = api.sos(activeRideId, here?.latitude, here?.longitude)
+                if (result is ApiResult.Ok || !uiState.sosActive) break
+                delay(SOS_RETRY_MS * attempt)
+            }
+            if (!uiState.sosActive) return@launch
+            val (shown, said) = when {
+                result is ApiResult.Ok && here != null ->
+                    "Support has your S O S and your location." to "Sent. Cab Eye support has your S O S and your location."
+                result is ApiResult.Ok ->
+                    "Support has your S O S. Your location wasn't available." to
+                        "Sent. Cab Eye support has your S O S, but I couldn't get your location."
+                else ->
+                    "Couldn't reach Cab Eye support. If you are in danger, call 112." to
+                        "I couldn't reach Cab Eye support. If you are in danger, call 1 1 2."
+            }
+            Log.w(TAG, "SOS delivered=${result is ApiResult.Ok} located=${here != null}")
+            uiState = uiState.copy(sosStatus = shown)
+            speak(said, NarrationTier.INTERRUPT)
+        }
     }
 
     fun onDismissSos() {
-        uiState = uiState.copy(sosActive = false)
+        // Dismissing hides the overlay; a case already sent stays open for support to follow up.
+        uiState = uiState.copy(sosActive = false, sosStatus = "")
     }
 
     // =================================================================================
@@ -3899,6 +3948,8 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
      */
     private fun offerProactive(trigger: String) {
         if (!app.memory.enabled || app.memory.current.isEmpty) return
+        // Exploring or browsing the mind map: the rider is busy; a "like usual?" would talk over it.
+        if (explore.ui.open || mindMapOpen) return
         if (uiState.ride !is RiderState.Idle || uiState.micOpen || activeRideId != null) return
         if (proactiveDeclines >= MAX_PROACTIVE_DECLINES) return
         val now = System.currentTimeMillis()
@@ -6354,6 +6405,14 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         val quiet = activeRideId == null && !uiState.micOpen &&
             (ride is RiderState.Idle || ride is RiderState.NextJourney || paidOrNoFare)
         if (!quiet) return
+        // Exploring: the camera screen covers everything. Say it once; closing explore books it.
+        if (explore.ui.open) {
+            if (dueRideAnnouncedFor != id) {
+                dueRideAnnouncedFor = id
+                speak("It's time for your scheduled ride. Say finish, or tap Save and finish, and I'll book it.", NarrationTier.QUEUED)
+            }
+            return
+        }
         // Opened cold from the notification, the voice may still be warming up; the first
         // sentence here is the only warning the rider gets that a booking is starting.
         if (!app.audioReady) {
@@ -6366,6 +6425,9 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         }
         startDueRideNow()
     }
+
+    /** The scheduled ride already announced while exploring, so it is said only once. */
+    private var dueRideAnnouncedFor: String? = null
 
     private fun startDueRideNow() {
         val id = app.dueScheduledRide.value ?: return
@@ -7309,7 +7371,7 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         val next = when (snapshot.phase) {
             RidePhase.REQUESTED -> RiderState.Finding()
             RidePhase.ASSIGNED -> RiderState.Assigned(driver, snapshot.etaMinutes)
-            RidePhase.ENROUTE -> RiderState.Approaching(
+            RidePhase.ENROUTE -> RiderState.Approaching.of(
                 driver, snapshot.distanceMeters, snapshot.bearingDeg
             )
             RidePhase.ARRIVED -> RiderState.Arrived(
@@ -7386,6 +7448,10 @@ class RiderViewModel(application: Application) : AndroidViewModel(application) {
         if (next is RiderState.Idle) engine.heartbeat(false)
         val wasFinding = uiState.ride is RiderState.Finding
         if (awaitingAnswer != null && awaitingAnswer?.second != next::class) clearAwaiting()
+        // The mind map covers the main screen. Anything that moves the ride on (a booking said
+        // with a volume key held, a scheduled ride coming due) must not happen underneath it,
+        // where the cancel window and its button can't be seen or pressed.
+        if (next !is RiderState.Idle && mindMapOpen) mindMapOpen = false
         uiState = uiState.copy(ride = next)
         if (next is RiderState.Finding && !wasFinding) startFindingWatch()
         // A scheduled ride that came due while the app was busy starts at the next quiet moment.

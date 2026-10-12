@@ -30,6 +30,7 @@ import com.cabeye.rider.BuildConfig
 import com.cabeye.rider.state.PlaceOption
 import com.cabeye.rider.state.RideType
 import com.cabeye.rider.ui.theme.CabEyeColors
+import com.cabeye.rider.ui.theme.LocalPalette
 import com.cabeye.rider.ui.theme.CabEyeShapes
 import com.cabeye.rider.ui.theme.CabEyeSpacing
 import com.cabeye.rider.ui.theme.CabEyeType
@@ -62,8 +63,8 @@ fun DestinationCard(
         modifier = modifier
             .fillMaxWidth()
             .clip(CabEyeShapes.card)
-            .background(CabEyeColors.SurfaceDark)
-            .border(2.dp, CabEyeColors.CardBorder, CabEyeShapes.card)
+            .background(LocalPalette.current.surface)
+            .border(2.dp, LocalPalette.current.outline, CabEyeShapes.card)
             .padding(CabEyeSpacing.md)
     ) {
         // Top row: Destination Icon & Name
@@ -74,8 +75,8 @@ fun DestinationCard(
             Box(
                 modifier = Modifier
                     .size(42.dp)
-                    .background(CabEyeColors.SurfaceElevated, CircleShape)
-                    .border(1.5.dp, CabEyeColors.SuccessGreen, CircleShape),
+                    .background(LocalPalette.current.surfaceElevated, CircleShape)
+                    .border(1.5.dp, LocalPalette.current.confirm, CircleShape),
                 contentAlignment = Alignment.Center
             ) {
                 Text(text = "📍", fontSize = 20.sp)
@@ -87,13 +88,13 @@ fun DestinationCard(
                 Text(
                     text = destinationName,
                     style = CabEyeType.mainInstruction.copy(fontWeight = FontWeight.Bold),
-                    color = CabEyeColors.TextPrimary
+                    color = LocalPalette.current.onBackground
                 )
                 if (!address.isNullOrBlank()) {
                     Text(
                         text = address,
                         style = CabEyeType.secondaryInfo,
-                        color = CabEyeColors.TextSecondary
+                        color = LocalPalette.current.muted
                     )
                 }
             }
@@ -105,7 +106,7 @@ fun DestinationCard(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(CabEyeColors.SurfaceElevated, CabEyeShapes.medium)
+                .background(LocalPalette.current.surfaceElevated, CabEyeShapes.medium)
                 .padding(horizontal = 14.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -118,13 +119,13 @@ fun DestinationCard(
                 Text(
                     text = "$icon ${rideType.spokenName.replaceFirstChar { it.uppercase() }}",
                     style = CabEyeType.buttonText.copy(fontSize = 16.sp),
-                    color = CabEyeColors.WarningYellow
+                    color = LocalPalette.current.clarify
                 )
                 Spacer(Modifier.width(16.dp))
                 Box(
                     modifier = Modifier
                         .size(4.dp)
-                        .background(CabEyeColors.TextMuted, CircleShape)
+                        .background(LocalPalette.current.muted, CircleShape)
                 )
                 Spacer(Modifier.width(16.dp))
             }
@@ -132,7 +133,7 @@ fun DestinationCard(
             Text(
                 text = "Pickup: $pickupText",
                 style = CabEyeType.secondaryInfo.copy(fontSize = 14.sp),
-                color = CabEyeColors.TextSecondary
+                color = LocalPalette.current.muted
             )
         }
 
@@ -192,6 +193,6 @@ private fun MapPreview(place: PlaceOption) {
             .fillMaxWidth()
             .height(120.dp)
             .clip(CabEyeShapes.medium)
-            .border(1.dp, CabEyeColors.CardBorder, CabEyeShapes.medium)
+            .border(1.dp, LocalPalette.current.outline, CabEyeShapes.medium)
     )
 }

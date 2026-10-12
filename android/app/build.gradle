@@ -94,6 +94,19 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
 
+    // Screens can be rendered to PNG on the PC, no phone needed (ScreenGalleryTest):
+    //     gradlew :app:testDebugUnitTest --tests "*ScreenGalleryTest" -Pscreenshots
+    // Without -Pscreenshots that test skips itself, so ordinary test runs stay fast.
+    testOptions {
+        unitTests {
+            includeAndroidResources = true
+            all {
+                systemProperty 'cabeye.screenshots', project.hasProperty('screenshots') ? 'true' : 'false'
+                systemProperty 'cabeye.screenshots.dir', "${layout.buildDirectory.get().asFile}/screenshots"
+            }
+        }
+    }
+
     kotlinOptions {
         jvmTarget = '17'
     }
@@ -202,6 +215,12 @@ dependencies {
 
     // ---- Test ------------------------------------------------------------------------
     testImplementation 'junit:junit:4.13.2'
+
+    // Rendering Compose screens on the JVM (ScreenGalleryTest): Robolectric draws them with
+    // Android's real graphics, the Compose test rule hosts them. Test classpath only.
+    testImplementation composeBom
+    testImplementation 'androidx.compose.ui:ui-test-junit4'
+    testImplementation 'org.robolectric:robolectric:4.14.1'
 
     // The REAL org.json, on the unit-test classpath only.
     //

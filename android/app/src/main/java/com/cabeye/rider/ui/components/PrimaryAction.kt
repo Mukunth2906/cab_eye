@@ -13,6 +13,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.cabeye.rider.ui.theme.CabEyeColors
+import com.cabeye.rider.ui.theme.LocalPalette
 import com.cabeye.rider.ui.theme.CabEyeShapes
 import com.cabeye.rider.ui.theme.CabEyeSpacing
 import com.cabeye.rider.ui.theme.CabEyeType
@@ -28,8 +29,8 @@ fun PrimaryAction(
     label: String,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
-    accentColor: Color = CabEyeColors.SuccessGreen,
-    containerColor: Color = CabEyeColors.SurfaceElevated,
+    accentColor: Color = LocalPalette.current.confirm,
+    containerColor: Color = LocalPalette.current.surfaceElevated,
     enabled: Boolean = true
 ) {
     Button(
@@ -39,8 +40,8 @@ fun PrimaryAction(
         colors = ButtonDefaults.buttonColors(
             containerColor = containerColor,
             contentColor = accentColor,
-            disabledContainerColor = CabEyeColors.SurfaceDark,
-            disabledContentColor = CabEyeColors.TextMuted
+            disabledContainerColor = LocalPalette.current.surface,
+            disabledContentColor = LocalPalette.current.muted
         ),
         modifier = modifier
             .fillMaxWidth()

@@ -173,6 +173,50 @@ public class CaseService {
         return c;
     }
 
+    /** Presses of SOS within this long are one emergency: the case is updated, not duplicated. */
+    static final long SOS_WINDOW_MS = 10 * 60_000L;
+
+    /**
+     * The rider held SOS. Always urgent, always alerted (Telegram and email) the first time; a
+     * second press within {@link #SOS_WINDOW_MS} refreshes the same case's position instead of
+     * opening another. Works for guests too: nobody should have to be signed in to get help.
+     *
+     * @param riderId the signed-in rider, or null for a guest
+     */
+    public AdminCase sos(String riderId, String rideId, Double latitude, Double longitude, String note) {
+        long now = System.currentTimeMillis();
+        String who = rideId != null && !rideId.isBlank() ? rideId : riderId != null ? riderId : "guest";
+        String id = "sos-" + who + "-" + (now / SOS_WINDOW_MS);
+        AdminCase existing = cases.get(id).orElse(null);
+
+        AdminCase c = existing != null ? existing : new AdminCase();
+        c.id = id;
+        c.kind = AdminCase.Kind.SOS;
+        c.urgent = true;
+        c.rideId = rideId == null || rideId.isBlank() ? null : rideId;
+        if (c.createdAt == 0) c.createdAt = now;
+        c.updatedAt = now;
+        if (existing != null && existing.status == AdminCase.Status.RESOLVED) c.status = AdminCase.Status.NEW;
+        if (latitude != null && longitude != null) {
+            c.latitude = latitude;
+            c.longitude = longitude;
+            c.locationAt = now;
+        }
+        Ride ride = c.rideId == null ? null : rides.find(c.rideId).orElse(null);
+        String phase = ride == null ? "no ride under way" : "ride " + ride.phase().name().toLowerCase(java.util.Locale.ROOT).replace('_', ' ');
+        c.text = "SOS pressed by the rider (" + phase + ")."
+                + (c.latitude == null ? " Location not available." : "")
+                + (note == null || note.isBlank() ? "" : " " + note.trim());
+        fillPeople(c, riderId != null ? riderId : ride == null ? null : ride.riderId(), ride == null ? null : ride.driverId());
+        cases.put(id, c);
+
+        if (existing == null) {
+            sendAlert(c);
+            log.warn("ADMIN case {} opened: SOS rider={} ride={} located={}", id, c.riderId, c.rideId, c.latitude != null);
+        }
+        return c;
+    }
+
     private void fillPeople(AdminCase c, String riderId, String driverId) {
         Ride ride = c.rideId == null ? null : rides.find(c.rideId).orElse(null);
         if (ride != null) {

@@ -23,8 +23,8 @@ heard the app's own voice saying "say cancel to stop" and cancelled rides.)
 | **Double tap** the screen | Main screen, no ride under way | **Opens Explore** (the camera, no ride needed). |
 | **Volume down three times quickly** (each press within 0.6 s) | Main screen, no ride under way | **Opens the Mind map.** The same again closes it. The volume returns to where it was before the three presses. |
 | **Tap** the screen | In the cab | "Where are we": area, distance, time left, next cue. |
-| **Hold SOS** for 2 seconds | Bottom right, always | Emergency: shares location and alerts support. |
-| Top bar buttons: **⚙ Settings**, **📷 Explore**, **🧭 My mind map** | Main screen | Same as the gestures, for touch and TalkBack users. Outside the hold-to-talk area, so touching them never opens the mic. |
+| **Hold SOS** for 2 seconds | Bottom right; also on the Explore and mind map screens | Emergency. Sends an urgent case to Cab Eye support with your position, ride, driver and plate (Telegram and email to the admin). The screen counts down while you hold. It then says only what happened: "Sent…", or "I couldn't reach Cab Eye support. If you are in danger, call 1 1 2." It works for guests too. |
+| Top bar buttons: **⚙ Settings**, **📷 Explore**, **🧭 My mind map** | Main screen | Same as the gestures, for touch and TalkBack users; each module button shows its gesture underneath ("or double-tap the screen", "or volume down ×3"). Outside the hold-to-talk area, so touching them never opens the mic. |
 
 Why these choices:
 

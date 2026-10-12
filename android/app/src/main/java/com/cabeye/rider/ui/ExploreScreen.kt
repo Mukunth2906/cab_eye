@@ -41,6 +41,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.cabeye.rider.explore.ExploreMode
 import com.cabeye.rider.explore.ExploreUi
@@ -70,7 +71,9 @@ fun ExploreScreen(
     onAskName: () -> Unit,
     onFinish: (save: Boolean) -> Unit,
     micOpen: Boolean,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    /** SOS stays reachable while exploring: the camera screen covers the main one. */
+    onSos: () -> Unit = {}
 ) {
     val palette = LocalPalette.current
     val context = LocalContext.current
@@ -130,21 +133,28 @@ fun ExploreScreen(
                     when {
                         micOpen -> "◉ LISTENING — let go when done"
                         ui.busy -> "LOOKING…"
-                        ui.mode == ExploreMode.CONTINUOUS -> "● TELLING YOU AS YOU WALK"
+                        ui.mode == ExploreMode.CONTINUOUS -> "● TELLING YOU WHAT'S NEW"
                         ui.mode == ExploreMode.FINDING -> "● FINDING: ${ui.findTarget.uppercase()}"
                         else -> "EXPLORE"
                     },
-                    style = MaterialTheme.typography.labelLarge,
-                    color = if (micOpen) palette.listening else palette.onBackground
+                    style = MaterialTheme.typography.labelLarge.copy(fontSize = 17.sp, lineHeight = 22.sp),
+                    // Over the camera picture: always light on the dark strip, whatever the theme.
+                    color = if (micOpen) palette.listening else Color.White,
+                    maxLines = 1,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
                 )
+                Spacer(Modifier.width(8.dp))
                 Text(
                     buildString {
                         append("${ui.seen} seen")
                         if (ui.spots.isNotEmpty()) append(" · ${ui.spots.size} named")
-                        if (ui.recordingPath) append(" · path ●")
+                        if (ui.recordingPath) append(" · ● path")
                     },
                     style = MaterialTheme.typography.labelMedium,
-                    color = palette.muted
+                    color = OnCameraMuted,
+                    maxLines = 1,
+                    softWrap = false
                 )
             }
 
@@ -162,7 +172,7 @@ fun ExploreScreen(
                         Text(
                             if (src == SceneSource.GEMINI) "Described by Gemini" else "Detected on this phone (offline)",
                             style = MaterialTheme.typography.labelSmall,
-                            color = palette.muted
+                            color = OnCameraMuted
                         )
                     }
                 }
@@ -252,7 +262,14 @@ fun ExploreScreen(
                 BigButton("Save & finish", palette.confirm, Modifier.weight(1f)) { onFinish(true) }
             }
             Spacer(Modifier.height(8.dp))
-            BigButton("Close without saving the walk", palette.muted, Modifier.fillMaxWidth()) { onFinish(false) }
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                BigButton("Close without saving", palette.muted, Modifier.weight(1f)) { onFinish(false) }
+                com.cabeye.rider.ui.components.SosButton(onSos = onSos)
+            }
         }
     }
 }
@@ -271,3 +288,6 @@ private fun BigButton(label: String, accent: Color, modifier: Modifier = Modifie
         Text(label, style = MaterialTheme.typography.titleMedium, textAlign = TextAlign.Center)
     }
 }
+
+/** Secondary text over the camera picture: light grey on the dark strips, in every theme. */
+private val OnCameraMuted = Color(0xFFD0D0D0)

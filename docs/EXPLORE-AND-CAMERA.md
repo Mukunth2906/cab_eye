@@ -100,6 +100,9 @@ detail, never the answer.
   can follow it later.
 - **Holding the camera picture talks**: describe, find …, read this, this is …, keep telling me,
   stop, finish, discard.
+- **SOS** sits beside "Close without saving": the camera screen covers the main one, and an
+  emergency button must never be out of reach.
+- **The status strip** over the picture is always light text on a dark band, in every theme.
 
 **Storage**: the mind map keeps the two modules apart, in separate SharedPreferences on the
 phone:

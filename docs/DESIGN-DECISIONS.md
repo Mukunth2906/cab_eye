@@ -60,6 +60,11 @@ promises, so each is written down with its reason.
 - **The ride camera needs consent every time** (unless the rider chose "always"), is relayed
   only to that ride's driver, is never stored, and switches itself off at pickup or after
   3 minutes. The camera never touches the microphone.
+- **SOS says only what happened.** Holding SOS for two seconds sends an urgent case to support
+  (position, ride, driver, plate, emergency contact) and retries. The app then says "sent", or
+  "couldn't reach support, call 112". An earlier version said "sharing your location" and sent
+  nothing; it also fired twice, at the system long press and again at two seconds. SOS is on every
+  screen that covers the main one (Explore, the mind map), and works without a sign-in.
 - **The fare is computed on the server**, from the driver's GPS, so no phone can name its price.
 - **`/debug/broadcast` answers 404, not 401**, so probing it reveals nothing.
 - **The server stamps message senders from the session**, never from the body.
@@ -84,6 +89,14 @@ promises, so each is written down with its reason.
   destination search, area names and nearby places need no paid service.
 
 ## Look and feel
+
+- **Every colour comes from the active theme** (`LocalPalette`), never from fixed constants in a
+  component. Components that used the dark theme's constants made the light theme unreadable
+  (a white title on white, dark text on black buttons) until `ScreenGalleryTest` rendered every
+  screen in every theme and showed it. The one exception is text over the live camera picture,
+  which is always light on a dark strip.
+- **Unknown is not a number.** A distance or ETA the app doesn't know yet is null, and the
+  screen says "on the way" rather than "-1 m away" or "0 minutes".
 
 - **Pure black background, all text ≥ 7:1 contrast** (WCAG AAA). The danger colour is `#FF8A80`;
   pure red on black is only ~5.3:1.

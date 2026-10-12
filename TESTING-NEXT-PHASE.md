@@ -234,3 +234,20 @@ keys everything below still works with the on-device detector.
 
 Logs: `adb logcat -s CabEye.Explore CabEye.Vision CabEye.Camera CABEYE_METRICS`.
 
+## 10. SOS, distances and themes
+
+| Do | Expected |
+|---|---|
+| Tap SOS briefly | Nothing happens (protects against accidental presses). |
+| Hold SOS | The button counts down "HOLD 2s… 1s"; at two seconds: "S O S. Sending your location to Cab Eye support." Fires **once**. |
+| …with the backend up | "Sent. Cab Eye support has your S O S and your location." Admin site: an urgent **SOS** case with the position, ride, driver and plate; Telegram/email alert if set up. |
+| …with Wi-Fi and data off | After about 10 s of retries: "I couldn't reach Cab Eye support. If you are in danger, call 1 1 2." The screen shows the same. |
+| Hold SOS again within 10 minutes | Same case, position updated; no second alert. |
+| SOS while exploring / in the mind map | The SOS button is on both screens. |
+| Driver accepts, before any location | "Karthik is on the way", never "-1 meters away". |
+| Driver sends a position | "240 m away" (rounded to 10 m); "1.2 km away" from 995 m up. |
+| Arrived | "Ask for the three-digit boarding code" (the code has three digits). |
+| Say "high contrast light theme" | Title, buttons, cards and the driver card all readable: dark text on light. |
+| Mind map open, a scheduled ride comes due | The map closes; the booking and its cancel button are on screen. |
+| Exploring, a scheduled ride comes due | "It's time for your scheduled ride. Say finish…"; it books as soon as explore closes. |
+

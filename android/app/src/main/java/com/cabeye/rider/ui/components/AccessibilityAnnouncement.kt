@@ -14,7 +14,7 @@ import com.cabeye.rider.state.RiderUiState
  * Kept concise and readable for screen reader speech.
  */
 fun announcementFor(uiState: RiderUiState): String {
-    if (uiState.sosActive) return "S O S active. Sharing your location."
+    if (uiState.sosActive) return "S O S active. " + uiState.sosStatus
 
     return when (val ride = uiState.ride) {
         is RiderState.Idle ->
@@ -37,10 +37,12 @@ fun announcementFor(uiState: RiderUiState): String {
             "Finding a driver for you."
 
         is RiderState.Assigned ->
-            "${ride.driver.name} is your driver, ${ride.etaMinutes} minutes away."
+            if (ride.etaMinutes > 0) "${ride.driver.name} is your driver, ${ride.etaMinutes} minutes away."
+            else "${ride.driver.name} is your driver and is on the way."
 
         is RiderState.Approaching ->
-            "Your driver is approaching."
+            ride.distanceMeters?.let { "Your driver is approaching, ${formatDistance(it)} away." }
+                ?: "Your driver is on the way."
 
         is RiderState.Arrived -> when {
             ride.codeVerified ->
@@ -48,14 +50,15 @@ fun announcementFor(uiState: RiderUiState): String {
             ride.verificationFailed ->
                 "Boarding code incorrect. Please do not enter the vehicle. Ask driver to repeat, or say S O S."
             else ->
-                "Your driver has arrived. Ask the driver to say the four-digit boarding code."
+                "Your driver has arrived. Ask the driver to say the three-digit boarding code."
         }
 
         is RiderState.InTrip -> {
             val stop = ride.currentStop
             when {
                 stop == null ->
-                    "On the way to ${ride.destination}, approximately ${ride.etaMinutes} minutes remaining."
+                    if (ride.etaMinutes > 0) "On the way to ${ride.destination}, approximately ${ride.etaMinutes} minutes remaining."
+                    else "On the way to ${ride.destination}."
                 stop.status == "WAITING" && !stop.riderBack ->
                     "Stopped at ${stop.name}. Your driver is waiting. When you are back, press I'm back and let the driver say the code."
                 else -> "Next stop ${stop.index}, ${stop.name}. Then ${ride.destination}."

@@ -14,6 +14,8 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -29,6 +31,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.cabeye.rider.ui.theme.CabEyeColors
+import com.cabeye.rider.ui.theme.LocalPalette
 import com.cabeye.rider.ui.theme.CabEyeType
 import com.cabeye.rider.ui.theme.LocalReducedMotion
 
@@ -68,23 +71,18 @@ fun VoiceOrb(
     orbSize: Dp = 150.dp
 ) {
     val reducedMotion = LocalReducedMotion.current
+    val palette = LocalPalette.current
 
-    // Base colors according to state
+    // Base colors according to state, from the active theme
     val accent = customAccent ?: when (state) {
-        VoiceOrbState.READY -> CabEyeColors.VoiceBlue
-        VoiceOrbState.LISTENING -> CabEyeColors.VoiceBlue
-        VoiceOrbState.PROCESSING -> CabEyeColors.ProcessingPurple
-        VoiceOrbState.SUCCESS -> CabEyeColors.SuccessGreen
-        VoiceOrbState.ERROR -> CabEyeColors.DangerRed
+        VoiceOrbState.READY -> palette.listening
+        VoiceOrbState.LISTENING -> palette.listening
+        VoiceOrbState.PROCESSING -> palette.processing
+        VoiceOrbState.SUCCESS -> palette.confirm
+        VoiceOrbState.ERROR -> palette.danger
     }
 
-    val subtleGlow = when (state) {
-        VoiceOrbState.READY -> CabEyeColors.VoiceBlueSubtle
-        VoiceOrbState.LISTENING -> CabEyeColors.VoiceBlueSubtle
-        VoiceOrbState.PROCESSING -> CabEyeColors.ProcessingPurpleSubtle
-        VoiceOrbState.SUCCESS -> CabEyeColors.SuccessGreenSubtle
-        VoiceOrbState.ERROR -> CabEyeColors.DangerRedSubtle
-    }
+    val subtleGlow = accent.copy(alpha = 0.15f)
 
     val glyph = customGlyph ?: when (state) {
         VoiceOrbState.READY -> "🎙"
@@ -215,7 +213,7 @@ fun VoiceOrb(
                         },
                         shape = CircleShape
                     )
-                    .background(CabEyeColors.SurfaceDark, CircleShape),
+                    .background(palette.surface, CircleShape),
                 contentAlignment = Alignment.Center
             ) {
                 // Main icon/glyph inside the orb
@@ -230,11 +228,12 @@ fun VoiceOrb(
 
         Spacer(Modifier.height(14.dp))
 
-        // State Badge text
+        // State badge: a padded pill, so its outline sits around the word, not through it
         Box(
             modifier = Modifier
-                .background(subtleGlow, CircleShape)
-                .border(1.5.dp, accent.copy(alpha = 0.6f), CircleShape)
+                .background(subtleGlow, RoundedCornerShape(50))
+                .border(1.5.dp, accent.copy(alpha = 0.6f), RoundedCornerShape(50))
+                .padding(horizontal = 14.dp, vertical = 5.dp)
         ) {
             Text(
                 text = labelText,

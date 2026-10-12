@@ -34,6 +34,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.cabeye.rider.ui.theme.CabEyeColors
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.onLongClick
+import androidx.compose.runtime.rememberUpdatedState
+import com.cabeye.rider.ui.theme.LocalPalette
 import com.cabeye.rider.ui.theme.CabEyeSpacing
 import com.cabeye.rider.ui.theme.CabEyeType
 
@@ -60,7 +64,11 @@ fun SosButton(
         label = "sosHoldProgress"
     )
 
-    // Trigger when 2-second hold completes
+    val palette = LocalPalette.current
+    val currentOnSos by rememberUpdatedState(onSos)
+
+    // The one trigger: the full two-second hold. (A system long press used to fire it as well,
+    // after about half a second, so it went off early and then a second time.)
     if (holdProgress >= 0.99f && isHolding) {
         isHolding = false
         onSos()
@@ -70,25 +78,20 @@ fun SosButton(
         modifier = modifier
             .defaultMinSize(minWidth = CabEyeSpacing.prominentTouchTarget, minHeight = CabEyeSpacing.prominentTouchTarget)
             .clip(RoundedCornerShape(20.dp))
-            .background(CabEyeColors.SurfaceDark)
-            .border(3.dp, CabEyeColors.DangerRed, RoundedCornerShape(20.dp))
+            .background(if (isHolding) palette.danger.copy(alpha = 0.10f + 0.25f * holdProgress) else palette.surface)
+            .border(3.dp, palette.danger, RoundedCornerShape(20.dp))
             .semantics {
                 role = Role.Button
                 contentDescription = "Emergency S O S. Press and hold for two seconds to activate."
+                // TalkBack: double-tap and hold works as a hold; the actions menu offers it too.
+                onLongClick(label = "Activate S O S") { currentOnSos(); true }
             }
             .pointerInput(Unit) {
                 detectTapGestures(
                     onPress = {
                         isHolding = true
-                        val released = tryAwaitRelease()
+                        tryAwaitRelease()
                         isHolding = false
-                    },
-                    onLongPress = {
-                        onSos()
-                    },
-                    onTap = {
-                        // Accidental tap protection guidance: brief flash or instruction
-                        // We still allow immediate activation on deliberate long press or hold
                     }
                 )
             }
@@ -99,13 +102,13 @@ fun SosButton(
             Box(
                 modifier = Modifier
                     .size(10.dp)
-                    .background(CabEyeColors.DangerRed, CircleShape)
+                    .background(palette.danger, CircleShape)
             )
             Spacer(Modifier.width(8.dp))
             Text(
-                text = if (isHolding) "HOLD..." else label,
+                text = if (isHolding) "HOLD ${(2 - 2 * holdProgress).coerceAtLeast(0f).let { kotlin.math.ceil(it).toInt() }}s" else label,
                 style = CabEyeType.buttonText.copy(fontSize = 18.sp, fontWeight = FontWeight.Black),
-                color = CabEyeColors.DangerRed
+                color = palette.danger
             )
         }
     }
@@ -120,12 +123,15 @@ fun SosButton(
 @Composable
 fun EmergencyOverlay(
     onDismiss: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    /** What happened to the SOS: sending, sent, or not delivered. Shown as it is. */
+    status: String = ""
 ) {
+    val palette = LocalPalette.current
     Box(
         modifier = modifier
             .fillMaxWidth()
-            .background(CabEyeColors.Background)
+            .background(palette.background)
             .padding(CabEyeSpacing.screenPadding),
         contentAlignment = Alignment.Center
     ) {
@@ -136,14 +142,14 @@ fun EmergencyOverlay(
             Box(
                 modifier = Modifier
                     .size(120.dp)
-                    .background(CabEyeColors.DangerRedSubtle, CircleShape)
-                    .border(6.dp, CabEyeColors.DangerRed, CircleShape),
+                    .background(palette.danger.copy(alpha = 0.15f), CircleShape)
+                    .border(6.dp, palette.danger, CircleShape),
                 contentAlignment = Alignment.Center
             ) {
                 Text(
                     text = "☎",
                     fontSize = 48.sp,
-                    color = CabEyeColors.DangerRed
+                    color = palette.danger
                 )
             }
 
@@ -152,7 +158,7 @@ fun EmergencyOverlay(
             Text(
                 text = "EMERGENCY ASSISTANCE",
                 style = CabEyeType.badgeText,
-                color = CabEyeColors.DangerRed
+                color = palette.danger
             )
 
             Spacer(Modifier.size(CabEyeSpacing.sm))
@@ -160,15 +166,17 @@ fun EmergencyOverlay(
             Text(
                 text = "SOS ACTIVE",
                 style = CabEyeType.stateTitleLarge,
-                color = CabEyeColors.DangerRed
+                color = palette.danger
             )
 
             Spacer(Modifier.size(CabEyeSpacing.md))
 
             Text(
-                text = "Sharing your location and ride details with emergency contacts.",
+                text = status.ifBlank { "Sending your S O S to Cab Eye support…" },
                 style = CabEyeType.supportingText,
-                color = CabEyeColors.TextPrimary
+                color = palette.onBackground,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                modifier = Modifier.semantics { liveRegion = androidx.compose.ui.semantics.LiveRegionMode.Assertive }
             )
 
             Spacer(Modifier.size(CabEyeSpacing.xl))
@@ -176,8 +184,8 @@ fun EmergencyOverlay(
             SecondaryAction(
                 label = "DISMISS EMERGENCY",
                 onClick = onDismiss,
-                accentColor = CabEyeColors.DangerRed,
-                containerColor = CabEyeColors.SurfaceDark
+                accentColor = palette.danger,
+                containerColor = palette.surface
             )
         }
     }

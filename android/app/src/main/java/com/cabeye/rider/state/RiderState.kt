@@ -132,14 +132,24 @@ sealed interface RiderState {
      * panned to the driver's real bearing. Narrating distance every few seconds would eat
      * the user's attention for information an earcon conveys instantly.
      *
-     * @param distanceMeters drives earcon pitch
-     * @param bearingDegrees driver's bearing relative to device heading, 0..360; drives pan
+     * @param distanceMeters drives earcon pitch; null until the driver's first position arrives
+     *   (the screen then says "on the way", never a made-up or negative number)
+     * @param bearingDegrees driver's bearing relative to device heading, 0..360; drives pan;
+     *   null while unknown, so no direction is shown that was never measured
      */
     data class Approaching(
         val driver: DriverInfo,
-        val distanceMeters: Int,
-        val bearingDegrees: Float
-    ) : RiderState
+        val distanceMeters: Int?,
+        val bearingDegrees: Float?
+    ) : RiderState {
+        companion object {
+            /** From wire values, where a negative distance means "not known". */
+            fun of(driver: DriverInfo, distanceMeters: Int, bearingDegrees: Float?): Approaching {
+                val known = distanceMeters.takeIf { it >= 0 }
+                return Approaching(driver, known, bearingDegrees.takeIf { known != null })
+            }
+        }
+    }
 
     /**
      * Driver has arrived. Tier-0 (interrupting) announcement plus a distinct haptic.
@@ -307,6 +317,8 @@ enum class NextStep {
 data class RiderUiState(
     val ride: RiderState = RiderState.Idle,
     val sosActive: Boolean = false,
+    /** What happened to the SOS, said and shown as it is: sending, sent, or not delivered. */
+    val sosStatus: String = "",
     val isSpeaking: Boolean = false,
     val handsFreeEnabled: Boolean = false,
     val connected: Boolean = false,

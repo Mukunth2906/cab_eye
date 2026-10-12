@@ -9,6 +9,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.cabeye.rider.ui.theme.CabEyeColors
+import com.cabeye.rider.ui.theme.LocalPalette
 import com.cabeye.rider.ui.theme.CabEyeType
 
 /**
@@ -19,7 +20,7 @@ import com.cabeye.rider.ui.theme.CabEyeType
 fun SupportingText(
     text: String,
     modifier: Modifier = Modifier,
-    color: Color = CabEyeColors.TextSecondary
+    color: Color = LocalPalette.current.muted
 ) {
     Text(
         text = text,

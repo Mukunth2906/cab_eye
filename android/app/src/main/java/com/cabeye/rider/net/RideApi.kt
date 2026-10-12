@@ -577,6 +577,21 @@ class RideApi(private val settings: AppSettings, private val auth: AuthStore) {
     }
 
     /**
+     * The SOS button: an urgent case for support (admin inbox, Telegram, email), with the ride
+     * and the position. Works without a sign-in. Ok(true) when an alert channel is set up on the
+     * server, Ok(false) when the case was only filed in the inbox.
+     */
+    suspend fun sos(rideId: String?, lat: Double?, lng: Double?): ApiResult<Boolean> {
+        val body = JSONObject()
+        if (!rideId.isNullOrBlank()) body.put("rideId", rideId)
+        if (lat != null && lng != null) body.put("lat", lat).put("lng", lng)
+        return when (val r = call(post("${base()}/sos", body))) {
+            is ApiResult.Ok -> ApiResult.Ok(runCatching { JSONObject(r.value).optBoolean("alerted", false) }.getOrDefault(false))
+            is ApiResult.Failed -> r
+        }
+    }
+
+    /**
      * The area a point is in ("RS Puram"), from OpenStreetMap through the backend — no key.
      * Ok(null) when it can't be named; Failed when the server is off or unreachable.
      */

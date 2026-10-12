@@ -55,7 +55,7 @@ volume key.
 | **Double tap** the screen | Open **Explore** (camera) |
 | **Volume down three times quickly** | Open / close the **Mind map** |
 | **Tap**, in the cab | "Where are we" |
-| **Hold SOS** 2 s | Emergency |
+| **Hold SOS** 2 s (main screen, Explore, mind map) | Sends an urgent case with your location to support, and says whether it got through |
 | Top bar: **⚙ Settings**, **📷 Explore**, **🧭 My mind map** | The same, by touch or TalkBack |
 
 Say **"help"** at any time for the list of commands. The full guide, with every voice command
@@ -93,14 +93,21 @@ cab_eye/
 ├─ docker-compose.yml, docker/, aws/   ← multi-instance and cloud deployment
 ```
 
+```mermaid
+flowchart LR
+    rider(["Rider"]) <--> rapp["Rider app<br/>speech, TTS, ML Kit on the phone<br/>mind map, walks, explore finds stored here"]
+    driver(["Driver"]) <--> dapp["Driver app<br/>same APK, silent"]
+    rapp <-- "REST + WebSocket /ws/ride" --> server["Backend<br/>rides, fare, memory, camera relay,<br/>payments, SOS, admin"]
+    dapp <-- "REST + WebSocket" --> server
+    server -.-> ext["Optional: Gemini, Grok, OpenStreetMap,<br/>Razorpay, SMS, Telegram, email"]
+    admin(["Support"]) <--> server
 ```
- rider phone ──REST + WebSocket /ws/ride──▶ backend ◀──REST + WebSocket── driver phone
-   │  speech recognition, TTS, ML Kit         │  ride state machine, fare, memory,
-   │  on the phone                            │  ride-camera relay, payments, admin
-   │                                          ├──▶ Gemini (camera descriptions, optional)
-   │  mind map, walks, explore finds:         ├──▶ Grok/Gemini (sentence reader, optional)
-   │  stored on the phone only                └──▶ OpenStreetMap (areas, nearby places)
-```
+
+Every level of detail, from this overview down to each flow and where every piece of data
+lives, is drawn in **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**: system context,
+containers, phone and server components, the ride lifecycle on both sides, sequence diagrams
+for booking, reconnecting, explore, the ride camera and SOS, input routing, and data and
+privacy.
 
 ## Quick start
 
@@ -172,13 +179,22 @@ cd backend;  .\gradlew.bat test                      # endpoint + logic tests, n
 cd android;  .\gradlew.bat testDebugUnitTest         # dialogue, agents, vision, walks, mind map
 ```
 
-External services (Gemini, Grok, OpenStreetMap, SMS, Razorpay) are stubbed in tests. Step-by-step
-checks on real phones, feature by feature: [TESTING-NEXT-PHASE.md](TESTING-NEXT-PHASE.md).
+External services (Gemini, Grok, OpenStreetMap, SMS, Razorpay) are stubbed in tests.
+
+**See every screen without a phone.** This renders all rider screens, in all three themes, to
+PNG files in `android/app/build/screenshots/`, plus contact sheets:
+
+```powershell
+cd android;  .\gradlew.bat :app:testDebugUnitTest --tests "*ScreenGalleryTest" -Pscreenshots
+```
+
+Step-by-step checks on real phones, feature by feature: [TESTING-NEXT-PHASE.md](TESTING-NEXT-PHASE.md).
 
 ## Documentation
 
 | Document | Covers |
 |---|---|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Diagrams at every level: context, containers, components, ride lifecycle, flows, input routing, data and privacy |
 | [docs/RIDER-GUIDE.md](docs/RIDER-GUIDE.md) | Every input and voice command: sign-in, rides, explore, mind map, walks, settings, TalkBack, the driver app, the admin site |
 | [docs/SETUP.md](docs/SETUP.md) | Installing, running, phones, `adb reverse`, sharing with ngrok, logs, troubleshooting, versions |
 | [docs/EXPLORE-AND-CAMERA.md](docs/EXPLORE-AND-CAMERA.md) | Explore, the ride camera, Gemini + ML Kit detection, what is stored |
