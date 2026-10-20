@@ -30,12 +30,13 @@ server, km + fare attached to every complaint, and drivers rating riders — see
 6. [Part B — Prepare your Android phone](#part-b--prepare-your-android-phone)
 7. [Part C — Run the app on your phone](#part-c--run-the-app-on-your-phone)
 8. [Part D — Connect the phone to localhost](#part-d--connect-the-phone-to-localhost)
-9. [Using the app](#using-the-app)
-10. [Testing with TalkBack](#testing-with-talkback)
-11. [Reading the instrumentation](#reading-the-instrumentation)
-12. [Troubleshooting](#troubleshooting)
-13. [Versions](#versions)
-14. [Design decisions](#design-decisions)
+9. [Part E — Machine Learning: Double DQN Recovery](#part-e--machine-learning-double-dqn-recovery)
+10. [Using the app](#using-the-app)
+11. [Testing with TalkBack](#testing-with-talkback)
+12. [Reading the instrumentation](#reading-the-instrumentation)
+13. [Troubleshooting](#troubleshooting)
+14. [Versions](#versions)
+15. [Design decisions](#design-decisions)
 
 ---
 
@@ -63,6 +64,7 @@ Being precise about this, because it determines what you can demo today.
 | **`install-app.ps1` multi-device** | **Working** — verified on a real device |
 | **`share-with-friends.ps1`** — ngrok URL baked into the APK | **Working** |
 | Rider surface: all eleven states, earcons, TTS, on-device STT | **Working** (steps 1–3) |
+| **ML Subsystem — Double DQN Recovery** | **Working** — 16-feature state vector, 5 canonical recovery actions, offline trainer, live WebSocket dashboard, automated EDA & test metrics, exported Kotlin JSON model (`artifacts/recovery_policy_v1.json`), 31 unit tests |
 | Classifier, four matching gates, recovery ladder, three themes | **Working** (steps 1–3) |
 | LLM escalation | Interface only — still gated on your go-ahead |
 | Cloud STT / Cloud TTS | Interfaces only — benchmark targets, not fallbacks |
@@ -471,6 +473,39 @@ To check it's active:
 
 ```powershell
 & "C:\Users\Prahalya\AppData\Local\Android\Sdk\platform-tools\adb.exe" reverse --list
+```
+
+---
+
+## Part E — Machine Learning: Double DQN Recovery
+
+The `ml/` subsystem provides an offline-trained reinforcement learning policy for autonomous voice dialogue recovery. When a visually impaired rider's spoken destination fails speech recognition or encounters ambiguous destination matches, the model dynamically selects the optimal recovery behavior (explaining why it failed, prompting for landmarks, confirming top guess, offering saved places, or escalating to human support) rather than repeating robotic reprompts.
+
+### Key Capabilities
+- **16-Feature State Schema**: Encodes attempt count, speech confidence, match scores, candidate count, MatchGate flags, and previous actions.
+- **5 Canonical Actions with Safety Masking**: Preconditions strictly enforced so the agent never hallucinates or attempts unverified confirmations.
+- **Offline Double DQN**: Decoupled action selection and value estimation with Huber loss to eliminate maximization bias.
+- **Real-Time Test Metrics Export**: Automatically writes `test_metrics.csv` at each evaluation checkpoint tracking accuracy, loss, safety error rate, and abandonment.
+- **Automated Exploratory Data Analysis (EDA)**: Produces descriptive stats, correlation matrices, and 4 high-resolution plots (`eda_summary_dashboard.png`, `eda_accuracy_and_loss.png`, `eda_error_breakdown.png`, `eda_loss_distribution.png`) plus a self-contained `eda_report.html`.
+- **Zero-Dependency Mobile Inference**: Weights exported to `ml/artifacts/recovery_policy_v1.json` with deterministic test vectors verified against Kotlin FloatArray math.
+- **Live Training Dashboard**: FastAPI + WebSocket live stream server with real-time charts at `http://localhost:8000`.
+
+### Quick Commands
+
+```bash
+cd ml
+
+# 1. Run full 31-test suite
+python3 main.py test
+
+# 2. Train the Double DQN agent (e.g. 1,000 episodes)
+python3 main.py train --episodes 1000 --seed 42
+
+# 3. Generate Exploratory Data Analysis (EDA) report & plots
+python3 main.py eda
+
+# 4. Launch live interactive web dashboard
+python3 main.py serve --port 8000
 ```
 
 ---

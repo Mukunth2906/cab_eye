@@ -1,0 +1,65 @@
+{
+  "timestamp": "2026-10-20T07:49:54.115090+00:00",
+  "total_training_episodes": 40000,
+  "total_test_checkpoints": 20,
+  "accuracy_metrics": {
+    "initial_accuracy": 0.772,
+    "final_accuracy": 0.814,
+    "peak_accuracy": 0.85,
+    "mean_accuracy": 0.8001000000000001,
+    "std_accuracy": 0.022631835983852464,
+    "accuracy_improvement_pct": 5.440414507772011
+  },
+  "loss_metrics": {
+    "initial_loss": 3.796921,
+    "final_loss": 2.571137,
+    "min_loss": 2.324208,
+    "max_loss": 3.892494,
+    "mean_loss": 2.5760787806666334,
+    "median_loss": 2.5746085,
+    "loss_iqr": 0.09578050000000005,
+    "loss_reduction_pct": 32.28363192175977
+  },
+  "error_metrics": {
+    "initial_total_error": 0.20400000000000001,
+    "final_total_error": 0.186,
+    "final_incorrect_destination_error": 0.004,
+    "final_abandonment_error": 0.182,
+    "safety_boundary_maintained": true,
+    "error_reduction_pct": 8.823529411764714
+  },
+  "return_metrics": {
+    "initial_rolling_return": NaN,
+    "final_rolling_return": 5.79,
+    "mean_return": 6.096322591935202,
+    "std_return": 6.307336737984729,
+    "min_return": -15.0,
+    "max_return": 10.0
+  },
+  "correlations": {
+    "accuracy": {
+      "accuracy": 1.0,
+      "mean_return": 0.9956335527084026,
+      "total_error_rate": -0.968532618770253,
+      "td_loss": 0.03174572259816074
+    },
+    "mean_return": {
+      "accuracy": 0.9956335527084026,
+      "mean_return": 1.0,
+      "total_error_rate": -0.9737759437834549,
+      "td_loss": 0.015601960672929188
+    },
+    "total_error_rate": {
+      "accuracy": -0.968532618770253,
+      "mean_return": -0.9737759437834549,
+      "total_error_rate": 1.0,
+      "td_loss": 0.0376247654209126
+    },
+    "td_loss": {
+      "accuracy": 0.03174572259816074,
+      "mean_return": 0.015601960672929188,
+      "total_error_rate": 0.0376247654209126,
+      "td_loss": 1.0
+    }
+  }
+}

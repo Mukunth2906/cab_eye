@@ -1,0 +1,51 @@
+# Cab Eye — Double DQN Dialogue Recovery Configuration
+# Schema Version 1
+
+# Environment and Dialogue State
+state_dim: 16
+action_dim: 5
+hidden_dim: 64
+max_turns_per_episode: 4
+
+# Training Hyperparameters
+total_episodes: 2000
+batch_size: 64
+learning_rate: 0.0005
+gamma: 0.95
+tau: 0.005
+target_update_interval: 100
+buffer_capacity: 50000
+warmup_steps: 500
+
+# Epsilon-Greedy Exploration Schedule
+epsilon_start: 1.0
+epsilon_end: 0.05
+epsilon_decay_episodes: 1500
+
+# Loss and Optimization
+loss_type: "huber"  # huber (smooth l1) or mse
+grad_clip_norm: 10.0
+
+# Evaluation & Checkpointing
+eval_interval: 100
+eval_episodes: 100
+save_interval: 200
+seed: 42
+eval_seeds: [101, 102, 103, 104, 105]
+
+# Reward Weights
+reward:
+  correct_confirm: 10.0
+  incorrect_confirm: -20.0
+  successful_escape: 5.0
+  step_penalty: -1.0
+  abandonment_penalty: -15.0
+  redundant_reprompt_penalty: -2.0
+
+# Paths
+paths:
+  artifacts_dir: "artifacts"
+  metrics_file: "artifacts/metrics.jsonl"
+  best_checkpoint: "artifacts/best_checkpoint.pt"
+  latest_checkpoint: "artifacts/latest_checkpoint.pt"
+  exported_model_json: "artifacts/recovery_policy_v1.json"

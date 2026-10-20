@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# PyTorch binary checkpoints
+*.pt
+**/checkpoints/
+
+# Runtime metrics
+**/metrics/
+
+# Ephemeral runtime reports
+reports/
+**/reports/
+
+# Keep sample recovery_policy_v1.json, sample EDA plots, and sample test_metrics.csv in artifacts/
